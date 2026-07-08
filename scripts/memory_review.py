@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""CLI for reviewing and approving memory candidates."""
+
+from __future__ import annotations
+
+import argparse
+import sys
+
+import memory_review_queue as review
+
+
+def print_items(items: list[dict], status: str | None = None) -> None:
+    for item in items:
+        if status and item.get("status") != status:
+            continue
+        risks = ",".join(item.get("risk_flags", [])) or "-"
+        print(
+            f"{item['id']}\t{item.get('status')}\t{item.get('scope')}\t"
+            f"{item.get('target')}\trisks={risks}\t{item.get('summary')}"
+        )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Review shared memory candidates")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("--status", default="pending")
+
+    show_parser = sub.add_parser("show")
+    show_parser.add_argument("candidate_id")
+
+    approve_parser = sub.add_parser("approve")
+    approve_parser.add_argument("candidate_id")
+    approve_parser.add_argument(
+        "--target",
+        choices=["project_long", "personal_long", "personal_short"],
+        default=None,
+    )
+    approve_parser.add_argument("--content-file", default=None)
+
+    reject_parser = sub.add_parser("reject")
+    reject_parser.add_argument("candidate_id")
+
+    defer_parser = sub.add_parser("defer")
+    defer_parser.add_argument("candidate_id")
+
+    reset_parser = sub.add_parser("reset")
+    reset_parser.add_argument("candidate_id")
+
+    noise_parser = sub.add_parser("reject-noise-personal")
+    noise_parser.add_argument("--apply", action="store_true", help="Actually reject detected noise candidates")
+
+    sub.add_parser("refresh")
+    sub.add_parser("serve")
+
+    args = parser.parse_args()
+
+    if args.command == "list":
+        queue = review.load_queue(refresh=True)
+        print_items(queue.get("items", []), args.status)
+        return 0
+
+    if args.command == "show":
+        item = review.find_item(args.candidate_id)
+        print(f"ID: {item['id']}")
+        print(f"Status: {item.get('status')}")
+        print(f"Scope: {item.get('scope')}")
+        print(f"Target: {item.get('target')}")
+        print(f"Created: {item.get('created_at')}")
+        print(f"Risks: {', '.join(item.get('risk_flags', [])) or '-'}")
+        print()
+        print(item.get("content", ""))
+        return 0
+
+    if args.command == "approve":
+        content = None
+        if args.content_file:
+            with open(args.content_file, "r", encoding="utf-8") as handle:
+                content = handle.read()
+        item = review.approve(args.candidate_id, target=args.target, content=content)
+        print(f"approved {item['id']}")
+        return 0
+
+    if args.command == "reject":
+        review.reject(args.candidate_id)
+        print(f"rejected {args.candidate_id}")
+        return 0
+
+    if args.command == "defer":
+        review.defer(args.candidate_id)
+        print(f"deferred {args.candidate_id}")
+        return 0
+
+    if args.command == "reset":
+        review.reset(args.candidate_id)
+        print(f"reset {args.candidate_id}")
+        return 0
+
+    if args.command == "reject-noise-personal":
+        ids = review.reject_noise_personal_candidates(dry_run=not args.apply)
+        action = "would reject" if not args.apply else "rejected"
+        print(f"{action} {len(ids)} personal noise candidates")
+        for candidate_id in ids:
+            print(candidate_id)
+        return 0
+
+    if args.command == "refresh":
+        queue = review.build_queue()
+        print(review.review_summary(queue))
+        return 0
+
+    if args.command == "serve":
+        from memory_review_server import main as server_main
+
+        return server_main()
+
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

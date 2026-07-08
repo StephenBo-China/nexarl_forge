@@ -1,0 +1,50 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local runtime state; may include memory candidate content
+codex/memory_review_queue.json
+codex/memory_review_state.json
+codex/memory_review_server.log
+
+# Local scratch
+tmp/
+temp/
+*.log
+
+
+# Local environment
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+
+# Test and coverage output
+.coverage
+htmlcov/
+coverage.xml
+
+# Generated memory context packets
+codex/codex_context_packet.md
+codex/shared_memory_context_packet.md
+
+# Loop runtime artifacts
+loop/prd/current_prd.md
+loop/acceptance/criteria.md
+loop/reports/
+loop/state/
+loop/claude_tests/.cache/
+
+# Local databases and archives
+*.sqlite
+*.sqlite3
+*.db
+*.zip
+*.tar.gz

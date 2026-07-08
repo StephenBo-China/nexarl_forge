@@ -1,0 +1,64 @@
+{
+  "branch": {
+    "auto_commit": true,
+    "auto_push": true,
+    "commit_messages": {
+      "fix_round": "loop: fix claude findings round <round>",
+      "implement": "loop: implement <feature>"
+    },
+    "merge_to_main_requires_user_command": true,
+    "name_format": "loop/<project>-<date>-<slug>"
+  },
+  "claude_eval": {
+    "allow_claude_internal_browser": true,
+    "allow_interactive_login": true,
+    "allow_test_script_changes": true,
+    "default_method": "playwright",
+    "max_auto_rounds": 10,
+    "pause_on_same_p0_p1_for_consecutive_rounds": 2,
+    "report_json": "loop/reports/claude_eval_latest.json",
+    "report_markdown": "loop/reports/claude_eval_latest.md",
+    "test_scripts_dir": "loop/claude_tests"
+  },
+  "loop_enabled": true,
+  "memory": {
+    "both_agents_read_both_dirs": true,
+    "claude_loop_dir": "~/.claude/loop_engineering",
+    "codex_loop_dir": "~/.codex/loop_engineering",
+    "project_loop_config_to_personal_long_candidate": true
+  },
+  "prd": {
+    "acceptance_criteria_path": "loop/acceptance/criteria.md",
+    "codex_generates_acceptance_criteria": true,
+    "input_mode": "chat_markdown",
+    "save_latest_to": "loop/prd/current_prd.md",
+    "user_confirms_acceptance_criteria": true
+  },
+  "production_guardrails": {
+    "ask_before_merge_master": true,
+    "ask_before_production_deploy": true,
+    "create_production_database_before_master_merge": true,
+    "never_deploy_production_during_loop": true,
+    "switch_to_production_bucket_before_production_enablement": true
+  },
+  "project_repo_name": "vibe_coding_manage_platform",
+  "schema_version": 1,
+  "sensitive_data_policy": {
+    "do_not_record_api_keys": true,
+    "do_not_record_rds_or_oss_secrets": true,
+    "do_not_record_tokens": true,
+    "do_not_record_verification_codes": true
+  },
+  "staging": {
+    "aliyun_security_group_may_require_manual_or_cli_rule": true,
+    "allow_real_rds_oss": true,
+    "cleanup_test_data_after_eval": true,
+    "database": "vibe_coding_manage_platform_loop_staging",
+    "host": "root@8.210.155.175",
+    "open_server_firewall_port": true,
+    "oss_bucket": "vibe-coding-manage-platform-loop-staging",
+    "port": 8082,
+    "public_base_url": "http://8.210.155.175:8082",
+    "remote_path": "/root/vibe_coding_manage_platform_loop_staging"
+  }
+}

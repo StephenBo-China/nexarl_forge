@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""Shared memory review queue and approval helpers.
+
+This module is intentionally dependency-free so Codex and Claude Code hooks can
+run it quickly. It parses Markdown proposal files into a JSON review queue,
+tracks decisions separately, and applies approved memories only after an
+explicit user action from the CLI or local review server.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+import memory_project
+
+APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
+PROJECT_ROOT = pathlib.Path(
+    os.environ.get("MEMORY_REVIEW_PROJECT_ROOT", str(memory_project.current_project(APP_ROOT)))
+).expanduser().resolve()
+ROOT = PROJECT_ROOT
+CODEX_DIR = PROJECT_ROOT / "codex"
+PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"
+PROJECT_LONG = CODEX_DIR / "codex_long_memory.md"
+PROJECT_QUEUE = CODEX_DIR / "memory_review_queue.json"
+PROJECT_STATE = CODEX_DIR / "memory_review_state.json"
+
+PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
+PERSONAL_PROPOSALS = PERSONAL_DIR / "proposals.md"
+PERSONAL_LONG = PERSONAL_DIR / "long.md"
+PERSONAL_SHORT = PERSONAL_DIR / "short.md"
+
+REVIEW_HOST = "127.0.0.1"
+REVIEW_PORT = 8897
+REVIEW_URL = f"http://{REVIEW_HOST}:{REVIEW_PORT}"
+
+SENSITIVE_PATTERNS = {
+    "api_key": re.compile(r"\b(api[_-]?key|apikey)\b\s*[:=]", re.I),
+    "access_key": re.compile(r"\b(access[_-]?key|AccessKeyId|AccessKeySecret)\b", re.I),
+    "authorization": re.compile(r"\b(Authorization|Bearer\s+[A-Za-z0-9._~+/=-]{12,})\b", re.I),
+    "password": re.compile(r"\b(password|passwd|pwd|NOEMA_MYSQL_PASSWORD)\b", re.I),
+    "secret": re.compile(r"\b(secret|client_secret|ANTHROPIC_AUTH_TOKEN)\b", re.I),
+    "token": re.compile(r"\b(token|access_token|refresh_token)\b\s*[:=]", re.I),
+    "env_production": re.compile(r"\.env\.production", re.I),
+    "sms_code": re.compile(r"\b(verification_code|verify_code|短信验证码)\b", re.I),
+}
+PERSONAL_NOISE_PATTERNS = [
+    re.compile(r"# Overview\s+Generate 0 to 3 hyperpersonalized suggestions", re.I | re.S),
+    re.compile(r"Policies to always exclude|You are an expert at upholding safety", re.I | re.S),
+    re.compile(r"# In app browser:|Current URL:|Files mentioned by the user|codex-clipboard", re.I),
+    re.compile(r"AGENTS\.md instructions|<INSTRUCTIONS>|</INSTRUCTIONS>", re.I | re.S),
+    re.compile(r"^memory_id:\s*M-\d{8}-\d{6}", re.I | re.M),
+]
+
+
+def now() -> str:
+    return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def read_text(path: pathlib.Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def write_json(path: pathlib.Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def read_json(path: pathlib.Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default
+
+
+def stable_id(prefix: str, source_path: pathlib.Path, heading: str, body: str) -> str:
+    digest = hashlib.sha1(
+        f"{source_path}\n{heading}\n{body[:4000]}".encode("utf-8")
+    ).hexdigest()[:12]
+    return f"{prefix}-{digest}"
+
+
+def split_heading_sections(text: str) -> list[tuple[str, str]]:
+    matches = list(re.finditer(r"^### .+$", text, flags=re.MULTILINE))
+    sections: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        heading = match.group(0).strip()
+        body = text[match.end() : end].strip()
+        sections.append((heading, body))
+    return sections
+
+
+def metadata_value(body: str, key: str) -> str:
+    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", body, flags=re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def first_fenced_text(body: str) -> str:
+    match = re.search(r"```(?:text|markdown|md)?\n(.*?)\n```", body, flags=re.S)
+    if match:
+        return match.group(1).strip()
+    return body.strip()
+
+
+def short_summary(text: str, max_len: int = 140) -> str:
+    clean = re.sub(r"\s+", " ", text).strip()
+    return clean[: max_len - 3] + "..." if len(clean) > max_len else clean
+
+
+def risk_flags(text: str) -> list[str]:
+    return sorted(name for name, pattern in SENSITIVE_PATTERNS.items() if pattern.search(text))
+
+
+def is_noise_personal_candidate(item: dict[str, Any]) -> bool:
+    if item.get("scope") != "personal" or item.get("status", "pending") != "pending":
+        return False
+    content = item.get("content", "") or ""
+    if any(pattern.search(content) for pattern in PERSONAL_NOISE_PATTERNS):
+        return True
+    if not re.search(
+        r"(常用开发习惯|开发习惯|工作习惯|工作方式|协作方式|思维方式|用户画像|"
+        r"偏好|习惯|以后|每次|总是|都需要|长期|短期|跨项目|审批机制)",
+        content,
+    ):
+        return True
+    if len(content) > 1800 and not re.search(
+        r"(偏好|习惯|工作方式|协作方式|思维方式|用户画像|以后|每次|长期|短期)",
+        content,
+    ):
+        return True
+    return False
+
+
+def is_project_checkpoint(heading: str, body: str) -> bool:
+    return (
+        "Review checkpoint from" in heading
+        and (
+            "Review whether this thread introduced stable project facts" in body
+            or "Review whether this Claude Code thread introduced stable project facts" in body
+        )
+    )
+
+
+def state_map() -> dict[str, Any]:
+    state = read_json(PROJECT_STATE, {"items": {}, "last_reminder_at": ""})
+    if not isinstance(state, dict):
+        state = {"items": {}, "last_reminder_at": ""}
+    state.setdefault("items", {})
+    state.setdefault("last_reminder_at", "")
+    if not PROJECT_STATE.exists():
+        write_json(PROJECT_STATE, state)
+    return state
+
+
+def parse_project_candidates() -> list[dict[str, Any]]:
+    text = read_text(PROJECT_PROPOSALS)
+    items: list[dict[str, Any]] = []
+    for heading, body in split_heading_sections(text):
+        candidate_id = stable_id("P", PROJECT_PROPOSALS, heading, body)
+        created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
+        content = body.strip()
+        checkpoint = is_project_checkpoint(heading, content)
+        items.append(
+            {
+                "id": candidate_id,
+                "scope": "project",
+                "target": "project_long",
+                "review_kind": "checkpoint" if checkpoint else "memory",
+                "actionable": not checkpoint,
+                "source": "project_proposals",
+                "source_path": str(PROJECT_PROPOSALS),
+                "created_at": created,
+                "title": heading.removeprefix("### ").strip(),
+                "summary": short_summary(content),
+                "content": content,
+                "risk_flags": risk_flags(content),
+            }
+        )
+    return items
+
+
+def parse_personal_candidates() -> list[dict[str, Any]]:
+    text = read_text(PERSONAL_PROPOSALS)
+    items: list[dict[str, Any]] = []
+    for heading, body in split_heading_sections(text):
+        memory_id = metadata_value(body, "memory_id")
+        if not memory_id:
+            # Legacy unstructured proposals are preserved for audit but should
+            # not be treated as pending approvals.
+            continue
+        proposal_status = metadata_value(body, "status") or "pending"
+        if proposal_status != "pending":
+            continue
+        target = metadata_value(body, "target") or "unsure"
+        created = metadata_value(body, "created") or heading.removeprefix("### ").strip()
+        source_event = metadata_value(body, "source_event")
+        content = first_fenced_text(body)
+        items.append(
+            {
+                "id": memory_id,
+                "scope": "personal",
+                "target": target,
+                "review_kind": "memory",
+                "actionable": True,
+                "source": "personal_proposals",
+                "source_event": source_event,
+                "source_path": str(PERSONAL_PROPOSALS),
+                "created_at": created,
+                "title": heading.removeprefix("### ").strip(),
+                "summary": short_summary(content),
+                "content": content,
+                "risk_flags": risk_flags(content),
+            }
+        )
+    return items
+
+
+def build_queue() -> dict[str, Any]:
+    state = state_map()
+    decisions = state.get("items", {})
+    items = parse_project_candidates() + parse_personal_candidates()
+    for item in items:
+        decision = decisions.get(item["id"], {})
+        item["status"] = decision.get("status", "pending")
+        item["decision"] = decision
+    queue = {
+        "generated_at": now(),
+        "review_url": REVIEW_URL,
+        "items": items,
+        "counts": count_items(items),
+    }
+    write_json(PROJECT_QUEUE, queue)
+    return queue
+
+
+def count_items(items: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "pending": 0,
+        "actionable_pending": 0,
+        "checkpoint_pending": 0,
+        "project_pending": 0,
+        "personal_pending": 0,
+        "approved": 0,
+        "rejected": 0,
+        "deferred": 0,
+    }
+    for item in items:
+        status = item.get("status", "pending")
+        if status == "pending":
+            counts["pending"] += 1
+            if item.get("review_kind") == "checkpoint":
+                counts["checkpoint_pending"] += 1
+            elif item.get("actionable", True):
+                counts["actionable_pending"] += 1
+            if item.get("scope") == "project":
+                counts["project_pending"] += 1
+            if item.get("scope") == "personal":
+                counts["personal_pending"] += 1
+        elif status in counts:
+            counts[status] += 1
+    return counts
+
+
+def load_queue(refresh: bool = True) -> dict[str, Any]:
+    if refresh or not PROJECT_QUEUE.exists():
+        return build_queue()
+    queue = read_json(PROJECT_QUEUE, {"items": [], "counts": {}})
+    if not isinstance(queue, dict):
+        return build_queue()
+    return queue
+
+
+def find_item(candidate_id: str) -> dict[str, Any]:
+    queue = load_queue(refresh=True)
+    for item in queue.get("items", []):
+        if item.get("id") == candidate_id:
+            return item
+    raise KeyError(f"Unknown memory candidate: {candidate_id}")
+
+
+def memory_title(item: dict[str, Any], content: str) -> str:
+    summary = item.get("summary") or short_summary(content, 80)
+    summary = re.sub(r"[`#*_>\[\]]", "", summary).strip()
+    return summary[:64] or item.get("id", "Approved memory")
+
+
+def append_official_memory(path: pathlib.Path, item: dict[str, Any], content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    title = memory_title(item, content)
+    date = _dt.datetime.now().astimezone().date().isoformat()
+    entry = f"\n### {date} - {title}\n\n{content.strip()}\n"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(entry)
+
+
+def decision_target_path(target: str) -> pathlib.Path:
+    if target == "project_long":
+        return PROJECT_LONG
+    if target == "personal_long":
+        return PERSONAL_LONG
+    if target == "personal_short":
+        return PERSONAL_SHORT
+    raise ValueError(f"Unsupported approval target: {target}")
+
+
+def approve(candidate_id: str, target: str | None = None, content: str | None = None) -> dict[str, Any]:
+    item = find_item(candidate_id)
+    if target is None:
+        if item["scope"] == "project":
+            target = "project_long"
+        elif item.get("target") == "short":
+            target = "personal_short"
+        else:
+            target = "personal_long"
+    approved_content = (content if content is not None else item.get("content", "")).strip()
+    if not approved_content:
+        raise ValueError("Cannot approve empty memory content")
+    destination = decision_target_path(target)
+    append_official_memory(destination, item, approved_content)
+    record_decision(
+        candidate_id,
+        {
+            "status": "approved",
+            "approved_target": target,
+            "approved_path": str(destination),
+            "decided_at": now(),
+            "risk_flags": item.get("risk_flags", []),
+        },
+    )
+    return find_item(candidate_id)
+
+
+def record_decision(candidate_id: str, decision: dict[str, Any]) -> None:
+    state = state_map()
+    state["items"][candidate_id] = decision
+    write_json(PROJECT_STATE, state)
+    build_queue()
+
+
+def reject(candidate_id: str) -> None:
+    record_decision(candidate_id, {"status": "rejected", "decided_at": now()})
+
+
+def defer(candidate_id: str) -> None:
+    record_decision(candidate_id, {"status": "deferred", "decided_at": now()})
+
+
+def reset(candidate_id: str) -> None:
+    state = state_map()
+    state.get("items", {}).pop(candidate_id, None)
+    write_json(PROJECT_STATE, state)
+    build_queue()
+
+
+def reject_noise_personal_candidates(dry_run: bool = True) -> list[str]:
+    queue = load_queue(refresh=True)
+    ids = [item["id"] for item in queue.get("items", []) if is_noise_personal_candidate(item)]
+    if not dry_run:
+        for candidate_id in ids:
+            reject(candidate_id)
+    return ids
+
+
+def review_service_running(timeout: float = 0.6) -> bool:
+    try:
+        with urllib.request.urlopen(f"{REVIEW_URL}/health", timeout=timeout) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def start_review_service_if_needed() -> bool:
+    if review_service_running():
+        return False
+    server_script = APP_ROOT / "scripts" / "memory_review_server.py"
+    log_path = CODEX_DIR / "memory_review_server.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["MEMORY_REVIEW_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    with log_path.open("ab") as log_handle:
+        subprocess.Popen(
+            [sys.executable, str(server_script)],
+            cwd=str(PROJECT_ROOT),
+            stdout=log_handle,
+            stderr=log_handle,
+            stdin=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+    for _ in range(10):
+        time.sleep(0.2)
+        if review_service_running():
+            return True
+    return False
+
+
+def should_remind(queue: dict[str, Any], force: bool = False) -> bool:
+    counts = queue.get("counts", {})
+    if force:
+        return True
+    if counts.get("personal_pending", 0) > 3 or counts.get("project_pending", 0) > 5:
+        return True
+    state = state_map()
+    last = state.get("last_reminder_at")
+    if not last:
+        return counts.get("pending", 0) > 0
+    try:
+        last_dt = _dt.datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    return (_dt.datetime.now().astimezone() - last_dt).total_seconds() >= 24 * 3600
+
+
+def mark_reminded() -> None:
+    state = state_map()
+    state["last_reminder_at"] = now()
+    write_json(PROJECT_STATE, state)
+
+
+def review_summary(queue: dict[str, Any]) -> str:
+    counts = queue.get("counts", {})
+    return (
+        f"pending={counts.get('pending', 0)}, "
+        f"project={counts.get('project_pending', 0)}, "
+        f"personal={counts.get('personal_pending', 0)}, "
+        f"project_root={PROJECT_ROOT}, "
+        f"url={REVIEW_URL}"
+    )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Build and manage memory review queue")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("refresh")
+    sub.add_parser("summary")
+    sub.add_parser("ensure-server")
+    args = parser.parse_args()
+
+    if args.command == "refresh":
+        queue = build_queue()
+        print(review_summary(queue))
+        return 0
+    if args.command == "summary":
+        queue = load_queue(refresh=True)
+        print(review_summary(queue))
+        return 0
+    if args.command == "ensure-server":
+        queue = build_queue()
+        started = start_review_service_if_needed()
+        print(f"started={started} {review_summary(queue)}")
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
