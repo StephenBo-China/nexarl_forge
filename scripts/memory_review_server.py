@@ -364,7 +364,7 @@ def page() -> str:
         <input id="loopPort" placeholder="Loop staging 端口，留空用推荐值">
         <button onclick="registerProjectFromInput()">注册</button>
         <button onclick="initProjectFromInput()">初始化记忆</button>
-        <button class="primary" onclick="initLoopFromInput()">初始化 Loop</button>
+        <button class="primary" onclick="initLoopFromInput()">初始化 / 升级 Loop</button>
       </div>
       <div id="counts" class="counts"></div>
     </div>
@@ -518,7 +518,7 @@ async function initLoopFromInput() {
   const rawPort = document.getElementById('loopPort').value.trim();
   const port = rawPort ? Number(rawPort) : projectState.recommend_port;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return showMessage('请输入有效端口');
-  if (!confirm(`将初始化 loop 项目：\\n${root}\\n\\n建议/选择的 staging 端口：${port}\\n\\n需要你确认这个端口后才会写入 .loop/config.json。继续？`)) return;
+  if (!confirm(`将初始化或兼容升级 loop 项目：\\n${root}\\n\\n建议/选择的 staging 端口：${port}\\n\\n已有项目专用端口、数据库、OSS 和部署配置不会被覆盖；只补充缺失的多对话 Worktree/Release 安全字段。继续？`)) return;
   const result = await api('/api/projects/init-loop', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -526,7 +526,7 @@ async function initLoopFromInput() {
   });
   projectState = result.projects;
   updateProjectBadge();
-  showMessage(`loop 项目初始化完成，端口 ${result.port}`);
+  showMessage(`loop 项目初始化 / 升级完成，端口 ${result.port}`);
   await loadQueue();
   renderProjects(result);
 }
@@ -737,7 +737,7 @@ function renderProjects(lastResult) {
         <ul>
           <li><strong>注册项目</strong>：只把路径加入 <code>~/.codex/memory_review/projects.json</code> 并切换当前项目。</li>
           <li><strong>初始化项目记忆</strong>：创建缺失的项目记忆文件、Codex hook、Claude Code hook 和共享规则。</li>
-          <li><strong>初始化 loop 项目</strong>：在项目记忆初始化基础上创建 <code>.loop/config.json</code> 和 <code>loop/</code> 工作目录；端口由系统推荐，但必须经你在弹窗确认后写入。</li>
+          <li><strong>初始化 / 升级 loop 项目</strong>：创建或兼容升级 <code>.loop/config.json</code> 和 <code>loop/</code> 工作目录；已有项目资源配置不覆盖，只补充缺失的多对话 Worktree/Release 安全字段。</li>
           <li>已存在文件不会覆盖，会在结果中显示为 <code>existing</code>。</li>
         </ul>
       </section>
@@ -860,7 +860,7 @@ function renderMemoryStrategy() {
         <ol>
           <li>在“项目管理”输入项目路径。</li>
           <li>确认推荐 staging 端口，或手动输入端口。</li>
-          <li>点击“初始化 loop 项目”，创建 <code>.loop/config.json</code>、<code>loop/prd</code>、<code>loop/acceptance</code>、<code>loop/reports</code>、<code>loop/claude_tests</code>。</li>
+          <li>点击“初始化 / 升级 Loop”，创建或兼容升级 <code>.loop/config.json</code>，并确保 <code>loop/prd</code>、<code>loop/acceptance</code>、<code>loop/reports</code>、<code>loop/claude_tests</code> 存在。</li>
           <li>后续在 Codex 中贴 Markdown PRD，并要求先生成验收标准。</li>
           <li>Codex 负责开发和 staging，Claude Code 负责 Playwright/浏览器验收，直到通过或触发暂停条件。</li>
         </ol>
@@ -870,6 +870,7 @@ function renderMemoryStrategy() {
         <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py register /path/to/repo
 python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init /path/to/repo
 python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init-loop /path/to/repo --port 8082
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py upgrade-loop /path/to/repo
 python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py list
 python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py use /path/to/repo</pre>
       </section>
@@ -882,7 +883,9 @@ function renderLoopDocs() {
     'Codex 开发',
     'Claude Code 验收',
     'Playwright 默认测试',
-    'Worktree 隔离',
+    '多对话 Worktree 隔离',
+    'Release / Staging 串行锁',
+    '原仓库自动安全同步',
     '最多 10 轮',
     '合并和正式上线需用户确认'
   ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
@@ -890,18 +893,19 @@ function renderLoopDocs() {
     <div class="doc">
       <section class="doc-hero">
         <h2>Loop 开发使用说明</h2>
-        <p>Loop engineering 是一套跨项目循环开发流程：你给出 Markdown PRD，Codex 负责开发、分支、提交、staging 部署和修复；Claude Code 负责独立测试与评测报告；Codex 读取报告继续迭代。最终合并主分支和正式上线必须在你完成产品验收后，由你主动确认。</p>
+        <p>Loop engineering 是一套支持多对话并行开发、串行安全发布的跨项目流程：你给出 Markdown PRD，Codex 在独立外部 worktree 开发、提交、部署和修复；Claude Code 独立评测；经你批准后，release 队列基于最新远端主分支完成整合、测试、原仓库同步和部署一致性验证。</p>
       </section>
 
       <div class="doc-grid">
         <section class="doc-section">
           <h3>Worktree 优先</h3>
           <ul>
-            <li>当用户说 <code>开 worktree</code>，Codex 应先创建或使用专用 git worktree，再开始实质性项目工作。</li>
-            <li>loop 开发默认先进入专用 worktree：一个任务或 loop 功能，对应一个对话、一个 worktree、一个分支。</li>
+            <li>原始仓库是 canonical workspace，默认保持在主分支并作为 <code>origin/master</code> 的本地镜像；日常开发不在原始仓库进行。</li>
+            <li>当用户说 <code>开 worktree</code>，Codex 应在原始仓库之外创建专用 git worktree，再开始实质性项目工作。</li>
+            <li>一个任务或 loop 功能对应一个对话、一个外部 worktree、一个分支；多个对话可以并行开发，但不能共享 worktree 或分支。</li>
             <li>主开发对话拥有产品源码修改；review、eval、报告和实验对话使用辅助 worktree/分支。</li>
-            <li>不要让多个对话在同一个 worktree 写产品代码，也不要并发改同一个 loop 分支；辅助分支通过主 worktree merge 或 cherry-pick。</li>
-            <li>staging 默认由一个活跃 loop 分支占用；需要并行 staging 时，必须显式配置不同远程路径和端口。</li>
+            <li>功能开发可并行；主分支合并、主分支 push、原始仓库同步和共享 staging 部署必须通过仓库级锁串行执行。</li>
+            <li>staging 默认由一个活跃分支占用；并行 staging 必须显式隔离远程路径、端口、测试数据和 OSS 前缀。</li>
           </ul>
         </section>
 
@@ -920,10 +924,26 @@ function renderLoopDocs() {
             <li>loop 过程只在 <code>loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</code> 开发分支进行。</li>
             <li>每轮允许自动 commit/push，但不能自动合并 <code>master</code>。</li>
             <li>正式上线前必须再次询问用户。</li>
+            <li>主分支整合在基于最新远端主分支的临时 release worktree 进行，不能在脏的原始仓库里解决冲突。</li>
+            <li>禁止 force push、自动 stash、reset、checkout 覆盖或删除用户文件。</li>
+            <li>最终完成必须验证功能提交已进入主分支，且远端主分支、原始仓库和部署 commit 一致。</li>
             <li>报告、记忆、测试产物禁止记录 token、验证码、API key、RDS/OSS 密钥等敏感信息。</li>
           </ul>
         </section>
       </div>
+
+      <section class="doc-section">
+        <h3>多对话、Release 队列与原仓库同步</h3>
+        <ol>
+          <li>每个对话通过 <code>worktree_flow.py start</code> 注册唯一任务所有权，并从最新远端主分支创建外部 worktree。</li>
+          <li>各对话独立开发、提交、push 和评测，达到验收状态后运行 <code>finish</code>，但不能自动合并主分支。</li>
+          <li>用户批准合并后，任务进入仓库级 release 队列；同一时间只有一个 release lock 持有者。</li>
+          <li>release worktree 合并最新远端主分支与功能分支，解决冲突并执行完整测试；远端主分支并发更新会让普通 push 安全失败。</li>
+          <li>push 成功后以 <code>ff-only</code> 同步原始仓库。原始仓库分支不正确、历史分叉或脏文件路径重叠时停止并报告，不覆盖用户修改。</li>
+          <li>共享 staging 部署使用 staging lock，并部署确定的远端主分支 commit。</li>
+          <li>只有远端主分支、原始仓库、部署 commit 一致，且功能 commit 是主分支祖先时，才可报告最终完成。</li>
+        </ol>
+      </section>
 
       <section class="doc-section">
         <h3>在已经接入 loop 的仓库中启动</h3>
@@ -974,7 +994,7 @@ scripts/deploy_staging.sh</pre>
           <li>Codex 保存或同步 PRD 到 <code>loop/prd/current_prd.md</code>。</li>
           <li>Codex 生成 <code>loop/acceptance/criteria.md</code>。</li>
           <li>用户确认验收标准。</li>
-          <li>Codex 创建或使用专用 worktree，并创建或切换到 <code>loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</code> 分支。</li>
+          <li>Codex 通过中央 Worktree CLI 创建外部专用 worktree，并创建唯一 <code>loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</code> 分支。</li>
           <li>Codex 开发、运行本地验证、commit/push。</li>
           <li>Codex 部署远程 staging。</li>
           <li>Codex 通过 <code>claude -p</code> 下发测试任务给 Claude Code。</li>
@@ -982,6 +1002,8 @@ scripts/deploy_staging.sh</pre>
           <li>Claude Code 输出 <code>loop/reports/claude_eval_latest.md</code> 和 <code>loop/reports/claude_eval_latest.json</code>。</li>
           <li>Codex 读取报告继续修复并进入下一轮。</li>
           <li>循环通过、达到停止条件，或需要用户判断时暂停。</li>
+          <li>用户批准合并后进入串行 release 队列，在临时 release worktree 合并最新主分支并完整测试。</li>
+          <li>推送主分支后安全同步原始仓库，部署主分支测试服务，并验证提交一致性。</li>
         </ol>
       </section>
 
@@ -1010,20 +1032,23 @@ scripts/deploy_staging.sh</pre>
 
       <section class="doc-section">
         <h3>Worktree 常用命令</h3>
-        <p>从主仓库为一个 loop 功能创建独立 worktree：</p>
-        <pre>cd /path/to/project
-mkdir -p /Users/stephenbo/Noema/Projects/worktrees
-git worktree add -b loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt; \
-  /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-&lt;slug&gt; \
-  master</pre>
-        <p>为评测或 review 创建辅助 worktree：</p>
-        <pre>git worktree add -b codex/eval-&lt;slug&gt;-r1 \
-  /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-eval-&lt;slug&gt;-r1 \
-  loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</pre>
-        <p>查看和清理 worktree：</p>
-        <pre>git worktree list
-git worktree remove /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-&lt;slug&gt;
-git worktree prune</pre>
+        <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py start /path/to/repo \
+  --task &lt;slug&gt; --conversation &lt;conversation-id&gt;
+
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py status /path/to/repo
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py finish /path/to/repo --task &lt;slug&gt;
+
+# 仅在用户明确批准合并主分支后：
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py release /path/to/repo \
+  --task &lt;slug&gt; --approved --test-command "python3 -m pytest -q tests"
+
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py sync-canonical /path/to/repo
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py deploy-staging /path/to/repo \
+  --task &lt;slug&gt; --approved --command "./scripts/deploy_staging.sh" \
+  --deployed-commit-command "./scripts/deployed_commit.sh"
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py verify /path/to/repo --task &lt;slug&gt;
+python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py cleanup /path/to/repo --task &lt;slug&gt; --approved</pre>
+        <p>运行状态和锁保存在 <code>~/.codex/worktree_manager/</code>，不提交到项目仓库。清理只允许删除已经进入远端主分支且工作目录干净的本地 worktree；删除远端功能分支仍需单独授权。</p>
       </section>
 
       <section class="doc-section">

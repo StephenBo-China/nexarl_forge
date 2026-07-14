@@ -20,6 +20,9 @@ Codex. It has no third-party Python dependencies; Python 3.10+ is enough.
 - Project long memory approval flow.
 - Noise personal-memory candidate preview/rejection.
 - Built-in Loop Engineering usage documentation.
+- Multi-conversation worktree task registry and safe release CLI.
+- Repository-level release/staging locks and canonical workspace synchronization.
+- Remote-main, canonical-main, feature-ancestry, and deployment commit verification.
 - A CLI for terminal-based review and approval.
 
 ## Directory Layout
@@ -113,6 +116,13 @@ Initialize a Loop Engineering project:
 
 ```bash
 python3 scripts/memory_project.py init-loop /path/to/repo --port 8082
+```
+
+Upgrade an existing Loop project to the latest multi-conversation worktree
+schema without overwriting project-specific staging, database, or OSS values:
+
+```bash
+python3 scripts/memory_project.py upgrade-loop /path/to/repo
 ```
 
 If `--port` is omitted, the tool recommends the next available port based on
@@ -338,25 +348,50 @@ The web console includes a `Loop 说明` tab. It documents:
 
 ## Worktree Development
 
-Use a dedicated git worktree whenever multiple Codex or Claude conversations may
-work around the same project. The recommended mapping is:
+The original repository is the canonical workspace. Keep it on the configured
+main branch as a mirror of remote main; perform feature work in external
+worktrees. The required mapping is:
 
 ```text
 one task or loop feature = one conversation = one worktree = one branch
 ```
 
-When the user says `开 worktree`, Codex should create or use a dedicated
-worktree before substantial project work. For loop engineering, Codex should
-start implementation in a dedicated worktree by default. The primary development
-conversation owns product-source edits for the loop branch; review, evaluation,
-report, and experiment conversations should use auxiliary worktrees and branches.
-Merge or cherry-pick auxiliary contributions back through the primary loop
-worktree.
+Feature development may run concurrently. Main integration, main push,
+canonical synchronization, and shared staging deployment are serialized with
+repository locks. Main integration happens in a temporary release worktree
+based on the latest remote main branch, not in a dirty canonical workspace.
 
-Avoid multiple conversations writing product code in the same worktree or
-concurrently mutating the same loop branch. Staging should normally be owned by
-one active loop branch at a time unless the project explicitly configures
-separate remote paths and ports.
+After an approved merge, canonical synchronization uses `ff-only`. Dirty paths
+that overlap incoming paths block synchronization. The workflow never performs
+an automatic stash, reset, force push, checkout overwrite, or deletion of user
+files. Final completion requires remote main, canonical main, and deployment
+commits to match, and the feature commit to be an ancestor of main.
+
+Use the central CLI:
+
+```bash
+python3 scripts/worktree_flow.py start /path/to/repo \
+  --task feature-name --conversation conversation-id
+python3 scripts/worktree_flow.py status /path/to/repo
+python3 scripts/worktree_flow.py finish /path/to/repo --task feature-name
+
+# Only after explicit user approval to merge main:
+python3 scripts/worktree_flow.py release /path/to/repo \
+  --task feature-name --approved \
+  --test-command "python3 -m pytest -q tests"
+
+python3 scripts/worktree_flow.py sync-canonical /path/to/repo
+python3 scripts/worktree_flow.py deploy-staging /path/to/repo \
+  --task feature-name --approved \
+  --command "./scripts/deploy_staging.sh" \
+  --deployed-commit-command "./scripts/deployed_commit.sh"
+python3 scripts/worktree_flow.py verify /path/to/repo --task feature-name
+python3 scripts/worktree_flow.py cleanup /path/to/repo \
+  --task feature-name --approved
+```
+
+The complete lifecycle, safety rules, state model, and completion report are in
+[`docs/worktree_loop_workflow.md`](docs/worktree_loop_workflow.md).
 
 ## Port And Security
 

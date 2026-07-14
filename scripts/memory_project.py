@@ -168,7 +168,11 @@ If `.loop/config.json` exists, read it before PRD planning, loop branch work,
 staging deployment, Claude evaluation, or master/production decisions. When the
 user says `开 worktree`, create or use a dedicated git worktree before
 substantial project work. For loop development, start in a dedicated worktree by
-default before implementation begins.
+default before implementation begins. Treat the original repository as the
+canonical workspace. Parallel conversations must use different external
+worktrees and branches; main integration, canonical synchronization, and shared
+staging deployment must be serialized with repository locks. After an approved
+main merge, verify remote main, canonical main, and deployed commits match.
 
 ## Memory Governance
 
@@ -227,6 +231,13 @@ repository and the same approval-gated personal memory files.
 - When the user says `开 worktree`, create or use a dedicated git worktree
   before substantial project work. Loop implementation should start in a
   dedicated worktree by default.
+- Keep task worktrees outside the canonical repository. One conversation owns
+  one task worktree and branch. Main integration, canonical synchronization,
+  and shared staging deployment are repository-locked serialized operations.
+- After a user-approved main merge, update the canonical repository with
+  `ff-only` only when safe. Never auto-stash, reset, force-push, or overwrite
+  dirty canonical paths. Verify remote main, canonical main, and deployment
+  commit equality before reporting final completion.
 - When `.loop/config.json` exists, also read:
   - `/Users/stephenbo/.codex/loop_engineering`
   - `/Users/stephenbo/.claude/loop_engineering`
@@ -470,13 +481,20 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
     name = repo_name(root)
     slug_bucket = re.sub(r"[^a-z0-9-]+", "-", name.lower().replace("_", "-")).strip("-")
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "project_repo_name": name,
         "loop_enabled": True,
+        "repository": {
+            "canonical_root": str(root.resolve()),
+            "main_branch": "master",
+            "remote": "origin",
+        },
         "worktree": {
             "enabled": True,
             "trigger_phrase": "开 worktree",
+            "root": "/Users/stephenbo/Noema/Projects/worktrees",
             "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
             "one_task_one_conversation_one_worktree_one_branch": True,
             "primary_loop_conversation_owns_product_source_edits": True,
@@ -484,6 +502,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "avoid_multiple_conversations_mutating_same_loop_branch": True,
             "merge_auxiliary_work_through_primary_loop_worktree": True,
             "staging_single_active_loop_branch_by_default": True,
+            "registry_path": "~/.codex/worktree_manager/tasks.json",
         },
         "branch": {
             "name_format": "loop/<project>-<date>-<slug>",
@@ -495,7 +514,33 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             },
             "merge_to_main_requires_user_command": True,
         },
+        "release": {
+            "serialized": True,
+            "lock_root": "~/.codex/worktree_manager/locks",
+            "temporary_release_branch": True,
+            "require_latest_remote_main": True,
+            "require_full_tests": True,
+            "allow_force_push": False,
+        },
+        "canonical_sync": {
+            "enabled": True,
+            "mode": "ff-only",
+            "require_main_branch": True,
+            "allow_dirty_non_overlapping": True,
+            "block_dirty_overlapping": True,
+            "allow_auto_stash": False,
+            "allow_reset": False,
+            "verify_dirty_content_preserved": True,
+        },
+        "verification": {
+            "commands": [],
+            "require_feature_ancestor_of_main": True,
+            "require_remote_canonical_deploy_commit_match": True,
+        },
         "staging": {
+            "mode": "shared_locked",
+            "lock_root": "~/.codex/worktree_manager/locks",
+            "deploy_source_after_merge": "origin/master",
             "host": DEFAULT_STAGING_HOST,
             "port": port,
             "public_base_url": f"http://8.210.155.175:{port}",
@@ -537,6 +582,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "claude_loop_dir": "~/.claude/loop_engineering",
             "both_agents_read_both_dirs": True,
             "project_loop_config_to_personal_long_candidate": True,
+            "worktree_flow_document": str(APP_ROOT / "docs" / "worktree_loop_workflow.md"),
         },
         "sensitive_data_policy": {
             "do_not_record_tokens": True,
@@ -547,18 +593,46 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
     }
 
 
+def merge_missing(current: Any, defaults: Any) -> Any:
+    """Add new schema defaults without overwriting project-specific values."""
+    if not isinstance(current, dict) or not isinstance(defaults, dict):
+        return current
+    merged = dict(current)
+    for key, default in defaults.items():
+        if key not in merged:
+            merged[key] = default
+        elif isinstance(merged[key], dict) and isinstance(default, dict):
+            merged[key] = merge_missing(merged[key], default)
+    return merged
+
+
+def upgrade_loop_config(root: pathlib.Path, port: int) -> tuple[dict[str, Any], str]:
+    config_path = root / ".loop" / "config.json"
+    defaults = loop_config(root, port)
+    if not config_path.exists():
+        write_json(config_path, defaults)
+        return defaults, "created"
+    current = read_json(config_path, {})
+    if not isinstance(current, dict):
+        raise ValueError(f"Invalid loop config JSON: {config_path}")
+    upgraded = merge_missing(current, defaults)
+    upgraded["schema_version"] = max(int(current.get("schema_version", 1)), 2)
+    upgraded.setdefault("repository", {})["canonical_root"] = str(root.resolve())
+    if upgraded != current:
+        write_json(config_path, upgraded)
+        return upgraded, "upgraded"
+    return current, "existing"
+
+
 def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, Any]:
     project_root = normalize_project_root(root)
     result = init_project(project_root)
     changes = result["changes"]
     selected_port = int(port or recommend_port())
     config_path = project_root / ".loop" / "config.json"
-    if config_path.exists():
-        changes.append({"path": str(config_path), "status": "existing"})
-    else:
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        write_json(config_path, loop_config(project_root, selected_port))
-        changes.append({"path": str(config_path), "status": "created"})
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    _, config_status = upgrade_loop_config(project_root, selected_port)
+    changes.append({"path": str(config_path), "status": config_status})
     for rel in ["loop/prd", "loop/acceptance", "loop/reports", "loop/state", "loop/claude_tests"]:
         path = project_root / rel
         if path.exists():
@@ -594,6 +668,9 @@ def main() -> int:
     loop_parser = sub.add_parser("init-loop")
     loop_parser.add_argument("project_root")
     loop_parser.add_argument("--port", type=int, default=None)
+    upgrade_parser = sub.add_parser("upgrade-loop")
+    upgrade_parser.add_argument("project_root")
+    upgrade_parser.add_argument("--port", type=int, default=None)
     sub.add_parser("list")
     sub.add_parser("current")
     sub.add_parser("recommend-port")
@@ -609,6 +686,9 @@ def main() -> int:
         print(json.dumps(init_project(args.project_root), ensure_ascii=False, indent=2))
         return 0
     if args.command == "init-loop":
+        print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-loop":
         print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
         return 0
     if args.command == "list":
