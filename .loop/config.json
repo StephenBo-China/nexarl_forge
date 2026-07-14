@@ -60,5 +60,17 @@
     "port": 8082,
     "public_base_url": "http://8.210.155.175:8082",
     "remote_path": "/root/vibe_coding_manage_platform_loop_staging"
+  },
+  "worktree": {
+    "enabled": true,
+    "trigger_phrase": "开 worktree",
+    "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+    "loop_requires_dedicated_worktree": true,
+    "one_task_one_conversation_one_worktree_one_branch": true,
+    "primary_loop_conversation_owns_product_source_edits": true,
+    "auxiliary_conversations_use_auxiliary_branches": true,
+    "avoid_multiple_conversations_mutating_same_loop_branch": true,
+    "merge_auxiliary_work_through_primary_loop_worktree": true,
+    "staging_single_active_loop_branch_by_default": true
   }
 }

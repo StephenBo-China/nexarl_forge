@@ -882,6 +882,7 @@ function renderLoopDocs() {
     'Codex 开发',
     'Claude Code 验收',
     'Playwright 默认测试',
+    'Worktree 隔离',
     '最多 10 轮',
     '合并和正式上线需用户确认'
   ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
@@ -893,6 +894,17 @@ function renderLoopDocs() {
       </section>
 
       <div class="doc-grid">
+        <section class="doc-section">
+          <h3>Worktree 优先</h3>
+          <ul>
+            <li>当用户说 <code>开 worktree</code>，Codex 应先创建或使用专用 git worktree，再开始实质性项目工作。</li>
+            <li>loop 开发默认先进入专用 worktree：一个任务或 loop 功能，对应一个对话、一个 worktree、一个分支。</li>
+            <li>主开发对话拥有产品源码修改；review、eval、报告和实验对话使用辅助 worktree/分支。</li>
+            <li>不要让多个对话在同一个 worktree 写产品代码，也不要并发改同一个 loop 分支；辅助分支通过主 worktree merge 或 cherry-pick。</li>
+            <li>staging 默认由一个活跃 loop 分支占用；需要并行 staging 时，必须显式配置不同远程路径和端口。</li>
+          </ul>
+        </section>
+
         <section class="doc-section">
           <h3>角色分工</h3>
           <ul>
@@ -921,8 +933,8 @@ function renderLoopDocs() {
 这是 PRD：
 &lt;你的 Markdown PRD&gt;
 
-先生成 loop/acceptance/criteria.md，让我确认验收标准。</pre>
-        <p>Codex 会先读取项目 loop 配置、个人级 Codex/Claude loop 目录，然后生成验收标准。你确认后才进入开发循环。</p>
+先开 worktree，再生成 loop/acceptance/criteria.md，让我确认验收标准。</pre>
+        <p>Codex 会先读取项目 loop 配置、个人级 Codex/Claude loop 目录，并按 worktree-first 规则创建或使用专用 worktree，然后生成验收标准。你确认后才进入开发循环。</p>
       </section>
 
       <section class="doc-section">
@@ -962,7 +974,7 @@ scripts/deploy_staging.sh</pre>
           <li>Codex 保存或同步 PRD 到 <code>loop/prd/current_prd.md</code>。</li>
           <li>Codex 生成 <code>loop/acceptance/criteria.md</code>。</li>
           <li>用户确认验收标准。</li>
-          <li>Codex 创建或切换到 <code>loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</code> 分支。</li>
+          <li>Codex 创建或使用专用 worktree，并创建或切换到 <code>loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</code> 分支。</li>
           <li>Codex 开发、运行本地验证、commit/push。</li>
           <li>Codex 部署远程 staging。</li>
           <li>Codex 通过 <code>claude -p</code> 下发测试任务给 Claude Code。</li>
@@ -995,6 +1007,24 @@ scripts/deploy_staging.sh</pre>
           </ul>
         </section>
       </div>
+
+      <section class="doc-section">
+        <h3>Worktree 常用命令</h3>
+        <p>从主仓库为一个 loop 功能创建独立 worktree：</p>
+        <pre>cd /path/to/project
+mkdir -p /Users/stephenbo/Noema/Projects/worktrees
+git worktree add -b loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt; \
+  /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-&lt;slug&gt; \
+  master</pre>
+        <p>为评测或 review 创建辅助 worktree：</p>
+        <pre>git worktree add -b codex/eval-&lt;slug&gt;-r1 \
+  /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-eval-&lt;slug&gt;-r1 \
+  loop/&lt;project&gt;-&lt;date&gt;-&lt;slug&gt;</pre>
+        <p>查看和清理 worktree：</p>
+        <pre>git worktree list
+git worktree remove /Users/stephenbo/Noema/Projects/worktrees/&lt;repo&gt;-&lt;slug&gt;
+git worktree prune</pre>
+      </section>
 
       <section class="doc-section">
         <h3>常用命令</h3>
@@ -1071,7 +1101,7 @@ scripts/deploy_staging.sh</pre>
 
       <section class="doc-section">
         <h3>最短启动口令</h3>
-        <pre>按当前仓库 .loop/config.json 启动 loop 开发。
+        <pre>按当前仓库 .loop/config.json 启动 loop 开发，并先开 worktree。
 
 这是 PRD：
 &lt;你的 Markdown PRD&gt;

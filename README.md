@@ -325,15 +325,38 @@ Do not create personal-memory candidates from:
 
 ## Loop Engineering Documentation
 
-The web console includes a `Loop 开发说明` tab. It documents:
+The web console includes a `Loop 说明` tab. It documents:
 
 - how to start loop development
+- worktree-first multi-conversation development
 - how Codex and Claude Code divide work
 - how to use Playwright-based Claude evaluation
 - loop branch naming
 - staging deployment rules
 - stop conditions
 - common commands and examples
+
+## Worktree Development
+
+Use a dedicated git worktree whenever multiple Codex or Claude conversations may
+work around the same project. The recommended mapping is:
+
+```text
+one task or loop feature = one conversation = one worktree = one branch
+```
+
+When the user says `开 worktree`, Codex should create or use a dedicated
+worktree before substantial project work. For loop engineering, Codex should
+start implementation in a dedicated worktree by default. The primary development
+conversation owns product-source edits for the loop branch; review, evaluation,
+report, and experiment conversations should use auxiliary worktrees and branches.
+Merge or cherry-pick auxiliary contributions back through the primary loop
+worktree.
+
+Avoid multiple conversations writing product code in the same worktree or
+concurrently mutating the same loop branch. Staging should normally be owned by
+one active loop branch at a time unless the project explicitly configures
+separate remote paths and ports.
 
 ## Port And Security
 

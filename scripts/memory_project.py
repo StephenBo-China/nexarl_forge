@@ -165,7 +165,10 @@ Project short memory is large by design. Read recent or relevant sections only:
 - `codex/codex_short_memory.md`
 
 If `.loop/config.json` exists, read it before PRD planning, loop branch work,
-staging deployment, Claude evaluation, or master/production decisions.
+staging deployment, Claude evaluation, or master/production decisions. When the
+user says `开 worktree`, create or use a dedicated git worktree before
+substantial project work. For loop development, start in a dedicated worktree by
+default before implementation begins.
 
 ## Memory Governance
 
@@ -221,6 +224,9 @@ repository and the same approval-gated personal memory files.
 - If `.loop/config.json` exists, read it before loop planning, staging
   evaluation, Playwright/browser testing, report writing, or pass/block
   decisions.
+- When the user says `开 worktree`, create or use a dedicated git worktree
+  before substantial project work. Loop implementation should start in a
+  dedicated worktree by default.
 - When `.loop/config.json` exists, also read:
   - `/Users/stephenbo/.codex/loop_engineering`
   - `/Users/stephenbo/.claude/loop_engineering`
@@ -343,6 +349,8 @@ def context_text(event: str, counts: dict[str, int]) -> str:
 - Claude loop directory: `/Users/stephenbo/.claude/loop_engineering`
 - Required behavior: read `.loop/config.json` before loop planning,
   staging work, Claude evaluation, or master/production decisions.
+- Worktree behavior: use a dedicated worktree when the user says `开 worktree`;
+  loop implementation starts in a dedicated worktree by default.
 """
     return f"""# Shared Memory Context Packet
 
@@ -465,6 +473,18 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
         "schema_version": 1,
         "project_repo_name": name,
         "loop_enabled": True,
+        "worktree": {
+            "enabled": True,
+            "trigger_phrase": "开 worktree",
+            "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "loop_requires_dedicated_worktree": True,
+            "one_task_one_conversation_one_worktree_one_branch": True,
+            "primary_loop_conversation_owns_product_source_edits": True,
+            "auxiliary_conversations_use_auxiliary_branches": True,
+            "avoid_multiple_conversations_mutating_same_loop_branch": True,
+            "merge_auxiliary_work_through_primary_loop_worktree": True,
+            "staging_single_active_loop_branch_by_default": True,
+        },
         "branch": {
             "name_format": "loop/<project>-<date>-<slug>",
             "auto_commit": True,
