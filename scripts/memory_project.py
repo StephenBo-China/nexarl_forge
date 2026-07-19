@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 from typing import Any
 
@@ -144,6 +145,48 @@ def project_title(root: pathlib.Path) -> str:
     return repo_name(root).replace("_", " ")
 
 
+def agent_candidate_protocol(root: pathlib.Path) -> str:
+    return f"""## Agent-Generated Memory Candidates
+
+The active conversation model performs candidate summarization itself. Hooks
+must not copy raw prompts into candidate files or call another model API.
+
+Before the final response to a substantial instruction, and at compaction
+boundaries, review the conversation for at most two durable candidate memories:
+
+- Personal candidates: only cross-project development habits, collaboration
+  preferences, work/thinking style, workflow preferences, or user-profile
+  facts. Target `long` for stable preferences and `short` for genuinely
+  temporary cross-project context.
+- Project candidates: only durable architecture, deployment, product,
+  technical-constraint, or project-workflow facts. Target `long` only.
+
+Allowed personal categories: `development_habit`,
+`collaboration_preference`, `work_style`, `thinking_style`, `user_profile`,
+`workflow_preference`. Allowed project categories: `project_architecture`,
+`deployment_rule`, `product_direction`, `technical_constraint`,
+`project_workflow`.
+
+Never use a raw prompt as candidate content. Write a short title plus a
+standalone 1-3 sentence summary. Exclude one-off tasks, screenshots, URLs,
+paths, system instructions, uncertain assumptions, credentials, tokens,
+verification codes, passwords, and infrastructure secrets. Deduplicate against
+pending and approved memory before writing.
+
+Write a distilled candidate with:
+
+```bash
+MEMORY_REVIEW_PROJECT_ROOT={root} python3 {APP_ROOT}/scripts/memory_review.py propose \\
+  --scope personal|project --target long|short --category CATEGORY \\
+  --title "TITLE" --summary "SUMMARY" --source-event agent_summary
+```
+
+Do not write directly to official long/short memory. Official promotion remains
+approval-gated. If candidate creation fails, skip it and report the concrete
+reason in the current Codex or Claude Code conversation.
+"""
+
+
 def agent_memory_block(root: pathlib.Path) -> str:
     name = repo_name(root)
     return f"""# {name} Codex Instructions
@@ -180,6 +223,8 @@ Project short memory may be appended by hooks. Project long memory should
 receive only reviewed durable project facts. Personal long and short memory
 require explicit approval of exact content; write personal candidates only to
 `~/.codex/personal_memory/proposals.md`.
+
+{agent_candidate_protocol(root)}
 """
 
 
@@ -210,6 +255,8 @@ If `.loop/config.json` exists, also load:
 
 Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
+
+{agent_candidate_protocol(root)}
 """
 
 
@@ -262,6 +309,8 @@ The central memory review console is maintained at:
 For this project, pass:
 
 - `MEMORY_REVIEW_PROJECT_ROOT={root}`
+
+{agent_candidate_protocol(root)}
 """
 
 
@@ -385,6 +434,14 @@ Repository: `{{ROOT}}`
 - personal candidates: {{counts.get("personal_pending", 0)}}
 - review URL: {{REVIEW_URL}}
 - CLI: `MEMORY_REVIEW_PROJECT_ROOT={{ROOT}} python3 {{APP_ROOT}}/scripts/memory_review.py list`
+
+## Candidate Generation Reminder
+
+- The active {{SOURCE}} conversation model reviews memory candidates before its
+  final response and at compaction boundaries.
+- Hooks must not copy raw prompts into candidate files or call another model.
+- Create at most two distilled candidates through `memory_review.py propose`.
+- If creation fails, report the concrete reason in the current conversation.
 {{loop}}
 """
 
@@ -393,7 +450,10 @@ def append_short(event: str, payload: Any) -> None:
     prompt = find_prompt(payload)
     entry = f"\\n### {{now()}} - {{SOURCE}}:{{event}}\\n\\n- cwd: `{{os.getcwd()}}`\\n"
     if prompt:
-        entry += "\\n```text\\n" + prompt[:3000] + ("\\n...[truncated]" if len(prompt) > 3000 else "") + "\\n```\\n"
+        compact = " ".join(prompt.split())
+        if len(compact) > 280:
+            compact = compact[:277].rstrip() + "..."
+        entry += "- summary: " + compact + "\\n"
     else:
         entry += "- no user prompt payload was available to this hook.\\n"
     with SHORT_MEMORY.open("a", encoding="utf-8") as handle:
@@ -444,12 +504,44 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     ensure_file(project_root / "codex" / "shared_memory_context_packet.md", f"# {name} Shared Memory Context Packet\n\nGenerated: {now()}\n", changes)
     append_if_missing(project_root / "AGENTS.md", f"# {name} Codex Instructions", agent_memory_block(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "# " + name + " Shared Memory Instructions", claude_md(project_root), changes)
+    append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
+    append_if_missing(project_root / "CLAUDE.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
     ensure_file(project_root / ".codex" / "hooks.json", codex_hooks_json(), changes)
     ensure_file(project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex"), changes)
     ensure_file(project_root / ".claude" / "settings.json", claude_settings_json(), changes)
     ensure_file(project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude"), changes)
     ensure_file(project_root / ".claude" / "rules" / "shared-memory.md", shared_memory_rule(project_root), changes)
+    append_if_missing(
+        project_root / ".claude" / "rules" / "shared-memory.md",
+        "## Agent-Generated Memory Candidates",
+        agent_candidate_protocol(project_root),
+        changes,
+    )
     register_project(project_root, make_current=True)
+    return {"ok": True, "project": project_entry(project_root), "changes": changes}
+
+
+def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
+    """Upgrade managed hook code while preserving a timestamped audit backup."""
+    project_root = normalize_project_root(root)
+    changes: list[dict[str, str]] = []
+    stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    for path, content in (
+        (project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex")),
+        (project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude")),
+    ):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        current = path.read_text(encoding="utf-8") if path.exists() else ""
+        if current == content:
+            changes.append({"path": str(path), "status": "existing"})
+            continue
+        if path.exists():
+            backup = path.with_name(path.name + f".bak.{stamp}")
+            shutil.copy2(path, backup)
+            changes.append({"path": str(backup), "status": "backup"})
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+        changes.append({"path": str(path), "status": "upgraded"})
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 
@@ -662,7 +754,7 @@ def git_root(path: pathlib.Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage memory review projects")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["register", "use", "init"]:
+    for name in ["register", "use", "init", "upgrade-memory-hooks"]:
         p = sub.add_parser(name)
         p.add_argument("project_root")
     loop_parser = sub.add_parser("init-loop")
@@ -684,6 +776,9 @@ def main() -> int:
         return 0
     if args.command == "init":
         print(json.dumps(init_project(args.project_root), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-memory-hooks":
+        print(json.dumps(upgrade_memory_hooks(args.project_root), ensure_ascii=False, indent=2))
         return 0
     if args.command == "init-loop":
         print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))

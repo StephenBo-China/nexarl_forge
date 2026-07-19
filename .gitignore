@@ -35,6 +35,10 @@ coverage.xml
 codex/codex_context_packet.md
 codex/shared_memory_context_packet.md
 
+# Hook upgrade audit backups
+.codex/hooks/*.bak.*
+.claude/hooks/*.bak.*
+
 # Loop runtime artifacts
 loop/prd/current_prd.md
 loop/acceptance/criteria.md

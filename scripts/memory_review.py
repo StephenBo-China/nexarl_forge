@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 
 import memory_review_queue as review
@@ -48,8 +49,19 @@ def main() -> int:
     reset_parser = sub.add_parser("reset")
     reset_parser.add_argument("candidate_id")
 
-    noise_parser = sub.add_parser("reject-noise-personal")
-    noise_parser.add_argument("--apply", action="store_true", help="Actually reject detected noise candidates")
+    propose_parser = sub.add_parser("propose", help="Write a candidate distilled by the active agent model")
+    propose_parser.add_argument("--scope", choices=["personal", "project"], required=True)
+    propose_parser.add_argument("--target", choices=["long", "short"], required=True)
+    propose_parser.add_argument("--category", required=True)
+    propose_parser.add_argument("--title", required=True)
+    propose_parser.add_argument("--summary", required=True)
+    propose_parser.add_argument("--source-event", default="agent_summary")
+
+    noise_parser = sub.add_parser(
+        "reject-noise-personal",
+        help="Quarantine and mark detected personal noise candidates as rejected",
+    )
+    noise_parser.add_argument("--apply", action="store_true", help="Actually quarantine and reject detected noise candidates")
 
     sub.add_parser("refresh")
     sub.add_parser("serve")
@@ -95,6 +107,18 @@ def main() -> int:
     if args.command == "reset":
         review.reset(args.candidate_id)
         print(f"reset {args.candidate_id}")
+        return 0
+
+    if args.command == "propose":
+        value = review.create_agent_candidate(
+            args.scope,
+            args.target,
+            args.category,
+            args.title,
+            args.summary,
+            args.source_event,
+        )
+        print(json.dumps(value, ensure_ascii=False))
         return 0
 
     if args.command == "reject-noise-personal":

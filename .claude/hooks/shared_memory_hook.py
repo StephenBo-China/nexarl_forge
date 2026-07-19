@@ -91,6 +91,8 @@ def context_text(event: str, counts: dict[str, int]) -> str:
 - Claude loop directory: `/Users/stephenbo/.claude/loop_engineering`
 - Required behavior: read `.loop/config.json` before loop planning,
   staging work, Claude evaluation, or master/production decisions.
+- Worktree behavior: use a dedicated worktree when the user says `开 worktree`;
+  loop implementation starts in a dedicated worktree by default.
 """
     return f"""# Shared Memory Context Packet
 
@@ -114,6 +116,14 @@ Repository: `{ROOT}`
 - personal candidates: {counts.get("personal_pending", 0)}
 - review URL: {REVIEW_URL}
 - CLI: `MEMORY_REVIEW_PROJECT_ROOT={ROOT} python3 {APP_ROOT}/scripts/memory_review.py list`
+
+## Candidate Generation Reminder
+
+- The active {SOURCE} conversation model reviews memory candidates before its
+  final response and at compaction boundaries.
+- Hooks must not copy raw prompts into candidate files or call another model.
+- Create at most two distilled candidates through `memory_review.py propose`.
+- If creation fails, report the concrete reason in the current conversation.
 {loop}
 """
 
@@ -122,7 +132,10 @@ def append_short(event: str, payload: Any) -> None:
     prompt = find_prompt(payload)
     entry = f"\n### {now()} - {SOURCE}:{event}\n\n- cwd: `{os.getcwd()}`\n"
     if prompt:
-        entry += "\n```text\n" + prompt[:3000] + ("\n...[truncated]" if len(prompt) > 3000 else "") + "\n```\n"
+        compact = " ".join(prompt.split())
+        if len(compact) > 280:
+            compact = compact[:277].rstrip() + "..."
+        entry += "- summary: " + compact + "\n"
     else:
         entry += "- no user prompt payload was available to this hook.\n"
     with SHORT_MEMORY.open("a", encoding="utf-8") as handle:

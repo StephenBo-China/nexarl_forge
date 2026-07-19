@@ -60,8 +60,26 @@ PERSONAL_NOISE_PATTERNS = [
     re.compile(r"Policies to always exclude|You are an expert at upholding safety", re.I | re.S),
     re.compile(r"# In app browser:|Current URL:|Files mentioned by the user|codex-clipboard", re.I),
     re.compile(r"AGENTS\.md instructions|<INSTRUCTIONS>|</INSTRUCTIONS>", re.I | re.S),
+    re.compile(r"审核台|候选记忆|记忆候选|项目短期记忆|项目长期记忆|codex_short_memory", re.I),
     re.compile(r"^memory_id:\s*M-\d{8}-\d{6}", re.I | re.M),
 ]
+AGENT_CATEGORIES = {
+    "personal": {
+        "development_habit": "开发习惯",
+        "collaboration_preference": "协作偏好",
+        "work_style": "工作方式",
+        "thinking_style": "思维方式",
+        "user_profile": "用户画像",
+        "workflow_preference": "跨项目工作流偏好",
+    },
+    "project": {
+        "project_architecture": "项目架构",
+        "deployment_rule": "部署规则",
+        "product_direction": "产品方向",
+        "technical_constraint": "技术约束",
+        "project_workflow": "项目工作流",
+    },
+}
 
 
 def now() -> str:
@@ -125,6 +143,10 @@ def short_summary(text: str, max_len: int = 140) -> str:
     return clean[: max_len - 3] + "..." if len(clean) > max_len else clean
 
 
+def normalize_memory(text: str) -> str:
+    return re.sub(r"\W+", "", text.lower())
+
+
 def risk_flags(text: str) -> list[str]:
     return sorted(name for name, pattern in SENSITIVE_PATTERNS.items() if pattern.search(text))
 
@@ -134,6 +156,10 @@ def is_noise_personal_candidate(item: dict[str, Any]) -> bool:
         return False
     content = item.get("content", "") or ""
     if any(pattern.search(content) for pattern in PERSONAL_NOISE_PATTERNS):
+        return True
+    if re.search(r"(项目|服务|代码|文件|部署|员工|接口|路径)", content, re.I) and not re.search(
+        r"(跨项目|个人偏好|用户习惯|以后都|每次都|我的工作方式)", content
+    ):
         return True
     if not re.search(
         r"(常用开发习惯|开发习惯|工作习惯|工作方式|协作方式|思维方式|用户画像|"
@@ -249,6 +275,62 @@ def build_queue() -> dict[str, Any]:
     }
     write_json(PROJECT_QUEUE, queue)
     return queue
+
+
+def create_agent_candidate(
+    scope: str,
+    target: str,
+    category: str,
+    title: str,
+    summary: str,
+    source_event: str = "agent_summary",
+) -> dict[str, Any]:
+    """Persist a candidate already distilled by the active Codex/Claude model."""
+    title = re.sub(r"\s+", " ", title).strip()[:100]
+    summary = summary.strip()
+    if scope not in {"personal", "project"}:
+        raise ValueError("scope must be personal or project")
+    if target not in {"long", "short"}:
+        raise ValueError("target must be long or short")
+    if scope == "project" and target != "long":
+        raise ValueError("project candidates must target long memory")
+    if category not in AGENT_CATEGORIES[scope]:
+        raise ValueError("unsupported candidate category")
+    if not title or len(summary) < 12 or len(summary) > 1200:
+        raise ValueError("candidate title/summary length is invalid")
+    if risk_flags(summary):
+        raise ValueError("candidate contains sensitive material")
+    needle = normalize_memory(summary)
+    sources = [read_text(PERSONAL_PROPOSALS), read_text(PERSONAL_LONG), read_text(PERSONAL_SHORT)]
+    if scope == "project":
+        sources = [read_text(PROJECT_PROPOSALS), read_text(PROJECT_LONG)]
+    if needle and any(needle in normalize_memory(text) for text in sources):
+        return {"created": False, "reason": "duplicate"}
+
+    created = now()
+    markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
+    if scope == "personal":
+        existing = read_text(PERSONAL_PROPOSALS)
+        stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        candidate_id = f"M-{stamp}"
+        suffix = 2
+        while candidate_id in existing:
+            candidate_id = f"M-{stamp}-{suffix}"
+            suffix += 1
+        with PERSONAL_PROPOSALS.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n### {candidate_id}\n\n")
+            handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
+            handle.write(f"created: {created}\nsource_event: {source_event}\n")
+            handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
+            handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
+    else:
+        candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
+        with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n### {created} - {title}\n\n")
+            handle.write(f"**分类：{category}**\n\n{summary}\n\n")
+            handle.write(f"- source_event: `{source_event}`\n")
+    build_queue()
+    return {"created": True, "id": candidate_id, "scope": scope, "target": target, "content": markdown}
 
 
 def count_items(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -372,10 +454,28 @@ def reset(candidate_id: str) -> None:
 
 def reject_noise_personal_candidates(dry_run: bool = True) -> list[str]:
     queue = load_queue(refresh=True)
-    ids = [item["id"] for item in queue.get("items", []) if is_noise_personal_candidate(item)]
+    items = [item for item in queue.get("items", []) if is_noise_personal_candidate(item)]
+    ids = [item["id"] for item in items]
     if not dry_run:
+        archive = CODEX_DIR / "memory_review_noise_personal.md"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with archive.open("a", encoding="utf-8") as handle:
+            for item in items:
+                handle.write(f"\n### {item['id']} - quarantined personal candidate\n\n")
+                handle.write(f"- original source: `{item.get('source_path', '')}`\n")
+                handle.write(f"- original target: `{item.get('target', '')}`\n")
+                handle.write(f"- quarantined_at: `{now()}`\n\n")
+                handle.write(item.get("content", "").strip() + "\n")
         for candidate_id in ids:
-            reject(candidate_id)
+            record_decision(
+                candidate_id,
+                {
+                    "status": "rejected",
+                    "reason": "noise_quarantined",
+                    "quarantine_path": str(archive),
+                    "decided_at": now(),
+                },
+            )
     return ids
 
 

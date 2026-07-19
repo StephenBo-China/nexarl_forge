@@ -125,6 +125,32 @@ schema without overwriting project-specific staging, database, or OSS values:
 python3 scripts/memory_project.py upgrade-loop /path/to/repo
 ```
 
+Upgrade only the managed Codex and Claude memory hooks. Existing hook files are
+preserved as timestamped `.bak.*` audit backups before replacement:
+
+```bash
+python3 scripts/memory_project.py upgrade-memory-hooks /path/to/repo
+```
+
+## Candidate Quality Policy
+
+- The active Codex or Claude Code conversation model distills candidates from
+  context it already has; hooks do not call another model API.
+- Hooks create local reminders and context packets only. They never copy raw
+  prompts into long-memory candidate files.
+- Personal candidates must be distilled cross-project habits, preferences,
+  thinking styles, collaboration patterns, or user-profile facts.
+- Project long-memory candidates are summarized by the active agent as durable
+  Markdown facts before review.
+- Project short memory stores a bounded prompt summary instead of the complete
+  raw prompt.
+- Detected personal noise can be quarantined and marked rejected while the
+  original proposal file remains untouched:
+
+```bash
+python3 scripts/memory_review.py reject-noise-personal --apply
+```
+
 If `--port` is omitted, the tool recommends the next available port based on
 registered projects. The web UI always asks the user to confirm the port before
 writing `.loop/config.json`.

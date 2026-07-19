@@ -803,13 +803,11 @@ function renderMemoryStrategy() {
       </div>
       <section class="doc-section">
         <h3>候选记忆写入来源</h3>
-        <p>审核台本身不主动生成候选，它负责读取、展示、编辑、审批和落盘。候选主要由 Codex/Claude hooks 写入。</p>
+        <p>审核台本身不主动总结候选。当前 Codex 或 Claude Code 对话模型负责提炼，hook 只生成本地提醒和上下文检查点。</p>
         <ul>
-          <li>个人候选由全局 Codex hook 写入：<code>~/.codex/hooks/personal_memory_hook.py</code>。</li>
-          <li>个人 hook 注册在 <code>~/.codex/hooks.json</code>，触发于 <code>UserPromptSubmit</code>、<code>PreCompact</code>、<code>Stop</code>。</li>
+          <li>Codex 使用当前 Codex 模型总结；Claude Code 使用当前 Claude 模型总结，不额外调用第三方模型 API。</li>
+          <li>全局和项目 hook 注册在对应配置中，负责在 <code>UserPromptSubmit</code>、<code>PreCompact</code>、<code>Stop</code> 等节点更新提醒。</li>
           <li>个人候选写入：<code>~/.codex/personal_memory/proposals.md</code>。</li>
-          <li>项目候选由项目 Codex hook 和 Claude Code hook 写入：<code>.codex/hooks/*memory_hook.py</code>、<code>.claude/hooks/*memory_hook.py</code>。</li>
-          <li>项目 hook 注册在项目的 <code>.codex/hooks.json</code> 和 <code>.claude/settings.json</code>，主要在 <code>PreCompact</code>、<code>Stop</code> 写项目长期记忆检查点。</li>
           <li>项目候选写入当前项目：<code>&lt;project&gt;/codex/memory_proposals.md</code>。</li>
         </ul>
       </section>
@@ -817,10 +815,9 @@ function renderMemoryStrategy() {
         <h3>候选生成策略</h3>
         <ul>
           <li>个人候选必须是提炼后的跨项目事实，例如开发习惯、协作偏好、思维方式、工作流偏好或用户画像。</li>
-          <li>个人 hook 会过滤截图描述、当前 URL、附件提示、AGENTS 指令、系统提示、ambient suggestion、原始会话内容和一次性项目任务。</li>
-          <li>个人 hook 会拒绝疑似敏感信息：token、验证码、API key、RDS/OSS 密钥、密码、<code>.env.production</code> 等。</li>
-          <li>个人 hook 每次最多生成 2 条候选，且会对已存在候选和已批准记忆做去重。</li>
-          <li>项目长期候选当前采用“检查点提醒”策略：hook 只写入是否需要沉淀稳定项目事实的提醒，不自动把整段会话当成最终长期记忆。</li>
+          <li>当前对话模型必须把候选改写为标题、分类和 1-3 句独立总结，禁止复制原始 prompt。</li>
+          <li>模型排除截图、URL、路径、系统提示、一次性任务和敏感信息；每轮最多生成 2 条并去重。</li>
+          <li>项目长期候选只允许稳定架构、部署、产品、技术约束或项目工作流事实。</li>
           <li>项目短期记忆可由 hook 自动追加，记录近期指令、hook 事件、当前状态、loop 轮次和临时上下文。</li>
         </ul>
       </section>
@@ -839,7 +836,7 @@ function renderMemoryStrategy() {
         <h3>自动化写入边界</h3>
         <ul>
           <li>允许自动写入：项目短期记忆、context packet、review queue、review state、个人候选 proposals。</li>
-          <li>允许自动写入：项目长期记忆检查点候选，用于提醒用户是否需要整理长期事实。</li>
+          <li>允许当前 Codex/Claude 模型写入总结后的个人或项目候选；hook 本身只写提醒，不复制原始 prompt。</li>
           <li>禁止自动写入：正式个人长期记忆、正式个人短期记忆。</li>
           <li>默认禁止自动写入：正式项目长期记忆，除非用户明确批准候选或明确要求写入具体内容。</li>
           <li>审核台可以编辑、删除已生效记忆；这属于用户在本地页面上的显式操作。</li>
