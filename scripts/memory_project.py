@@ -67,14 +67,85 @@ def registry() -> dict[str, Any]:
 
 def project_entry(root: pathlib.Path) -> dict[str, Any]:
     root = root.resolve()
+    has_memory = (root / "codex" / "codex_long_memory.md").exists() and (
+        root / "codex" / "codex_short_memory.md"
+    ).exists() and (root / "codex" / "memory_proposals.md").exists()
+    config_path = root / ".loop" / "config.json"
+    loop_status = "not_initialized"
+    completion_gate = "not_applicable"
+    if config_path.exists():
+        try:
+            config = loop_superpowers.read_loop_config_strict(config_path)
+            validator_state = loop_superpowers.validator_status(root)
+            readiness = loop_superpowers.inspect_config(config, validator_state)
+            completion_gate = readiness["completion_gate"]
+            methodology = config.get("methodology", {})
+            provider = methodology.get("provider") if isinstance(methodology, dict) else None
+            if readiness["contract_ok"] and completion_gate == "configured":
+                loop_status = "superpowers_ready"
+            elif provider == "superpowers":
+                loop_status = "superpowers_incomplete"
+            else:
+                loop_status = "legacy"
+        except (OSError, TypeError, ValueError):
+            loop_status = "invalid"
+            completion_gate = "needs_attention"
+
+    rule_states = [
+        loop_superpowers.managed_rule_status(root / "AGENTS.md"),
+        loop_superpowers.managed_rule_status(root / "CLAUDE.md"),
+        loop_superpowers.managed_rule_status(
+            root / ".claude" / "rules" / "shared-memory.md"
+        ),
+    ]
+    if "conflict" in rule_states:
+        managed_rules_status = "conflict"
+    elif all(state == "current" for state in rule_states):
+        managed_rules_status = "current"
+    elif all(state == "missing" for state in rule_states):
+        managed_rules_status = "missing"
+    else:
+        managed_rules_status = "upgrade_available"
+
+    hook_targets = (
+        (root / ".codex" / "hooks" / "shared_memory_hook.py", "codex"),
+        (root / ".claude" / "hooks" / "shared_memory_hook.py", "claude"),
+    )
+    hook_states = []
+    for path, source in hook_targets:
+        if not path.exists():
+            hook_states.append("missing")
+        elif path.read_text(encoding="utf-8") == hook_script(root, source):
+            hook_states.append("current")
+        else:
+            hook_states.append("upgrade_available")
+    managed_hooks_status = (
+        "current"
+        if all(state == "current" for state in hook_states)
+        else "missing"
+        if all(state == "missing" for state in hook_states)
+        else "upgrade_available"
+    )
+    memory_status = (
+        "not_initialized"
+        if not has_memory
+        else "initialized"
+        if managed_rules_status == "current" and managed_hooks_status == "current"
+        else "upgrade_available"
+    )
+
     return {
         "name": repo_name(root),
         "root": str(root),
         "is_git_repo": (root / ".git").exists(),
-        "has_memory": (root / "codex" / "codex_long_memory.md").exists()
-        and (root / "codex" / "codex_short_memory.md").exists()
-        and (root / "codex" / "memory_proposals.md").exists(),
-        "has_loop": (root / ".loop" / "config.json").exists(),
+        "has_memory": has_memory,
+        "has_loop": config_path.exists(),
+        "memory_status": memory_status,
+        "loop_status": loop_status,
+        "completion_gate": completion_gate,
+        "managed_rules_status": managed_rules_status,
+        "managed_hooks_status": managed_hooks_status,
+        "plugin_status": loop_superpowers.plugin_status(),
         "last_opened_at": now(),
     }
 

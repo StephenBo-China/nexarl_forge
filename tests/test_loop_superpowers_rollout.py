@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
 import loop_superpowers
+import memory_review_server
 
 
 EXPECTED_SKILLS = {
@@ -174,6 +175,66 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
 
             self.assertEqual(validator.read_text(encoding="utf-8"), "custom validator\n")
             self.assertEqual(result["methodology_status"]["status"], "custom_conflict")
+
+    def test_project_entry_reports_loop_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = (pathlib.Path(value) / "sample").resolve()
+            project.mkdir()
+            (project / ".git").mkdir()
+            empty = memory_project.project_entry(project)
+            self.assertIn("loop_status", empty)
+            self.assertEqual(empty["loop_status"], "not_initialized")
+            self.assertEqual(empty["completion_gate"], "not_applicable")
+
+            original_registry = memory_project.REGISTRY_PATH
+            memory_project.REGISTRY_PATH = pathlib.Path(value) / "projects.json"
+            try:
+                memory_project.init_loop(project, 8123)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+            ready = memory_project.project_entry(project)
+            self.assertEqual(ready["loop_status"], "superpowers_ready")
+            self.assertEqual(ready["completion_gate"], "configured")
+            self.assertIn(ready["plugin_status"], {"installed", "partial", "missing"})
+
+    def test_project_operation_requires_git_and_explicit_upgrade_confirmation(self) -> None:
+        self.assertTrue(hasattr(memory_review_server, "project_operation"))
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            with self.assertRaisesRegex(ValueError, "Git repository"):
+                memory_review_server.project_operation(
+                    "init-loop", {"project_root": str(project), "port": 8123}
+                )
+
+            (project / ".git").mkdir()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+            with self.assertRaisesRegex(PermissionError, "confirmation"):
+                memory_review_server.project_operation(
+                    "upgrade-loop",
+                    {"project_root": str(project), "port": 8123, "confirmed": False},
+                )
+
+            preview = memory_review_server.project_operation(
+                "preview-loop-upgrade",
+                {"project_root": str(project), "port": 8123},
+            )
+            self.assertTrue(preview["config_will_change"])
+
+    def test_init_loop_operation_rejects_existing_loop_config(self) -> None:
+        self.assertTrue(hasattr(memory_review_server, "project_operation"))
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            (project / ".git").mkdir()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+
+            with self.assertRaisesRegex(FileExistsError, "preview-loop-upgrade"):
+                memory_review_server.project_operation(
+                    "init-loop", {"project_root": str(project), "port": 8123}
+                )
 
 
 if __name__ == "__main__":

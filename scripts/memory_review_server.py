@@ -19,6 +19,32 @@ HOST = review.REVIEW_HOST
 PORT = review.REVIEW_PORT
 
 
+def project_operation(operation: str, body: dict) -> dict:
+    root = pathlib.Path(body.get("project_root", "")).expanduser().resolve()
+    if not (root / ".git").exists():
+        raise ValueError(f"Git repository is required: {root}")
+    port = body.get("port")
+    selected_port = int(port) if port else None
+    config_path = root / ".loop" / "config.json"
+    if operation == "init-loop":
+        if config_path.exists():
+            raise FileExistsError(
+                "Loop config already exists; use preview-loop-upgrade before upgrade-loop"
+            )
+        return memory_project.init_loop(root, selected_port)
+    if operation == "preview-loop-upgrade":
+        return memory_project.preview_loop_upgrade(root, selected_port)
+    if operation == "upgrade-loop":
+        if body.get("confirmed") is not True:
+            raise PermissionError("explicit upgrade confirmation is required")
+        return memory_project.upgrade_loop(root, selected_port)
+    if operation == "upgrade-memory":
+        if body.get("confirmed") is not True:
+            raise PermissionError("explicit memory upgrade confirmation is required")
+        return memory_project.upgrade_memory(root)
+    raise ValueError(f"Unknown project operation: {operation}")
+
+
 def switch_project(project_root: str) -> dict:
     global review
     root = str(pathlib.Path(project_root).expanduser().resolve())
@@ -1284,8 +1310,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/projects/init-loop":
                 body = self.read_json()
-                port = body.get("port")
-                result = memory_project.init_loop(body.get("project_root", ""), int(port) if port else None)
+                result = project_operation("init-loop", body)
                 payload = switch_project(result["project"]["root"])
                 self.send_json({
                     "ok": True,
@@ -1293,6 +1318,19 @@ class Handler(BaseHTTPRequestHandler):
                     "changes": result.get("changes", []),
                     "projects": payload,
                 })
+                return
+            if parsed.path == "/api/projects/preview-loop-upgrade":
+                self.send_json(project_operation("preview-loop-upgrade", self.read_json()))
+                return
+            if parsed.path == "/api/projects/upgrade-loop":
+                result = project_operation("upgrade-loop", self.read_json())
+                payload = switch_project(result["project"]["root"])
+                self.send_json({**result, "projects": payload})
+                return
+            if parsed.path == "/api/projects/upgrade-memory":
+                result = project_operation("upgrade-memory", self.read_json())
+                payload = switch_project(result["project"]["root"])
+                self.send_json({**result, "projects": payload})
                 return
             if parsed.path == "/api/active-memory/update":
                 body = self.read_json()

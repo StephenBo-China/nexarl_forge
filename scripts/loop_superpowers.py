@@ -307,3 +307,40 @@ def replace_managed_block(current: str, managed: str) -> tuple[str, str]:
     if updated == current:
         return current, "existing"
     return updated, "upgraded"
+
+
+def managed_rule_status(path: pathlib.Path) -> str:
+    if not path.exists():
+        return "missing"
+    current = path.read_text(encoding="utf-8")
+    start_count = current.count(MANAGED_RULE_START)
+    end_count = current.count(MANAGED_RULE_END)
+    if start_count != 1 or end_count != 1:
+        return "conflict" if start_count or end_count else "upgrade_available"
+    updated, status = replace_managed_block(current, managed_rule_block())
+    if status == "conflict":
+        return "conflict"
+    return "current" if updated == current else "upgrade_available"
+
+
+def plugin_status(home: pathlib.Path | None = None) -> str:
+    root = (home or pathlib.Path.home()).expanduser()
+    codex_installed = any(
+        (root / ".codex" / "plugins" / "cache" / "openai-api-curated" / "superpowers").glob(
+            "*/skills/using-superpowers/SKILL.md"
+        )
+    )
+    claude_installed = False
+    claude_registry = root / ".claude" / "plugins" / "installed_plugins.json"
+    try:
+        registry = json.loads(claude_registry.read_text(encoding="utf-8"))
+        claude_installed = "superpowers@claude-plugins-official" in json.dumps(
+            registry, ensure_ascii=False
+        )
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        claude_installed = False
+    if codex_installed and claude_installed:
+        return "installed"
+    if codex_installed or claude_installed:
+        return "partial"
+    return "missing"
