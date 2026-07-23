@@ -10,6 +10,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
+import loop_superpowers
 
 
 EXPECTED_SKILLS = {
@@ -52,6 +53,42 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
             config["worktree"]["finish_validation_commands"],
             ["python3 scripts/validate_loop_methodology.py --phase completion"],
         )
+
+    def test_init_loop_installs_managed_validator_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value) / "sample"
+            project.mkdir()
+            (project / ".git").mkdir()
+            original_registry = memory_project.REGISTRY_PATH
+            memory_project.REGISTRY_PATH = pathlib.Path(value) / "projects.json"
+            try:
+                first = memory_project.init_loop(project, 8123)
+                validator = project.resolve() / "scripts" / "validate_loop_methodology.py"
+                self.assertTrue(validator.exists())
+                first_text = validator.read_text(encoding="utf-8")
+                second = memory_project.init_loop(project, 8123)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            self.assertIn(
+                "Validate the repository's Loop + Superpowers workflow contract",
+                first_text,
+            )
+            self.assertIn(loop_superpowers.MANAGED_VALIDATOR_MARKER, first_text)
+            self.assertEqual(first_text, validator.read_text(encoding="utf-8"))
+            self.assertTrue(
+                any(
+                    item["status"] == "created" and item["path"] == str(validator)
+                    for item in first["changes"]
+                ),
+                first["changes"],
+            )
+            self.assertTrue(
+                any(
+                    item["status"] == "existing" and item["path"] == str(validator)
+                    for item in second["changes"]
+                )
+            )
 
 
 if __name__ == "__main__":

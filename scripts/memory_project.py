@@ -738,8 +738,15 @@ def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, An
         else:
             path.mkdir(parents=True, exist_ok=True)
             changes.append({"path": str(path), "status": "created"})
+    methodology_status = loop_superpowers.install_validator(project_root, changes)
     register_project(project_root, make_current=True)
-    return {"ok": True, "project": project_entry(project_root), "port": selected_port, "changes": changes}
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "port": selected_port,
+        "changes": changes,
+        "methodology_status": methodology_status,
+    }
 
 
 def git_root(path: pathlib.Path) -> str:

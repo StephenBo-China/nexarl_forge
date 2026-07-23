@@ -4,7 +4,11 @@
 from __future__ import annotations
 
 import copy
+import datetime as _dt
+import os
 import pathlib
+import shutil
+import tempfile
 from typing import Any
 
 
@@ -20,6 +24,7 @@ VALIDATOR_TEMPLATE = (
 )
 MANAGED_RULE_START = "<!-- vibe-loop-superpowers:start -->"
 MANAGED_RULE_END = "<!-- vibe-loop-superpowers:end -->"
+MANAGED_VALIDATOR_MARKER = "MANAGED_BY_VIBE_LOOP_SUPERPOWERS ="
 
 EXPECTED_SKILLS = frozenset(
     {
@@ -119,3 +124,68 @@ def methodology_defaults() -> dict[str, Any]:
             },
         },
     }
+
+
+def atomic_write_text(target: pathlib.Path, content: str, mode: int = 0o644) -> None:
+    """Atomically replace a text file in its own directory."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            delete=False,
+        ) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = pathlib.Path(handle.name)
+        temporary_path.chmod(mode)
+        os.replace(temporary_path, target)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def timestamped_backup(target: pathlib.Path) -> pathlib.Path:
+    stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    backup = target.with_name(f"{target.name}.bak.{stamp}")
+    shutil.copy2(target, backup)
+    return backup
+
+
+def validator_text() -> str:
+    return VALIDATOR_TEMPLATE.read_text(encoding="utf-8")
+
+
+def install_validator(
+    project_root: pathlib.Path, changes: list[dict[str, str]]
+) -> dict[str, Any]:
+    """Install or upgrade the managed validator without overwriting custom code."""
+    target = project_root / VALIDATOR_RELATIVE_PATH
+    expected = validator_text()
+    if not target.exists():
+        atomic_write_text(target, expected, mode=0o755)
+        changes.append({"path": str(target), "status": "created"})
+        return {"status": "managed", "path": str(target)}
+
+    current = target.read_text(encoding="utf-8")
+    if current == expected:
+        changes.append({"path": str(target), "status": "existing"})
+        return {"status": "managed", "path": str(target)}
+    if MANAGED_VALIDATOR_MARKER not in current:
+        changes.append({"path": str(target), "status": "conflict"})
+        return {"status": "custom_conflict", "path": str(target)}
+
+    backup = timestamped_backup(target)
+    atomic_write_text(target, expected, mode=0o755)
+    changes.extend(
+        [
+            {"path": str(backup), "status": "backup"},
+            {"path": str(target), "status": "upgraded"},
+        ]
+    )
+    return {"status": "managed", "path": str(target)}
