@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -89,6 +90,90 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
                     for item in second["changes"]
                 )
             )
+
+    def test_preview_and_upgrade_preserve_custom_values_and_are_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = (pathlib.Path(value) / "sample").resolve()
+            project.mkdir()
+            (project / ".git").mkdir()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            original = {
+                "schema_version": 2,
+                "project_repo_name": "sample",
+                "repository": {
+                    "canonical_root": "/old",
+                    "main_branch": "main",
+                    "remote": "upstream",
+                },
+                "worktree": {"finish_validation_commands": ["make preflight"]},
+                "staging": {
+                    "port": 9191,
+                    "database": "offline",
+                    "oss_bucket": "owned",
+                    "remote_path": "/srv/sample",
+                },
+                "verification": {"commands": ["make test"]},
+                "custom_extension": {"keep": True},
+            }
+            config_path.write_text(json.dumps(original), encoding="utf-8")
+
+            self.assertTrue(hasattr(memory_project, "preview_loop_upgrade"))
+            self.assertTrue(hasattr(memory_project, "upgrade_loop"))
+            preview = memory_project.preview_loop_upgrade(project, 8123)
+            self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), original)
+            self.assertIn("methodology", preview["added_paths"])
+
+            first = memory_project.upgrade_loop(project, 8123)
+            upgraded = json.loads(config_path.read_text(encoding="utf-8"))
+            for key, expected in original["staging"].items():
+                self.assertEqual(upgraded["staging"][key], expected)
+            self.assertEqual(upgraded["verification"]["commands"], ["make test"])
+            self.assertEqual(upgraded["custom_extension"], {"keep": True})
+            self.assertEqual(upgraded["repository"]["canonical_root"], str(project))
+            self.assertEqual(
+                upgraded["worktree"]["finish_validation_commands"],
+                ["make preflight", loop_superpowers.COMPLETION_COMMAND],
+            )
+            self.assertEqual(len(list(config_path.parent.glob("config.json.bak.*"))), 1)
+            self.assertEqual(first["config_status"], "upgraded")
+
+            second = memory_project.upgrade_loop(project, 8123)
+            self.assertEqual(second["config_status"], "existing")
+            self.assertEqual(len(list(config_path.parent.glob("config.json.bak.*"))), 1)
+
+    def test_invalid_loop_json_is_not_rewritten_or_backed_up(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text("{broken", encoding="utf-8")
+
+            self.assertTrue(hasattr(memory_project, "preview_loop_upgrade"))
+            self.assertTrue(hasattr(memory_project, "upgrade_loop"))
+            with self.assertRaisesRegex(ValueError, "Invalid loop config JSON"):
+                memory_project.preview_loop_upgrade(project, 8123)
+            with self.assertRaisesRegex(ValueError, "Invalid loop config JSON"):
+                memory_project.upgrade_loop(project, 8123)
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), "{broken")
+            self.assertEqual(list(config_path.parent.glob("config.json.bak.*")), [])
+
+    def test_upgrade_reports_custom_validator_conflict_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            config_path.write_text(json.dumps({"schema_version": 2}), encoding="utf-8")
+            validator = project / loop_superpowers.VALIDATOR_RELATIVE_PATH
+            validator.parent.mkdir()
+            validator.write_text("custom validator\n", encoding="utf-8")
+
+            self.assertTrue(hasattr(memory_project, "upgrade_loop"))
+            result = memory_project.upgrade_loop(project, 8123)
+
+            self.assertEqual(validator.read_text(encoding="utf-8"), "custom validator\n")
+            self.assertEqual(result["methodology_status"]["status"], "custom_conflict")
 
 
 if __name__ == "__main__":

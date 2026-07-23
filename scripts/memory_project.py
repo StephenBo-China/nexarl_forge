@@ -722,6 +722,89 @@ def upgrade_loop_config(root: pathlib.Path, port: int) -> tuple[dict[str, Any], 
     return current, "existing"
 
 
+def _upgraded_loop_value(
+    project_root: pathlib.Path, current: dict[str, Any], port: int
+) -> dict[str, Any]:
+    upgraded = merge_missing(current, loop_config(project_root, port))
+    upgraded["schema_version"] = max(
+        int(current.get("schema_version", 1)), loop_superpowers.SCHEMA_VERSION
+    )
+    repository = upgraded.setdefault("repository", {})
+    if not isinstance(repository, dict):
+        raise ValueError("Invalid loop config: repository must be an object")
+    repository["canonical_root"] = str(project_root.resolve())
+    loop_superpowers.append_unique_command(upgraded)
+    return upgraded
+
+
+def preview_loop_upgrade(
+    root: str | pathlib.Path, port: int | None = None
+) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    current = loop_superpowers.read_loop_config_strict(config_path)
+    selected_port = int(port or current.get("staging", {}).get("port") or recommend_port())
+    upgraded = _upgraded_loop_value(project_root, current, selected_port)
+    validator_state = loop_superpowers.validator_status(project_root)
+    projected_validator_state = (
+        "custom_conflict" if validator_state == "custom_conflict" else "managed"
+    )
+    return {
+        "ok": True,
+        "project_root": str(project_root),
+        "port": selected_port,
+        "added_paths": loop_superpowers.added_config_paths(current, upgraded),
+        "preserved_categories": [
+            "repository main/remote",
+            "staging resources",
+            "verification commands",
+            "production guardrails",
+            "unknown extension fields",
+        ],
+        "config_will_change": upgraded != current,
+        "validator_action": validator_state,
+        "readiness": loop_superpowers.inspect_config(
+            upgraded, projected_validator_state
+        ),
+    }
+
+
+def upgrade_loop(
+    root: str | pathlib.Path, port: int | None = None
+) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    current = loop_superpowers.read_loop_config_strict(config_path)
+    selected_port = int(port or current.get("staging", {}).get("port") or recommend_port())
+    upgraded = _upgraded_loop_value(project_root, current, selected_port)
+    changes: list[dict[str, str]] = []
+
+    methodology_status = loop_superpowers.install_validator(project_root, changes)
+    config_status = "existing"
+    if upgraded != current:
+        backup = loop_superpowers.timestamped_backup(config_path)
+        changes.append({"path": str(backup), "status": "backup"})
+        loop_superpowers.atomic_write_text(
+            config_path,
+            json.dumps(upgraded, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        changes.append({"path": str(config_path), "status": "upgraded"})
+        config_status = "upgraded"
+
+    readiness = loop_superpowers.inspect_config(
+        upgraded, methodology_status["status"]
+    )
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "port": selected_port,
+        "changes": changes,
+        "config_status": config_status,
+        "methodology_status": methodology_status,
+        "readiness": readiness,
+    }
+
+
 def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, Any]:
     project_root = normalize_project_root(root)
     result = init_project(project_root)
@@ -776,6 +859,9 @@ def main() -> int:
     upgrade_parser = sub.add_parser("upgrade-loop")
     upgrade_parser.add_argument("project_root")
     upgrade_parser.add_argument("--port", type=int, default=None)
+    preview_parser = sub.add_parser("preview-loop-upgrade")
+    preview_parser.add_argument("project_root")
+    preview_parser.add_argument("--port", type=int, default=None)
     sub.add_parser("list")
     sub.add_parser("current")
     sub.add_parser("recommend-port")
@@ -797,7 +883,16 @@ def main() -> int:
         print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
         return 0
     if args.command == "upgrade-loop":
-        print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
+        print(json.dumps(upgrade_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "preview-loop-upgrade":
+        print(
+            json.dumps(
+                preview_loop_upgrade(args.project_root, args.port),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "list":
         print(json.dumps(list_projects(), ensure_ascii=False, indent=2))

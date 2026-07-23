@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import json
 import os
 import pathlib
 import shutil
@@ -189,3 +190,85 @@ def install_validator(
         ]
     )
     return {"status": "managed", "path": str(target)}
+
+
+def read_loop_config_strict(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Loop config does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid loop config JSON: {path}: {exc.msg}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid loop config object: {path}")
+    return value
+
+
+def append_unique_command(config: dict[str, Any]) -> None:
+    worktree = config.setdefault("worktree", {})
+    if not isinstance(worktree, dict):
+        raise ValueError("Invalid loop config: worktree must be an object")
+    commands = worktree.setdefault("finish_validation_commands", [])
+    if not isinstance(commands, list) or not all(
+        isinstance(command, str) for command in commands
+    ):
+        raise ValueError(
+            "Invalid loop config: worktree.finish_validation_commands must be a list of strings"
+        )
+    if COMPLETION_COMMAND not in commands:
+        commands.append(COMPLETION_COMMAND)
+
+
+def validator_status(project_root: pathlib.Path) -> str:
+    target = project_root / VALIDATOR_RELATIVE_PATH
+    if not target.exists():
+        return "missing"
+    current = target.read_text(encoding="utf-8")
+    if current == validator_text():
+        return "managed"
+    if MANAGED_VALIDATOR_MARKER in current:
+        return "managed_upgrade_available"
+    return "custom_conflict"
+
+
+def inspect_config(config: dict[str, Any], current_validator_status: str) -> dict[str, Any]:
+    methodology = config.get("methodology", {})
+    if not isinstance(methodology, dict):
+        methodology = {}
+    method = methodology.get("superpowers", {})
+    if not isinstance(method, dict):
+        method = {}
+    authority = method.get("authority", {})
+    if not isinstance(authority, dict):
+        authority = {}
+    declared = method.get("declared_skills", [])
+    contract_ok = (
+        int(config.get("schema_version", 0) or 0) >= SCHEMA_VERSION
+        and methodology.get("provider") == "superpowers"
+        and method.get("enabled") is True
+        and isinstance(declared, list)
+        and set(declared) == EXPECTED_SKILLS
+        and authority.get("orchestrator") == "loop"
+        and authority.get("worktree") == "loop_worktree_flow_only"
+    )
+    worktree = config.get("worktree", {})
+    commands = worktree.get("finish_validation_commands", []) if isinstance(worktree, dict) else []
+    gate_ok = COMPLETION_COMMAND in commands and current_validator_status == "managed"
+    return {
+        "contract_ok": contract_ok,
+        "completion_gate": "configured" if gate_ok else "needs_attention",
+        "validator_status": current_validator_status,
+    }
+
+
+def added_config_paths(current: Any, upgraded: Any, prefix: str = "") -> list[str]:
+    if not isinstance(current, dict) or not isinstance(upgraded, dict):
+        return []
+    paths: list[str] = []
+    for key, value in upgraded.items():
+        path = f"{prefix}.{key}" if prefix else key
+        if key not in current:
+            paths.append(path)
+        elif isinstance(current[key], dict) and isinstance(value, dict):
+            paths.extend(added_config_paths(current[key], value, path))
+    return paths
