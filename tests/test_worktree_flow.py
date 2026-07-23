@@ -117,6 +117,32 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertTrue(checked["feature_is_ancestor"])
         self.assertTrue(checked["canonical_matches_remote"])
 
+    def test_finish_runs_configured_feature_worktree_validation(self) -> None:
+        config_path = self.repo / ".loop" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["worktree"]["finish_validation_commands"] = [
+            "test -f finish-ready.txt"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        entry = workflow.start(str(self.repo), "validated-finish", "conversation-2")
+        feature = pathlib.Path(entry["worktree"])
+        (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
+        command("git", "add", "feature.txt", cwd=feature)
+        command("git", "commit", "-m", "feature", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        with self.assertRaises(workflow.WorkflowError):
+            workflow.finish(str(self.repo), "validated-finish")
+
+        (feature / "finish-ready.txt").write_text("ready\n", encoding="utf-8")
+        command("git", "add", "finish-ready.txt", cwd=feature)
+        command("git", "commit", "-m", "finish evidence", cwd=feature)
+        command("git", "push", cwd=feature)
+
+        finished = workflow.finish(str(self.repo), "validated-finish")
+        self.assertEqual(finished["status"], "ready_for_user_acceptance")
+
     def test_canonical_sync_blocks_overlapping_dirty_file(self) -> None:
         updater = self.base / "updater"
         command("git", "clone", "--branch", "master", str(self.remote), str(updater))

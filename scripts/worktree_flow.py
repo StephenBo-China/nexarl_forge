@@ -141,6 +141,7 @@ def workflow_settings(root: pathlib.Path) -> dict[str, Any]:
         "remote": str(remote),
         "worktree_root": base_root.resolve(),
         "branch_format": branch.get("name_format", "loop/<project>-<date>-<slug>"),
+        "finish_validation_commands": worktree.get("finish_validation_commands", []),
         "verification_commands": value.get("verification", {}).get("commands", []),
     }
 
@@ -273,6 +274,7 @@ def start(root_value: str, task: str, conversation: str) -> dict[str, Any]:
 
 def finish(root_value: str, task: str) -> dict[str, Any]:
     root = canonical_root(root_value)
+    settings = workflow_settings(root)
     entry = task_entry(root, task)
     worktree = pathlib.Path(entry["worktree"])
     if dirty_paths(worktree):
@@ -286,6 +288,10 @@ def finish(root_value: str, task: str) -> dict[str, Any]:
         raise WorkflowError("feature branch has no upstream; push it before finish")
     if git(worktree, "rev-parse", upstream) != feature_commit:
         raise WorkflowError("feature branch is not fully pushed")
+    for command in settings["finish_validation_commands"]:
+        run_user_command(command, worktree)
+    if dirty_paths(worktree):
+        raise WorkflowError("finish validation commands left the feature worktree dirty")
     data = registry()
     value = data["tasks"][task_key(root, task)]
     value.update(
