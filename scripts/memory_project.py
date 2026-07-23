@@ -13,6 +13,8 @@ import shutil
 import subprocess
 from typing import Any
 
+import loop_superpowers
+
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REGISTRY_PATH = pathlib.Path(
@@ -573,7 +575,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
     name = repo_name(root)
     slug_bucket = re.sub(r"[^a-z0-9-]+", "-", name.lower().replace("_", "-")).strip("-")
     return {
-        "schema_version": 2,
+        "schema_version": loop_superpowers.SCHEMA_VERSION,
         "project_repo_name": name,
         "loop_enabled": True,
         "repository": {
@@ -586,7 +588,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "trigger_phrase": "开 worktree",
             "root": "/Users/stephenbo/Noema/Projects/worktrees",
             "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
-            "finish_validation_commands": [],
+            "finish_validation_commands": [loop_superpowers.COMPLETION_COMMAND],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
             "one_task_one_conversation_one_worktree_one_branch": True,
@@ -677,6 +679,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "project_loop_config_to_personal_long_candidate": True,
             "worktree_flow_document": str(APP_ROOT / "docs" / "worktree_loop_workflow.md"),
         },
+        "methodology": loop_superpowers.methodology_defaults(),
         "sensitive_data_policy": {
             "do_not_record_tokens": True,
             "do_not_record_verification_codes": True,
@@ -709,7 +712,9 @@ def upgrade_loop_config(root: pathlib.Path, port: int) -> tuple[dict[str, Any], 
     if not isinstance(current, dict):
         raise ValueError(f"Invalid loop config JSON: {config_path}")
     upgraded = merge_missing(current, defaults)
-    upgraded["schema_version"] = max(int(current.get("schema_version", 1)), 2)
+    upgraded["schema_version"] = max(
+        int(current.get("schema_version", 1)), loop_superpowers.SCHEMA_VERSION
+    )
     upgraded.setdefault("repository", {})["canonical_root"] = str(root.resolve())
     if upgraded != current:
         write_json(config_path, upgraded)

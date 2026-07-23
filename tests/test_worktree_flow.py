@@ -63,10 +63,13 @@ class WorktreeFlowTest(unittest.TestCase):
 
     def test_generated_loop_config_has_safe_multi_conversation_defaults(self) -> None:
         value = memory_project.loop_config(self.repo, 8088)
-        self.assertEqual(value["schema_version"], 2)
+        self.assertEqual(value["schema_version"], 3)
         self.assertEqual(pathlib.Path(value["repository"]["canonical_root"]), self.repo.resolve())
         self.assertFalse(value["worktree"]["allow_inside_canonical_root"])
-        self.assertEqual(value["worktree"]["finish_validation_commands"], [])
+        self.assertEqual(
+            value["worktree"]["finish_validation_commands"],
+            ["python3 scripts/validate_loop_methodology.py --phase completion"],
+        )
         self.assertTrue(value["release"]["serialized"])
         self.assertEqual(value["canonical_sync"]["mode"], "ff-only")
         self.assertFalse(value["canonical_sync"]["allow_auto_stash"])
@@ -85,12 +88,13 @@ class WorktreeFlowTest(unittest.TestCase):
 
         upgraded, status = memory_project.upgrade_loop_config(self.repo, 8088)
         self.assertEqual(status, "upgraded")
-        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["schema_version"], 3)
         self.assertEqual(upgraded["staging"]["port"], 9191)
         self.assertEqual(upgraded["staging"]["database"], "project_offline_database")
         self.assertEqual(upgraded["staging"]["oss_bucket"], "project-controlled-bucket")
         self.assertTrue(upgraded["release"]["serialized"])
         self.assertEqual(upgraded["canonical_sync"]["mode"], "ff-only")
+        self.assertTrue(upgraded["methodology"]["superpowers"]["enabled"])
 
     def test_start_finish_release_sync_and_verify(self) -> None:
         entry = workflow.start(str(self.repo), "preview-chat", "conversation-1")
