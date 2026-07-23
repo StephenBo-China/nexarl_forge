@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
 import memory_review_queue as review
+import loop_superpowers
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
@@ -39,6 +40,15 @@ class MemoryReviewQualityTest(unittest.TestCase):
         self.assertNotIn('prompt[:3000]', hook)
         self.assertNotIn("append_project_candidate", hook)
         self.assertIn("conversation model reviews memory candidates", hook)
+
+    def test_hook_context_is_conditional_and_safe(self) -> None:
+        hook = memory_project.hook_script(pathlib.Path("/tmp/project"), "codex")
+        self.assertIn("def loop_context()", hook)
+        self.assertIn("Loop × Superpowers", hook)
+        self.assertIn("explicit user authorization", hook)
+        self.assertIn("Loop configuration is invalid", hook)
+        self.assertNotIn("oss_access_key", hook)
+        self.assertNotIn("database_password", hook)
 
     def test_agent_candidate_is_structured_and_deduplicated(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
@@ -90,6 +100,36 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "old managed hook\n")
             self.assertTrue(any(item["status"] == "backup" for item in result["changes"]))
+
+    def test_upgrade_managed_rules_preserves_user_text_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = pathlib.Path(temp_value)
+            agents = project / "AGENTS.md"
+            agents.write_text("# User rules\n\nKeep this exact text.\n", encoding="utf-8")
+            self.assertTrue(hasattr(memory_project, "upgrade_memory_rules"))
+
+            first = memory_project.upgrade_memory_rules(project)
+            updated = agents.read_text(encoding="utf-8")
+            second = memory_project.upgrade_memory_rules(project)
+
+            self.assertIn("Keep this exact text.", updated)
+            self.assertIn(loop_superpowers.MANAGED_RULE_START, updated)
+            self.assertEqual(updated, agents.read_text(encoding="utf-8"))
+            self.assertTrue(any(item["status"] == "backup" for item in first["changes"]))
+            self.assertFalse(any(item["status"] == "backup" for item in second["changes"]))
+
+    def test_upgrade_managed_rules_reports_unmatched_marker_without_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = pathlib.Path(temp_value)
+            agents = project / "AGENTS.md"
+            original = f"user text\n{loop_superpowers.MANAGED_RULE_START}\nbroken\n"
+            agents.write_text(original, encoding="utf-8")
+            self.assertTrue(hasattr(memory_project, "upgrade_memory_rules"))
+
+            result = memory_project.upgrade_memory_rules(project)
+
+            self.assertEqual(agents.read_text(encoding="utf-8"), original)
+            self.assertTrue(any(item["status"] == "conflict" for item in result["changes"]))
 
     def test_quarantine_preserves_source_and_marks_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

@@ -13,6 +13,8 @@ import shutil
 import subprocess
 from typing import Any
 
+import loop_superpowers
+
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 REGISTRY_PATH = pathlib.Path(
@@ -65,14 +67,85 @@ def registry() -> dict[str, Any]:
 
 def project_entry(root: pathlib.Path) -> dict[str, Any]:
     root = root.resolve()
+    has_memory = (root / "codex" / "codex_long_memory.md").exists() and (
+        root / "codex" / "codex_short_memory.md"
+    ).exists() and (root / "codex" / "memory_proposals.md").exists()
+    config_path = root / ".loop" / "config.json"
+    loop_status = "not_initialized"
+    completion_gate = "not_applicable"
+    if config_path.exists():
+        try:
+            config = loop_superpowers.read_loop_config_strict(config_path)
+            validator_state = loop_superpowers.validator_status(root)
+            readiness = loop_superpowers.inspect_config(config, validator_state)
+            completion_gate = readiness["completion_gate"]
+            methodology = config.get("methodology", {})
+            provider = methodology.get("provider") if isinstance(methodology, dict) else None
+            if readiness["contract_ok"] and completion_gate == "configured":
+                loop_status = "superpowers_ready"
+            elif provider == "superpowers":
+                loop_status = "superpowers_incomplete"
+            else:
+                loop_status = "legacy"
+        except (OSError, TypeError, ValueError):
+            loop_status = "invalid"
+            completion_gate = "needs_attention"
+
+    rule_states = [
+        loop_superpowers.managed_rule_status(root / "AGENTS.md"),
+        loop_superpowers.managed_rule_status(root / "CLAUDE.md"),
+        loop_superpowers.managed_rule_status(
+            root / ".claude" / "rules" / "shared-memory.md"
+        ),
+    ]
+    if "conflict" in rule_states:
+        managed_rules_status = "conflict"
+    elif all(state == "current" for state in rule_states):
+        managed_rules_status = "current"
+    elif all(state == "missing" for state in rule_states):
+        managed_rules_status = "missing"
+    else:
+        managed_rules_status = "upgrade_available"
+
+    hook_targets = (
+        (root / ".codex" / "hooks" / "shared_memory_hook.py", "codex"),
+        (root / ".claude" / "hooks" / "shared_memory_hook.py", "claude"),
+    )
+    hook_states = []
+    for path, source in hook_targets:
+        if not path.exists():
+            hook_states.append("missing")
+        elif path.read_text(encoding="utf-8") == hook_script(root, source):
+            hook_states.append("current")
+        else:
+            hook_states.append("upgrade_available")
+    managed_hooks_status = (
+        "current"
+        if all(state == "current" for state in hook_states)
+        else "missing"
+        if all(state == "missing" for state in hook_states)
+        else "upgrade_available"
+    )
+    memory_status = (
+        "not_initialized"
+        if not has_memory
+        else "initialized"
+        if managed_rules_status == "current" and managed_hooks_status == "current"
+        else "upgrade_available"
+    )
+
     return {
         "name": repo_name(root),
         "root": str(root),
         "is_git_repo": (root / ".git").exists(),
-        "has_memory": (root / "codex" / "codex_long_memory.md").exists()
-        and (root / "codex" / "codex_short_memory.md").exists()
-        and (root / "codex" / "memory_proposals.md").exists(),
-        "has_loop": (root / ".loop" / "config.json").exists(),
+        "has_memory": has_memory,
+        "has_loop": config_path.exists(),
+        "memory_status": memory_status,
+        "loop_status": loop_status,
+        "completion_gate": completion_gate,
+        "managed_rules_status": managed_rules_status,
+        "managed_hooks_status": managed_hooks_status,
+        "plugin_status": loop_superpowers.plugin_status(),
         "last_opened_at": now(),
     }
 
@@ -225,6 +298,8 @@ require explicit approval of exact content; write personal candidates only to
 `~/.codex/personal_memory/proposals.md`.
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -257,6 +332,8 @@ Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -311,6 +388,8 @@ For this project, pass:
 - `MEMORY_REVIEW_PROJECT_ROOT={root}`
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -397,21 +476,69 @@ def refresh_queue() -> dict[str, int]:
         return {{"pending": 0, "project_pending": 0, "personal_pending": 0}}
 
 
-def context_text(event: str, counts: dict[str, int]) -> str:
-    loop = ""
-    if LOOP_CONFIG.exists():
-        loop = f"""
+def loop_context() -> str:
+    if not LOOP_CONFIG.exists():
+        return ""
+    try:
+        config = json.loads(LOOP_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("root must be an object")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return f"""
+
+## Loop Engineering
+
+- Loop configuration is invalid: `{{LOOP_CONFIG}}`.
+- Fix the configuration before Loop planning, staging, evaluation, or release.
+"""
+
+    methodology = config.get("methodology", {{}})
+    superpowers = (
+        methodology.get("superpowers", {{}})
+        if isinstance(methodology, dict)
+        else {{}}
+    )
+    enabled = (
+        isinstance(superpowers, dict)
+        and methodology.get("provider") == "superpowers"
+        and superpowers.get("enabled") is True
+    )
+    if enabled:
+        worktree = config.get("worktree", {{}})
+        commands = (
+            worktree.get("finish_validation_commands", [])
+            if isinstance(worktree, dict)
+            else []
+        )
+        gate = "configured" if commands else "missing"
+        return f"""
+
+## Loop × Superpowers
+
+- project loop config: `{{LOOP_CONFIG}}` (present)
+- Loop is the only lifecycle orchestrator for worktrees, branches, staging,
+  evaluation, release, main merge, and production.
+- Use Superpowers for brainstorming, written plans, TDD, systematic debugging,
+  code review, and verification before completion.
+- finish validation gate: {{gate}}; run configured validation before success claims.
+- Subagents and parallel agents require explicit user authorization and isolated
+  Loop-safe worktrees.
+- Read `/Users/stephenbo/.codex/loop_engineering` and
+  `/Users/stephenbo/.claude/loop_engineering` before substantial Loop work.
+"""
+
+    return f"""
 
 ## Loop Engineering
 
 - project loop config: `{{LOOP_CONFIG}}` (present)
-- Codex loop directory: `/Users/stephenbo/.codex/loop_engineering`
-- Claude loop directory: `/Users/stephenbo/.claude/loop_engineering`
-- Required behavior: read `.loop/config.json` before loop planning,
-  staging work, Claude evaluation, or master/production decisions.
-- Worktree behavior: use a dedicated worktree when the user says `开 worktree`;
-  loop implementation starts in a dedicated worktree by default.
+- Required behavior: read `.loop/config.json` before loop planning, staging,
+  evaluation, or master/production decisions.
 """
+
+
+def context_text(event: str, counts: dict[str, int]) -> str:
+    loop = loop_context()
     return f"""# Shared Memory Context Packet
 
 Generated: {{now()}}
@@ -545,6 +672,54 @@ def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 
+def upgrade_memory_rules(root: str | pathlib.Path) -> dict[str, Any]:
+    """Install or replace only the central manager's marked instruction block."""
+    project_root = normalize_project_root(root)
+    changes: list[dict[str, str]] = []
+    managed = loop_superpowers.managed_rule_block()
+    targets = (
+        (project_root / "AGENTS.md", agent_memory_block(project_root)),
+        (project_root / "CLAUDE.md", claude_md(project_root)),
+        (
+            project_root / ".claude" / "rules" / "shared-memory.md",
+            shared_memory_rule(project_root),
+        ),
+    )
+    for path, default_content in targets:
+        if not path.exists():
+            loop_superpowers.atomic_write_text(path, default_content.rstrip() + "\n")
+            changes.append({"path": str(path), "status": "created"})
+            continue
+        current = path.read_text(encoding="utf-8")
+        updated, status = loop_superpowers.replace_managed_block(current, managed)
+        if status == "conflict":
+            changes.append({"path": str(path), "status": "conflict"})
+            continue
+        if status == "existing":
+            changes.append({"path": str(path), "status": "existing"})
+            continue
+        backup = loop_superpowers.timestamped_backup(path)
+        loop_superpowers.atomic_write_text(path, updated)
+        changes.extend(
+            [
+                {"path": str(backup), "status": "backup"},
+                {"path": str(path), "status": status},
+            ]
+        )
+    return {"ok": True, "project": project_entry(project_root), "changes": changes}
+
+
+def upgrade_memory(root: str | pathlib.Path) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    rules = upgrade_memory_rules(project_root)
+    hooks = upgrade_memory_hooks(project_root)
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "changes": rules["changes"] + hooks["changes"],
+    }
+
+
 def used_loop_ports() -> set[int]:
     ports: set[int] = set()
     for item in registry().get("projects", []):
@@ -573,7 +748,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
     name = repo_name(root)
     slug_bucket = re.sub(r"[^a-z0-9-]+", "-", name.lower().replace("_", "-")).strip("-")
     return {
-        "schema_version": 2,
+        "schema_version": loop_superpowers.SCHEMA_VERSION,
         "project_repo_name": name,
         "loop_enabled": True,
         "repository": {
@@ -586,6 +761,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "trigger_phrase": "开 worktree",
             "root": "/Users/stephenbo/Noema/Projects/worktrees",
             "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "finish_validation_commands": [loop_superpowers.COMPLETION_COMMAND],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
             "one_task_one_conversation_one_worktree_one_branch": True,
@@ -676,6 +852,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "project_loop_config_to_personal_long_candidate": True,
             "worktree_flow_document": str(APP_ROOT / "docs" / "worktree_loop_workflow.md"),
         },
+        "methodology": loop_superpowers.methodology_defaults(),
         "sensitive_data_policy": {
             "do_not_record_tokens": True,
             "do_not_record_verification_codes": True,
@@ -708,7 +885,9 @@ def upgrade_loop_config(root: pathlib.Path, port: int) -> tuple[dict[str, Any], 
     if not isinstance(current, dict):
         raise ValueError(f"Invalid loop config JSON: {config_path}")
     upgraded = merge_missing(current, defaults)
-    upgraded["schema_version"] = max(int(current.get("schema_version", 1)), 2)
+    upgraded["schema_version"] = max(
+        int(current.get("schema_version", 1)), loop_superpowers.SCHEMA_VERSION
+    )
     upgraded.setdefault("repository", {})["canonical_root"] = str(root.resolve())
     if upgraded != current:
         write_json(config_path, upgraded)
@@ -716,12 +895,101 @@ def upgrade_loop_config(root: pathlib.Path, port: int) -> tuple[dict[str, Any], 
     return current, "existing"
 
 
+def _upgraded_loop_value(
+    project_root: pathlib.Path, current: dict[str, Any], port: int
+) -> dict[str, Any]:
+    upgraded = merge_missing(current, loop_config(project_root, port))
+    upgraded["schema_version"] = max(
+        int(current.get("schema_version", 1)), loop_superpowers.SCHEMA_VERSION
+    )
+    repository = upgraded.setdefault("repository", {})
+    if not isinstance(repository, dict):
+        raise ValueError("Invalid loop config: repository must be an object")
+    repository["canonical_root"] = str(project_root.resolve())
+    loop_superpowers.append_unique_command(upgraded)
+    return upgraded
+
+
+def preview_loop_upgrade(
+    root: str | pathlib.Path, port: int | None = None
+) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    current = loop_superpowers.read_loop_config_strict(config_path)
+    selected_port = int(port or current.get("staging", {}).get("port") or recommend_port())
+    upgraded = _upgraded_loop_value(project_root, current, selected_port)
+    validator_state = loop_superpowers.validator_status(project_root)
+    projected_validator_state = (
+        "custom_conflict" if validator_state == "custom_conflict" else "managed"
+    )
+    return {
+        "ok": True,
+        "project_root": str(project_root),
+        "port": selected_port,
+        "added_paths": loop_superpowers.added_config_paths(current, upgraded),
+        "preserved_categories": [
+            "repository main/remote",
+            "staging resources",
+            "verification commands",
+            "production guardrails",
+            "unknown extension fields",
+        ],
+        "config_will_change": upgraded != current,
+        "validator_action": validator_state,
+        "readiness": loop_superpowers.inspect_config(
+            upgraded, projected_validator_state
+        ),
+    }
+
+
+def upgrade_loop(
+    root: str | pathlib.Path, port: int | None = None
+) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    current = loop_superpowers.read_loop_config_strict(config_path)
+    selected_port = int(port or current.get("staging", {}).get("port") or recommend_port())
+    upgraded = _upgraded_loop_value(project_root, current, selected_port)
+    changes: list[dict[str, str]] = []
+
+    config_status = "existing"
+    if upgraded != current:
+        backup = loop_superpowers.timestamped_backup(config_path)
+        changes.append({"path": str(backup), "status": "backup"})
+
+    methodology_status = loop_superpowers.install_validator(project_root, changes)
+    if upgraded != current:
+        loop_superpowers.atomic_write_text(
+            config_path,
+            json.dumps(upgraded, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        changes.append({"path": str(config_path), "status": "upgraded"})
+        config_status = "upgraded"
+
+    readiness = loop_superpowers.inspect_config(
+        upgraded, methodology_status["status"]
+    )
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "port": selected_port,
+        "changes": changes,
+        "config_status": config_status,
+        "methodology_status": methodology_status,
+        "readiness": readiness,
+    }
+
+
 def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, Any]:
     project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    if config_path.exists():
+        raise FileExistsError(
+            "Loop config already exists; use preview-loop-upgrade before upgrade-loop"
+        )
     result = init_project(project_root)
     changes = result["changes"]
     selected_port = int(port or recommend_port())
-    config_path = project_root / ".loop" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _, config_status = upgrade_loop_config(project_root, selected_port)
     changes.append({"path": str(config_path), "status": config_status})
@@ -732,8 +1000,15 @@ def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, An
         else:
             path.mkdir(parents=True, exist_ok=True)
             changes.append({"path": str(path), "status": "created"})
+    methodology_status = loop_superpowers.install_validator(project_root, changes)
     register_project(project_root, make_current=True)
-    return {"ok": True, "project": project_entry(project_root), "port": selected_port, "changes": changes}
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "port": selected_port,
+        "changes": changes,
+        "methodology_status": methodology_status,
+    }
 
 
 def git_root(path: pathlib.Path) -> str:
@@ -754,7 +1029,14 @@ def git_root(path: pathlib.Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage memory review projects")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["register", "use", "init", "upgrade-memory-hooks"]:
+    for name in [
+        "register",
+        "use",
+        "init",
+        "upgrade-memory-hooks",
+        "upgrade-rules",
+        "upgrade-memory",
+    ]:
         p = sub.add_parser(name)
         p.add_argument("project_root")
     loop_parser = sub.add_parser("init-loop")
@@ -763,6 +1045,9 @@ def main() -> int:
     upgrade_parser = sub.add_parser("upgrade-loop")
     upgrade_parser.add_argument("project_root")
     upgrade_parser.add_argument("--port", type=int, default=None)
+    preview_parser = sub.add_parser("preview-loop-upgrade")
+    preview_parser.add_argument("project_root")
+    preview_parser.add_argument("--port", type=int, default=None)
     sub.add_parser("list")
     sub.add_parser("current")
     sub.add_parser("recommend-port")
@@ -780,11 +1065,26 @@ def main() -> int:
     if args.command == "upgrade-memory-hooks":
         print(json.dumps(upgrade_memory_hooks(args.project_root), ensure_ascii=False, indent=2))
         return 0
+    if args.command == "upgrade-rules":
+        print(json.dumps(upgrade_memory_rules(args.project_root), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-memory":
+        print(json.dumps(upgrade_memory(args.project_root), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "init-loop":
         print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
         return 0
     if args.command == "upgrade-loop":
-        print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
+        print(json.dumps(upgrade_loop(args.project_root, args.port), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "preview-loop-upgrade":
+        print(
+            json.dumps(
+                preview_loop_upgrade(args.project_root, args.port),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     if args.command == "list":
         print(json.dumps(list_projects(), ensure_ascii=False, indent=2))

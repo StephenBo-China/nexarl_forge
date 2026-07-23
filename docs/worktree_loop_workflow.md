@@ -3,6 +3,25 @@
 This document defines the safe cross-project workflow used by Codex and Claude
 Code when several conversations develop against the same repository.
 
+## Superpowers Method Layer
+
+Loop remains the only lifecycle orchestrator. It owns worktree registration,
+branches, staging coordination, independent evaluation, release locks, main
+integration, canonical synchronization, production resources, and deployment.
+Superpowers supplies the stage-level engineering method: brainstorming, an
+approved design, a written plan, TDD, systematic debugging, code review, and
+verification before completion.
+
+New projects initialized by the central manager receive the complete method
+contract and dependency-free completion validator. Existing Loop projects use
+`preview-loop-upgrade` before the explicit `upgrade-loop` operation; project
+resource values are retained. The existing Codex and Claude memory hooks may be
+updated with `upgrade-memory`; no separate Superpowers hook is created.
+
+Subagents and parallel agents remain disabled by default. They require explicit
+user authorization and isolated Loop worktrees. Superpowers branch-finishing
+guidance may not bypass Loop to merge main or deploy production.
+
 ## Invariants
 
 - The original repository is the canonical workspace and normally stays on the

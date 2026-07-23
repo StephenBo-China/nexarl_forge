@@ -63,9 +63,13 @@ class WorktreeFlowTest(unittest.TestCase):
 
     def test_generated_loop_config_has_safe_multi_conversation_defaults(self) -> None:
         value = memory_project.loop_config(self.repo, 8088)
-        self.assertEqual(value["schema_version"], 2)
+        self.assertEqual(value["schema_version"], 3)
         self.assertEqual(pathlib.Path(value["repository"]["canonical_root"]), self.repo.resolve())
         self.assertFalse(value["worktree"]["allow_inside_canonical_root"])
+        self.assertEqual(
+            value["worktree"]["finish_validation_commands"],
+            ["python3 scripts/validate_loop_methodology.py --phase completion"],
+        )
         self.assertTrue(value["release"]["serialized"])
         self.assertEqual(value["canonical_sync"]["mode"], "ff-only")
         self.assertFalse(value["canonical_sync"]["allow_auto_stash"])
@@ -84,12 +88,13 @@ class WorktreeFlowTest(unittest.TestCase):
 
         upgraded, status = memory_project.upgrade_loop_config(self.repo, 8088)
         self.assertEqual(status, "upgraded")
-        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["schema_version"], 3)
         self.assertEqual(upgraded["staging"]["port"], 9191)
         self.assertEqual(upgraded["staging"]["database"], "project_offline_database")
         self.assertEqual(upgraded["staging"]["oss_bucket"], "project-controlled-bucket")
         self.assertTrue(upgraded["release"]["serialized"])
         self.assertEqual(upgraded["canonical_sync"]["mode"], "ff-only")
+        self.assertTrue(upgraded["methodology"]["superpowers"]["enabled"])
 
     def test_start_finish_release_sync_and_verify(self) -> None:
         entry = workflow.start(str(self.repo), "preview-chat", "conversation-1")
@@ -116,6 +121,96 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertTrue(checked["ok"])
         self.assertTrue(checked["feature_is_ancestor"])
         self.assertTrue(checked["canonical_matches_remote"])
+
+    def test_finish_runs_configured_feature_worktree_validation(self) -> None:
+        entry = workflow.start(str(self.repo), "validated-finish", "conversation-2")
+        feature = pathlib.Path(entry["worktree"])
+        config_path = feature / ".loop" / "config.json"
+        config_path.parent.mkdir()
+        config = json.loads(
+            (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
+        )
+        config["worktree"]["finish_validation_commands"] = [
+            "test -f finish-ready.txt"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
+        command("git", "add", ".loop/config.json", "feature.txt", cwd=feature)
+        command("git", "commit", "-m", "feature", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        with self.assertRaises(workflow.WorkflowError):
+            workflow.finish(str(self.repo), "validated-finish")
+
+        (feature / "finish-ready.txt").write_text("ready\n", encoding="utf-8")
+        command("git", "add", "finish-ready.txt", cwd=feature)
+        command("git", "commit", "-m", "finish evidence", cwd=feature)
+        command("git", "push", cwd=feature)
+
+        finished = workflow.finish(str(self.repo), "validated-finish")
+        self.assertEqual(finished["status"], "ready_for_user_acceptance")
+
+    def test_release_uses_verification_commands_from_feature_commit(self) -> None:
+        entry = workflow.start(str(self.repo), "feature-verification", "conversation-4")
+        feature = pathlib.Path(entry["worktree"])
+        config_path = feature / ".loop" / "config.json"
+        config_path.parent.mkdir()
+        config = json.loads(
+            (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
+        )
+        config["verification"]["commands"] = [
+            "test -f feature-verification-enabled.txt"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        (feature / "feature-verification-enabled.txt").write_text(
+            "enabled\n", encoding="utf-8"
+        )
+        command("git", "add", ".", cwd=feature)
+        command("git", "commit", "-m", "feature verification", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        workflow.finish(str(self.repo), "feature-verification")
+        released = workflow.release(
+            str(self.repo),
+            "feature-verification",
+            approved=True,
+            test_commands=[],
+        )
+
+        self.assertIn(released["status"], {"master_pushed", "canonical_synced"})
+        self.assertEqual(
+            command(
+                "git",
+                "show",
+                "origin/master:feature-verification-enabled.txt",
+                cwd=self.repo,
+            ),
+            "enabled",
+        )
+
+    def test_finish_rejects_validation_that_changes_feature_commit(self) -> None:
+        config_path = self.repo / ".loop" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["worktree"]["finish_validation_commands"] = [
+            "git commit --allow-empty -m validation-mutated-head"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        entry = workflow.start(str(self.repo), "mutating-validation", "conversation-3")
+        feature = pathlib.Path(entry["worktree"])
+        (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
+        command("git", "add", "feature.txt", cwd=feature)
+        command("git", "commit", "-m", "feature", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        with self.assertRaisesRegex(
+            workflow.WorkflowError,
+            "finish validation commands changed the feature commit",
+        ):
+            workflow.finish(str(self.repo), "mutating-validation")
+
+        status = workflow.status(str(self.repo))
+        self.assertEqual(status["tasks"][0]["status"], "developing")
 
     def test_canonical_sync_blocks_overlapping_dirty_file(self) -> None:
         updater = self.base / "updater"
