@@ -292,6 +292,22 @@ def finish(root_value: str, task: str) -> dict[str, Any]:
         run_user_command(command, worktree)
     if dirty_paths(worktree):
         raise WorkflowError("finish validation commands left the feature worktree dirty")
+    if git(worktree, "branch", "--show-current") != branch:
+        raise WorkflowError("finish validation commands changed the feature branch")
+    if git(worktree, "rev-parse", "HEAD") != feature_commit:
+        raise WorkflowError("finish validation commands changed the feature commit")
+    validated_upstream = git(
+        worktree,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{u}",
+        check=False,
+    )
+    if validated_upstream != upstream:
+        raise WorkflowError("finish validation commands changed the feature upstream")
+    if git(worktree, "rev-parse", validated_upstream) != feature_commit:
+        raise WorkflowError("feature branch is not fully pushed after finish validation")
     data = registry()
     value = data["tasks"][task_key(root, task)]
     value.update(

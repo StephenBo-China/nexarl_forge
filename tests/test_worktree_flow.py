@@ -144,6 +144,30 @@ class WorktreeFlowTest(unittest.TestCase):
         finished = workflow.finish(str(self.repo), "validated-finish")
         self.assertEqual(finished["status"], "ready_for_user_acceptance")
 
+    def test_finish_rejects_validation_that_changes_feature_commit(self) -> None:
+        config_path = self.repo / ".loop" / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["worktree"]["finish_validation_commands"] = [
+            "git commit --allow-empty -m validation-mutated-head"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        entry = workflow.start(str(self.repo), "mutating-validation", "conversation-3")
+        feature = pathlib.Path(entry["worktree"])
+        (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
+        command("git", "add", "feature.txt", cwd=feature)
+        command("git", "commit", "-m", "feature", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        with self.assertRaisesRegex(
+            workflow.WorkflowError,
+            "finish validation commands changed the feature commit",
+        ):
+            workflow.finish(str(self.repo), "mutating-validation")
+
+        status = workflow.status(str(self.repo))
+        self.assertEqual(status["tasks"][0]["status"], "developing")
+
     def test_canonical_sync_blocks_overlapping_dirty_file(self) -> None:
         updater = self.base / "updater"
         command("git", "clone", "--branch", "master", str(self.remote), str(updater))
