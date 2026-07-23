@@ -119,17 +119,19 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertTrue(checked["canonical_matches_remote"])
 
     def test_finish_runs_configured_feature_worktree_validation(self) -> None:
-        config_path = self.repo / ".loop" / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        entry = workflow.start(str(self.repo), "validated-finish", "conversation-2")
+        feature = pathlib.Path(entry["worktree"])
+        config_path = feature / ".loop" / "config.json"
+        config_path.parent.mkdir()
+        config = json.loads(
+            (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
+        )
         config["worktree"]["finish_validation_commands"] = [
             "test -f finish-ready.txt"
         ]
         config_path.write_text(json.dumps(config), encoding="utf-8")
-
-        entry = workflow.start(str(self.repo), "validated-finish", "conversation-2")
-        feature = pathlib.Path(entry["worktree"])
         (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
-        command("git", "add", "feature.txt", cwd=feature)
+        command("git", "add", ".loop/config.json", "feature.txt", cwd=feature)
         command("git", "commit", "-m", "feature", cwd=feature)
         command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
 
@@ -143,6 +145,44 @@ class WorktreeFlowTest(unittest.TestCase):
 
         finished = workflow.finish(str(self.repo), "validated-finish")
         self.assertEqual(finished["status"], "ready_for_user_acceptance")
+
+    def test_release_uses_verification_commands_from_feature_commit(self) -> None:
+        entry = workflow.start(str(self.repo), "feature-verification", "conversation-4")
+        feature = pathlib.Path(entry["worktree"])
+        config_path = feature / ".loop" / "config.json"
+        config_path.parent.mkdir()
+        config = json.loads(
+            (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
+        )
+        config["verification"]["commands"] = [
+            "test -f feature-verification-enabled.txt"
+        ]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        (feature / "feature-verification-enabled.txt").write_text(
+            "enabled\n", encoding="utf-8"
+        )
+        command("git", "add", ".", cwd=feature)
+        command("git", "commit", "-m", "feature verification", cwd=feature)
+        command("git", "push", "-u", "origin", entry["branch"], cwd=feature)
+
+        workflow.finish(str(self.repo), "feature-verification")
+        released = workflow.release(
+            str(self.repo),
+            "feature-verification",
+            approved=True,
+            test_commands=[],
+        )
+
+        self.assertIn(released["status"], {"master_pushed", "canonical_synced"})
+        self.assertEqual(
+            command(
+                "git",
+                "show",
+                "origin/master:feature-verification-enabled.txt",
+                cwd=self.repo,
+            ),
+            "enabled",
+        )
 
     def test_finish_rejects_validation_that_changes_feature_commit(self) -> None:
         config_path = self.repo / ".loop" / "config.json"

@@ -127,8 +127,23 @@ def config(root: pathlib.Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def workflow_settings(root: pathlib.Path) -> dict[str, Any]:
-    value = config(root)
+def config_at_revision(root: pathlib.Path, revision: str) -> dict[str, Any] | None:
+    result = run(
+        ["git", "-C", str(root), "show", f"{revision}:.loop/config.json"],
+        check=False,
+    )
+    if result.returncode:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WorkflowError(f"invalid .loop/config.json at {revision}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise WorkflowError(f".loop/config.json at {revision} must contain an object")
+    return value
+
+
+def settings_from_config(value: dict[str, Any]) -> dict[str, Any]:
     repository = value.get("repository", {})
     worktree = value.get("worktree", {})
     branch = value.get("branch", {})
@@ -144,6 +159,10 @@ def workflow_settings(root: pathlib.Path) -> dict[str, Any]:
         "finish_validation_commands": worktree.get("finish_validation_commands", []),
         "verification_commands": value.get("verification", {}).get("commands", []),
     }
+
+
+def workflow_settings(root: pathlib.Path) -> dict[str, Any]:
+    return settings_from_config(config(root))
 
 
 def slug(value: str) -> str:
@@ -288,7 +307,11 @@ def finish(root_value: str, task: str) -> dict[str, Any]:
         raise WorkflowError("feature branch has no upstream; push it before finish")
     if git(worktree, "rev-parse", upstream) != feature_commit:
         raise WorkflowError("feature branch is not fully pushed")
-    for command in settings["finish_validation_commands"]:
+    feature_config = config_at_revision(root, feature_commit)
+    feature_settings = (
+        settings_from_config(feature_config) if feature_config is not None else settings
+    )
+    for command in feature_settings["finish_validation_commands"]:
         run_user_command(command, worktree)
     if dirty_paths(worktree):
         raise WorkflowError("finish validation commands left the feature worktree dirty")
@@ -401,7 +424,11 @@ def release(
         release_commit = remote_head
         release_path: pathlib.Path | None = None
         if not already_merged:
-            commands = test_commands or list(settings["verification_commands"])
+            feature_config = config_at_revision(root, feature_commit)
+            feature_settings = (
+                settings_from_config(feature_config) if feature_config is not None else settings
+            )
+            commands = test_commands or list(feature_settings["verification_commands"])
             if not commands:
                 raise WorkflowError(
                     "release requires at least one --test-command or verification.commands entry"
