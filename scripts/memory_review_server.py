@@ -20,7 +20,10 @@ PORT = review.REVIEW_PORT
 
 
 def project_operation(operation: str, body: dict) -> dict:
-    root = pathlib.Path(body.get("project_root", "")).expanduser().resolve()
+    project_root = body.get("project_root")
+    if not isinstance(project_root, str) or not project_root.strip():
+        raise ValueError("project_root is required")
+    root = pathlib.Path(project_root).expanduser().resolve()
     if not (root / ".git").exists():
         raise ValueError(f"Git repository is required: {root}")
     port = body.get("port")
@@ -43,6 +46,16 @@ def project_operation(operation: str, body: dict) -> dict:
             raise PermissionError("explicit memory upgrade confirmation is required")
         return memory_project.upgrade_memory(root)
     raise ValueError(f"Unknown project operation: {operation}")
+
+
+def project_error_status(error: Exception) -> int:
+    if isinstance(error, FileExistsError):
+        return 409
+    if isinstance(error, PermissionError):
+        return 403
+    if isinstance(error, ValueError):
+        return 400
+    return 500
 
 
 def switch_project(project_root: str) -> dict:
@@ -1472,7 +1485,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"error": "not found"}, status=404)
         except Exception as exc:  # noqa: BLE001 - local admin tool should surface errors.
-            self.send_json({"error": str(exc)}, status=500)
+            self.send_json({"error": str(exc)}, status=project_error_status(exc))
 
 
 def main() -> int:

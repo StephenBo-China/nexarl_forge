@@ -5,6 +5,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -34,6 +35,13 @@ EXPECTED_SKILLS = {
 
 
 class LoopSuperpowersRolloutTest(unittest.TestCase):
+    def test_managed_validator_template_is_valid_python(self) -> None:
+        compile(
+            loop_superpowers.validator_text(),
+            str(loop_superpowers.VALIDATOR_TEMPLATE),
+            "exec",
+        )
+
     def test_new_loop_contract_is_complete(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             project = pathlib.Path(value) / "sample"
@@ -56,7 +64,7 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
             ["python3 scripts/validate_loop_methodology.py --phase completion"],
         )
 
-    def test_init_loop_installs_managed_validator_and_is_idempotent(self) -> None:
+    def test_init_loop_installs_managed_validator(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             project = pathlib.Path(value) / "sample"
             project.mkdir()
@@ -68,7 +76,6 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
                 validator = project.resolve() / "scripts" / "validate_loop_methodology.py"
                 self.assertTrue(validator.exists())
                 first_text = validator.read_text(encoding="utf-8")
-                second = memory_project.init_loop(project, 8123)
             finally:
                 memory_project.REGISTRY_PATH = original_registry
 
@@ -77,19 +84,12 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
                 first_text,
             )
             self.assertIn(loop_superpowers.MANAGED_VALIDATOR_MARKER, first_text)
-            self.assertEqual(first_text, validator.read_text(encoding="utf-8"))
             self.assertTrue(
                 any(
                     item["status"] == "created" and item["path"] == str(validator)
                     for item in first["changes"]
                 ),
                 first["changes"],
-            )
-            self.assertTrue(
-                any(
-                    item["status"] == "existing" and item["path"] == str(validator)
-                    for item in second["changes"]
-                )
             )
 
     def test_preview_and_upgrade_preserve_custom_values_and_are_idempotent(self) -> None:
@@ -236,6 +236,53 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
                     "init-loop", {"project_root": str(project), "port": 8123}
                 )
 
+    def test_init_loop_cli_boundary_rejects_existing_config_without_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            (project / ".git").mkdir()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            original = '{"schema_version": 2, "sentinel": true}\n'
+            config_path.write_text(original, encoding="utf-8")
+
+            with self.assertRaisesRegex(FileExistsError, "upgrade-loop"):
+                memory_project.init_loop(project, 8123)
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+
+    def test_project_operation_rejects_missing_project_root(self) -> None:
+        with self.assertRaisesRegex(ValueError, "project_root is required"):
+            memory_review_server.project_operation("init-loop", {"port": 8123})
+
+    def test_backup_failure_does_not_install_validator_or_rewrite_config(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value).resolve()
+            config_path = project / ".loop" / "config.json"
+            config_path.parent.mkdir()
+            original = json.dumps({"schema_version": 2})
+            config_path.write_text(original, encoding="utf-8")
+            validator = project / loop_superpowers.VALIDATOR_RELATIVE_PATH
+
+            with mock.patch.object(
+                loop_superpowers,
+                "timestamped_backup",
+                side_effect=OSError("backup denied"),
+            ):
+                with self.assertRaisesRegex(OSError, "backup denied"):
+                    memory_project.upgrade_loop(project, 8123)
+
+            self.assertFalse(validator.exists())
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+
+    def test_project_api_errors_have_specific_http_statuses(self) -> None:
+        self.assertEqual(memory_review_server.project_error_status(ValueError("bad")), 400)
+        self.assertEqual(
+            memory_review_server.project_error_status(PermissionError("confirm")), 403
+        )
+        self.assertEqual(
+            memory_review_server.project_error_status(FileExistsError("exists")), 409
+        )
+
     def test_console_renders_latest_loop_superpowers_actions_and_boundaries(self) -> None:
         html = memory_review_server.page()
         self.assertIn("初始化 Loop × Superpowers", html)
@@ -246,6 +293,21 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
         self.assertIn("子代理和并行代理必须获得用户明确授权", html)
         self.assertIn("preview-loop-upgrade", html)
         self.assertIn("confirmed: true", html)
+
+    def test_documentation_lists_latest_initialization_and_upgrade_commands(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        workflow = (ROOT / "docs" / "worktree_loop_workflow.md").read_text(
+            encoding="utf-8"
+        )
+        for command in (
+            "init-loop",
+            "preview-loop-upgrade",
+            "upgrade-loop",
+            "upgrade-memory",
+        ):
+            self.assertIn(command, readme)
+        self.assertIn("Superpowers", workflow)
+        self.assertIn("Loop remains", workflow)
 
 
 if __name__ == "__main__":

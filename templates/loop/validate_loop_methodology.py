@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Validate the repository's Loop + Superpowers workflow contract."""
 
-MANAGED_BY_VIBE_LOOP_SUPERPOWERS = 1
-
 from __future__ import annotations
+
+MANAGED_BY_VIBE_LOOP_SUPERPOWERS = 1
 
 import argparse
 import json

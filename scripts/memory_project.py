@@ -952,11 +952,13 @@ def upgrade_loop(
     upgraded = _upgraded_loop_value(project_root, current, selected_port)
     changes: list[dict[str, str]] = []
 
-    methodology_status = loop_superpowers.install_validator(project_root, changes)
     config_status = "existing"
     if upgraded != current:
         backup = loop_superpowers.timestamped_backup(config_path)
         changes.append({"path": str(backup), "status": "backup"})
+
+    methodology_status = loop_superpowers.install_validator(project_root, changes)
+    if upgraded != current:
         loop_superpowers.atomic_write_text(
             config_path,
             json.dumps(upgraded, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -980,10 +982,14 @@ def upgrade_loop(
 
 def init_loop(root: str | pathlib.Path, port: int | None = None) -> dict[str, Any]:
     project_root = normalize_project_root(root)
+    config_path = project_root / ".loop" / "config.json"
+    if config_path.exists():
+        raise FileExistsError(
+            "Loop config already exists; use preview-loop-upgrade before upgrade-loop"
+        )
     result = init_project(project_root)
     changes = result["changes"]
     selected_port = int(port or recommend_port())
-    config_path = project_root / ".loop" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
     _, config_status = upgrade_loop_config(project_root, selected_port)
     changes.append({"path": str(config_path), "status": config_status})

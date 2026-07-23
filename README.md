@@ -112,25 +112,40 @@ python3 scripts/memory_project.py init /path/to/repo
 This creates missing files only. Existing files are reported as `existing` and
 are not overwritten.
 
-Initialize a Loop Engineering project:
+Initialize a new Loop Engineering × Superpowers project. This creates schema 3,
+the complete method contract, standard artifact directories, and the managed
+completion validator:
 
 ```bash
 python3 scripts/memory_project.py init-loop /path/to/repo --port 8082
 ```
 
-Upgrade an existing Loop project to the latest multi-conversation worktree
-schema without overwriting project-specific staging, database, or OSS values:
+Preview an existing Loop project upgrade without writing files:
+
+```bash
+python3 scripts/memory_project.py preview-loop-upgrade /path/to/repo
+```
+
+Explicitly upgrade an existing Loop project after reviewing the preview. The
+upgrade preserves project-specific staging, database, OSS, port, remote path,
+verification commands, production guardrails, and unknown extension fields:
 
 ```bash
 python3 scripts/memory_project.py upgrade-loop /path/to/repo
 ```
 
-Upgrade only the managed Codex and Claude memory hooks. Existing hook files are
-preserved as timestamped `.bak.*` audit backups before replacement:
+Upgrade the central manager's marked memory-rule blocks and the two existing
+Codex/Claude memory hooks together. Changed managed files are preserved as
+timestamped `.bak.*` audit backups; no separate Superpowers hook is added:
 
 ```bash
-python3 scripts/memory_project.py upgrade-memory-hooks /path/to/repo
+python3 scripts/memory_project.py upgrade-memory /path/to/repo
 ```
+
+Initialization and upgrade do not install plugins, call external models, deploy
+staging, merge main, or access production. Codex and Claude Code use their own
+official Superpowers plugins. Loop remains the lifecycle authority for
+worktrees, branches, staging, evaluation, release, main merge, and production.
 
 ## Candidate Quality Policy
 
