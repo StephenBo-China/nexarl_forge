@@ -66,6 +66,7 @@ class WorktreeFlowTest(unittest.TestCase):
         self.assertEqual(value["schema_version"], 2)
         self.assertEqual(pathlib.Path(value["repository"]["canonical_root"]), self.repo.resolve())
         self.assertFalse(value["worktree"]["allow_inside_canonical_root"])
+        self.assertEqual(value["worktree"]["finish_validation_commands"], [])
         self.assertTrue(value["release"]["serialized"])
         self.assertEqual(value["canonical_sync"]["mode"], "ff-only")
         self.assertFalse(value["canonical_sync"]["allow_auto_stash"])

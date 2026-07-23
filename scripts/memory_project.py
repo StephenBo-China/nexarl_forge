@@ -586,6 +586,7 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
             "trigger_phrase": "开 worktree",
             "root": "/Users/stephenbo/Noema/Projects/worktrees",
             "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "finish_validation_commands": [],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
             "one_task_one_conversation_one_worktree_one_branch": True,
