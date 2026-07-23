@@ -227,6 +227,8 @@ require explicit approval of exact content; write personal candidates only to
 `~/.codex/personal_memory/proposals.md`.
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -259,6 +261,8 @@ Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -313,6 +317,8 @@ For this project, pass:
 - `MEMORY_REVIEW_PROJECT_ROOT={root}`
 
 {agent_candidate_protocol(root)}
+
+{loop_superpowers.managed_rule_block()}
 """
 
 
@@ -399,21 +405,69 @@ def refresh_queue() -> dict[str, int]:
         return {{"pending": 0, "project_pending": 0, "personal_pending": 0}}
 
 
-def context_text(event: str, counts: dict[str, int]) -> str:
-    loop = ""
-    if LOOP_CONFIG.exists():
-        loop = f"""
+def loop_context() -> str:
+    if not LOOP_CONFIG.exists():
+        return ""
+    try:
+        config = json.loads(LOOP_CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("root must be an object")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return f"""
+
+## Loop Engineering
+
+- Loop configuration is invalid: `{{LOOP_CONFIG}}`.
+- Fix the configuration before Loop planning, staging, evaluation, or release.
+"""
+
+    methodology = config.get("methodology", {{}})
+    superpowers = (
+        methodology.get("superpowers", {{}})
+        if isinstance(methodology, dict)
+        else {{}}
+    )
+    enabled = (
+        isinstance(superpowers, dict)
+        and methodology.get("provider") == "superpowers"
+        and superpowers.get("enabled") is True
+    )
+    if enabled:
+        worktree = config.get("worktree", {{}})
+        commands = (
+            worktree.get("finish_validation_commands", [])
+            if isinstance(worktree, dict)
+            else []
+        )
+        gate = "configured" if commands else "missing"
+        return f"""
+
+## Loop × Superpowers
+
+- project loop config: `{{LOOP_CONFIG}}` (present)
+- Loop is the only lifecycle orchestrator for worktrees, branches, staging,
+  evaluation, release, main merge, and production.
+- Use Superpowers for brainstorming, written plans, TDD, systematic debugging,
+  code review, and verification before completion.
+- finish validation gate: {{gate}}; run configured validation before success claims.
+- Subagents and parallel agents require explicit user authorization and isolated
+  Loop-safe worktrees.
+- Read `/Users/stephenbo/.codex/loop_engineering` and
+  `/Users/stephenbo/.claude/loop_engineering` before substantial Loop work.
+"""
+
+    return f"""
 
 ## Loop Engineering
 
 - project loop config: `{{LOOP_CONFIG}}` (present)
-- Codex loop directory: `/Users/stephenbo/.codex/loop_engineering`
-- Claude loop directory: `/Users/stephenbo/.claude/loop_engineering`
-- Required behavior: read `.loop/config.json` before loop planning,
-  staging work, Claude evaluation, or master/production decisions.
-- Worktree behavior: use a dedicated worktree when the user says `开 worktree`;
-  loop implementation starts in a dedicated worktree by default.
+- Required behavior: read `.loop/config.json` before loop planning, staging,
+  evaluation, or master/production decisions.
 """
+
+
+def context_text(event: str, counts: dict[str, int]) -> str:
+    loop = loop_context()
     return f"""# Shared Memory Context Packet
 
 Generated: {{now()}}
@@ -545,6 +599,54 @@ def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
         path.chmod(0o755)
         changes.append({"path": str(path), "status": "upgraded"})
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
+
+
+def upgrade_memory_rules(root: str | pathlib.Path) -> dict[str, Any]:
+    """Install or replace only the central manager's marked instruction block."""
+    project_root = normalize_project_root(root)
+    changes: list[dict[str, str]] = []
+    managed = loop_superpowers.managed_rule_block()
+    targets = (
+        (project_root / "AGENTS.md", agent_memory_block(project_root)),
+        (project_root / "CLAUDE.md", claude_md(project_root)),
+        (
+            project_root / ".claude" / "rules" / "shared-memory.md",
+            shared_memory_rule(project_root),
+        ),
+    )
+    for path, default_content in targets:
+        if not path.exists():
+            loop_superpowers.atomic_write_text(path, default_content.rstrip() + "\n")
+            changes.append({"path": str(path), "status": "created"})
+            continue
+        current = path.read_text(encoding="utf-8")
+        updated, status = loop_superpowers.replace_managed_block(current, managed)
+        if status == "conflict":
+            changes.append({"path": str(path), "status": "conflict"})
+            continue
+        if status == "existing":
+            changes.append({"path": str(path), "status": "existing"})
+            continue
+        backup = loop_superpowers.timestamped_backup(path)
+        loop_superpowers.atomic_write_text(path, updated)
+        changes.extend(
+            [
+                {"path": str(backup), "status": "backup"},
+                {"path": str(path), "status": status},
+            ]
+        )
+    return {"ok": True, "project": project_entry(project_root), "changes": changes}
+
+
+def upgrade_memory(root: str | pathlib.Path) -> dict[str, Any]:
+    project_root = normalize_project_root(root)
+    rules = upgrade_memory_rules(project_root)
+    hooks = upgrade_memory_hooks(project_root)
+    return {
+        "ok": True,
+        "project": project_entry(project_root),
+        "changes": rules["changes"] + hooks["changes"],
+    }
 
 
 def used_loop_ports() -> set[int]:
@@ -850,7 +952,14 @@ def git_root(path: pathlib.Path) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Manage memory review projects")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ["register", "use", "init", "upgrade-memory-hooks"]:
+    for name in [
+        "register",
+        "use",
+        "init",
+        "upgrade-memory-hooks",
+        "upgrade-rules",
+        "upgrade-memory",
+    ]:
         p = sub.add_parser(name)
         p.add_argument("project_root")
     loop_parser = sub.add_parser("init-loop")
@@ -878,6 +987,12 @@ def main() -> int:
         return 0
     if args.command == "upgrade-memory-hooks":
         print(json.dumps(upgrade_memory_hooks(args.project_root), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-rules":
+        print(json.dumps(upgrade_memory_rules(args.project_root), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-memory":
+        print(json.dumps(upgrade_memory(args.project_root), ensure_ascii=False, indent=2))
         return 0
     if args.command == "init-loop":
         print(json.dumps(init_loop(args.project_root, args.port), ensure_ascii=False, indent=2))

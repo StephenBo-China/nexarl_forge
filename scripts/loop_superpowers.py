@@ -272,3 +272,38 @@ def added_config_paths(current: Any, upgraded: Any, prefix: str = "") -> list[st
         elif isinstance(current[key], dict) and isinstance(value, dict):
             paths.extend(added_config_paths(current[key], value, path))
     return paths
+
+
+def managed_rule_block() -> str:
+    return f"""{MANAGED_RULE_START}
+## Loop Engineering With Superpowers
+
+When `.loop/config.json` enables `methodology.superpowers`, read the project
+Loop configuration, both personal Loop directories, and the configured workflow
+document before substantial development.
+
+- Loop is the lifecycle authority for worktrees, branches, staging, evaluation,
+  release, main merge, production resources, and deployment.
+- Use Superpowers for brainstorming, written plans, TDD, systematic debugging,
+  code review, and verification before completion.
+- Use only artifact paths declared in `.loop/config.json`.
+- Run configured finish validation before claiming the Loop feature is ready.
+- Subagents and parallel agents require explicit user authorization and Loop-safe
+  isolated worktrees.
+{MANAGED_RULE_END}"""
+
+
+def replace_managed_block(current: str, managed: str) -> tuple[str, str]:
+    start_count = current.count(MANAGED_RULE_START)
+    end_count = current.count(MANAGED_RULE_END)
+    if start_count != end_count or start_count > 1:
+        return current, "conflict"
+    if start_count == 0:
+        separator = "\n\n" if current.strip() else ""
+        return current.rstrip() + separator + managed.rstrip() + "\n", "appended"
+    start = current.index(MANAGED_RULE_START)
+    end = current.index(MANAGED_RULE_END, start) + len(MANAGED_RULE_END)
+    updated = current[:start] + managed.rstrip() + current[end:]
+    if updated == current:
+        return current, "existing"
+    return updated, "upgraded"
