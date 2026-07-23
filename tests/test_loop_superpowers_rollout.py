@@ -236,6 +236,17 @@ class LoopSuperpowersRolloutTest(unittest.TestCase):
                     "init-loop", {"project_root": str(project), "port": 8123}
                 )
 
+    def test_console_renders_latest_loop_superpowers_actions_and_boundaries(self) -> None:
+        html = memory_review_server.page()
+        self.assertIn("初始化 Loop × Superpowers", html)
+        self.assertIn("预览升级 Loop", html)
+        self.assertIn("升级记忆规则/钩子", html)
+        self.assertIn("Superpowers 是阶段内工程方法", html)
+        self.assertIn("Loop 是唯一生命周期编排器", html)
+        self.assertIn("子代理和并行代理必须获得用户明确授权", html)
+        self.assertIn("preview-loop-upgrade", html)
+        self.assertIn("confirmed: true", html)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -390,7 +390,9 @@ def page() -> str:
         <input id="loopPort" placeholder="Loop staging 端口，留空用推荐值">
         <button onclick="registerProjectFromInput()">注册</button>
         <button onclick="initProjectFromInput()">初始化记忆</button>
-        <button class="primary" onclick="initLoopFromInput()">初始化 / 升级 Loop</button>
+        <button class="primary" onclick="initLoopFromInput()">初始化 Loop × Superpowers</button>
+        <button onclick="previewLoopUpgradeFromInput()">预览升级 Loop</button>
+        <button onclick="upgradeMemoryFromInput()">升级记忆规则/钩子</button>
       </div>
       <div id="counts" class="counts"></div>
     </div>
@@ -410,6 +412,23 @@ const statusLabel = {pending: '待审批', approved: '已批准', rejected: '已
 const scopeLabel = {project: '项目记忆', personal: '个人记忆'};
 const targetLabel = {project_long: '项目长期记忆', personal_long: '个人长期记忆', personal_short: '个人短期记忆', short: '个人短期候选', unsure: '待判断'};
 const sourceLabel = {project_proposals: '项目候选文件', personal_proposals: '个人候选文件'};
+const loopStatusLabel = {
+  not_initialized: 'Loop 未初始化',
+  legacy: '旧版 Loop',
+  superpowers_incomplete: 'Loop × Superpowers 待完善',
+  superpowers_ready: 'Loop × Superpowers 已就绪',
+  invalid: 'Loop 配置无效'
+};
+const memoryStatusLabel = {
+  not_initialized: '项目记忆未初始化',
+  initialized: '项目记忆已就绪',
+  upgrade_available: '记忆规则/钩子可升级'
+};
+const pluginStatusLabel = {
+  installed: '双端 Superpowers 已安装',
+  partial: 'Superpowers 部分安装',
+  missing: 'Superpowers 未安装'
+};
 const riskLabel = {
   api_key: '疑似 API Key',
   access_key: '疑似 AccessKey',
@@ -544,7 +563,7 @@ async function initLoopFromInput() {
   const rawPort = document.getElementById('loopPort').value.trim();
   const port = rawPort ? Number(rawPort) : projectState.recommend_port;
   if (!Number.isInteger(port) || port < 1 || port > 65535) return showMessage('请输入有效端口');
-  if (!confirm(`将初始化或兼容升级 loop 项目：\\n${root}\\n\\n建议/选择的 staging 端口：${port}\\n\\n已有项目专用端口、数据库、OSS 和部署配置不会被覆盖；只补充缺失的多对话 Worktree/Release 安全字段。继续？`)) return;
+  if (!confirm(`将为新项目初始化 Loop × Superpowers：\\n${root}\\n\\n建议/选择的 staging 端口：${port}\\n\\n如果项目已有 Loop 配置，请改用“预览升级 Loop”。继续？`)) return;
   const result = await api('/api/projects/init-loop', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -552,8 +571,55 @@ async function initLoopFromInput() {
   });
   projectState = result.projects;
   updateProjectBadge();
-  showMessage(`loop 项目初始化 / 升级完成，端口 ${result.port}`);
+  showMessage(`Loop × Superpowers 初始化完成，端口 ${result.port}`);
   await loadQueue();
+  renderProjects(result);
+}
+
+async function previewLoopUpgradeFromInput() {
+  const root = document.getElementById('projectPath').value.trim();
+  if (!root) return showMessage('请输入项目路径');
+  const rawPort = document.getElementById('loopPort').value.trim();
+  const body = {project_root: root};
+  if (rawPort) {
+    const port = Number(rawPort);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return showMessage('请输入有效端口');
+    body.port = port;
+  }
+  const preview = await api('/api/projects/preview-loop-upgrade', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  });
+  renderProjects(preview);
+  const additions = (preview.added_paths || []).join('\\n') || '无配置字段变化';
+  const conflict = preview.validator_action === 'custom_conflict'
+    ? '\\n\\n检测到自定义同名验证器，将保留原文件并标记人工处理。'
+    : '';
+  if (!confirm(`升级预览：\\n\\n将新增的配置路径：\\n${additions}\\n\\n现有项目资源配置和未知扩展字段会保留；变更前创建备份。${conflict}\\n\\n确认执行升级？`)) return;
+  const result = await api('/api/projects/upgrade-loop', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({...body, confirmed: true})
+  });
+  projectState = result.projects;
+  updateProjectBadge();
+  showMessage('Loop × Superpowers 升级完成');
+  renderProjects(result);
+}
+
+async function upgradeMemoryFromInput() {
+  const root = document.getElementById('projectPath').value.trim();
+  if (!root) return showMessage('请输入项目路径');
+  if (!confirm(`将升级中央管理器拥有的记忆规则块和两个现有 hook：\\n${root}\\n\\n修改前保留时间戳备份，不新增 Superpowers hook，不改规则块外的用户内容。继续？`)) return;
+  const result = await api('/api/projects/upgrade-memory', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({project_root: root, confirmed: true})
+  });
+  projectState = result.projects;
+  updateProjectBadge();
+  showMessage('记忆规则/钩子升级完成');
   renderProjects(result);
 }
 
@@ -723,8 +789,10 @@ function renderProjects(lastResult) {
   ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
   const resultBlock = lastResult ? `
     <section class="doc-section">
-      <h3>最近一次初始化结果</h3>
+      <h3>最近一次项目操作结果</h3>
       <p>状态：${esc(lastResult.ok ? '成功' : '未知')} ${lastResult.port ? `| loop 端口：${esc(lastResult.port)}` : ''}</p>
+      ${(lastResult.added_paths || []).length ? `<p>预览将新增的配置路径：</p><pre>${esc(lastResult.added_paths.join('\\n'))}</pre>` : ''}
+      ${lastResult.validator_action ? `<p>验证器状态：${esc(lastResult.validator_action)}</p>` : ''}
       <pre>${esc((lastResult.changes || []).map(item => `${item.status.padEnd(8)} ${item.path}`).join('\\n'))}</pre>
     </section>
   ` : '';
@@ -741,8 +809,10 @@ function renderProjects(lastResult) {
           <div class="meta">${esc(project.root)}</div>
           <div class="label-row">
             <span class="tag">${project.is_git_repo ? 'Git 仓库' : '非 Git 或未检测到 .git'}</span>
-            <span class="tag">${project.has_memory ? '项目记忆已初始化' : '项目记忆未完整初始化'}</span>
-            <span class="tag">${project.has_loop ? 'Loop 已初始化' : 'Loop 未初始化'}</span>
+            <span class="tag">${esc(memoryStatusLabel[project.memory_status] || project.memory_status)}</span>
+            <span class="tag">${esc(loopStatusLabel[project.loop_status] || project.loop_status)}</span>
+            <span class="tag">完成门禁：${esc(project.completion_gate)}</span>
+            <span class="tag">${esc(pluginStatusLabel[project.plugin_status] || project.plugin_status)}</span>
           </div>
         </div>
         <div class="actions">
@@ -763,7 +833,9 @@ function renderProjects(lastResult) {
         <ul>
           <li><strong>注册项目</strong>：只把路径加入 <code>~/.codex/memory_review/projects.json</code> 并切换当前项目。</li>
           <li><strong>初始化项目记忆</strong>：创建缺失的项目记忆文件、Codex hook、Claude Code hook 和共享规则。</li>
-          <li><strong>初始化 / 升级 loop 项目</strong>：创建或兼容升级 <code>.loop/config.json</code> 和 <code>loop/</code> 工作目录；已有项目资源配置不覆盖，只补充缺失的多对话 Worktree/Release 安全字段。</li>
+          <li><strong>初始化 Loop × Superpowers</strong>：只用于尚无 Loop 配置的新项目，创建 schema 3 配置、标准目录和 completion 验证器。</li>
+          <li><strong>预览升级 Loop</strong>：对旧项目先只读展示新增路径、备份与冲突，再由用户确认升级；数据库、OSS、端口、远程路径和未知扩展字段保持原值。</li>
+          <li><strong>升级记忆规则/钩子</strong>：只更新中央托管规则块和两个既有 hook，保留备份，不新增 Superpowers hook。</li>
           <li>已存在文件不会覆盖，会在结果中显示为 <code>existing</code>。</li>
         </ul>
       </section>
@@ -883,7 +955,8 @@ function renderMemoryStrategy() {
         <ol>
           <li>在“项目管理”输入项目路径。</li>
           <li>确认推荐 staging 端口，或手动输入端口。</li>
-          <li>点击“初始化 / 升级 Loop”，创建或兼容升级 <code>.loop/config.json</code>，并确保 <code>loop/prd</code>、<code>loop/acceptance</code>、<code>loop/reports</code>、<code>loop/claude_tests</code> 存在。</li>
+          <li>新项目点击“初始化 Loop × Superpowers”；已有 Loop 项目点击“预览升级 Loop”，确认预览后显式升级。</li>
+          <li>如页面提示规则或钩子过期，单独点击“升级记忆规则/钩子”；不会新增独立 Superpowers hook。</li>
           <li>后续在 Codex 中贴 Markdown PRD，并要求先生成验收标准。</li>
           <li>Codex 负责开发和 staging，Claude Code 负责 Playwright/浏览器验收，直到通过或触发暂停条件。</li>
         </ol>
@@ -916,7 +989,19 @@ function renderLoopDocs() {
     <div class="doc">
       <section class="doc-hero">
         <h2>Loop 开发使用说明</h2>
-        <p>Loop engineering 是一套支持多对话并行开发、串行安全发布的跨项目流程：你给出 Markdown PRD，Codex 在独立外部 worktree 开发、提交、部署和修复；Claude Code 独立评测；经你批准后，release 队列基于最新远端主分支完成整合、测试、原仓库同步和部署一致性验证。</p>
+        <p>Loop engineering 是一套支持多对话隔离开发、串行安全发布的跨项目流程。Loop 是唯一生命周期编排器，负责需求验收、worktree、分支、staging、独立评测、release、主分支和 production；Superpowers 是阶段内工程方法，负责构思、计划、TDD、系统调试、代码审查和完成前验证。</p>
+      </section>
+
+      <section class="doc-section">
+        <h3>Loop × Superpowers 标准阶段</h3>
+        <ol>
+          <li><code>using-superpowers</code> 判断任务路径；新行为先通过 <code>brainstorming</code> 形成用户批准的设计。</li>
+          <li><code>writing-plans</code> 写出可执行计划，再由 Loop 创建和登记独立 worktree。</li>
+          <li>实施使用 TDD：先看到失败测试，再做最小实现；Bug 和评测 finding 先用系统调试定位根因。</li>
+          <li>内部规格与质量审查通过后，Claude Code 执行独立评测。</li>
+          <li>完成前验证器检查设计、验收、计划、报告状态、分支和不可变 tested commit；之后才允许 <code>finish</code> 等待用户验收。</li>
+        </ol>
+        <p>子代理和并行代理必须获得用户明确授权，并使用互不冲突的 Loop worktree。Superpowers 不得绕过 Loop 合并主分支、占用共享 staging 或部署 production。</p>
       </section>
 
       <div class="doc-grid">
