@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 import tempfile
@@ -15,6 +16,32 @@ import loop_superpowers
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_init_project_creates_safe_ui_design_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value) / "project"
+            root.mkdir()
+            (root / ".git").mkdir()
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = pathlib.Path(value) / "projects.json"
+
+                result = memory_project.init_project(root)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            config = json.loads(
+                (root / "codex/ui_design/config.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(config["gate_mode"], "design_package")
+            self.assertFalse(config["hard_gate_enabled"])
+            self.assertEqual(config["schema_version"], 1)
+            self.assertTrue((root / "codex/ui_design/active-skills.json").exists())
+            self.assertTrue((root / "codex/ui_design/preferences.json").exists())
+            self.assertTrue((root / "codex/ui_design/approvals.json").exists())
+            self.assertEqual(
+                result["project"]["ui_design_status"], "configuration_required"
+            )
+
     def test_personal_noise_rejects_project_tasks_and_memory_console_commands(self) -> None:
         base = {
             "scope": "personal",

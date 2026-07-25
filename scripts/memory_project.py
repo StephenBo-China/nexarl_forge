@@ -65,6 +65,53 @@ def registry() -> dict[str, Any]:
     return data
 
 
+def ui_design_config(_root: pathlib.Path) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "enabled": True,
+        "hard_gate_enabled": False,
+        "gate_mode": "design_package",
+        "relocked": True,
+        "formal_frontend_paths": [],
+        "design_artifact_paths": ["codex/ui_design/design-packages/**"],
+        "generated_paths": [],
+        "test_artifact_paths": [],
+    }
+
+
+def ui_design_status(root: pathlib.Path) -> str:
+    ui_root = root / "codex" / "ui_design"
+    config_path = ui_root / "config.json"
+    if not config_path.exists():
+        return "not_initialized"
+    required = (
+        ui_root / "preferences.json",
+        ui_root / "active-skills.json",
+        ui_root / "approvals.json",
+    )
+    if not all(path.exists() for path in required):
+        return "configuration_required"
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "configuration_required"
+    if not isinstance(config, dict):
+        return "configuration_required"
+    if config.get("schema_version") != 1:
+        return "configuration_required"
+    if config.get("gate_mode") not in {"design_package", "project_global"}:
+        return "configuration_required"
+    if (
+        config.get("enabled") is not True
+        or config.get("hard_gate_enabled") is not True
+    ):
+        return "configuration_required"
+    paths = config.get("formal_frontend_paths")
+    if not isinstance(paths, list) or not paths:
+        return "configuration_required"
+    return "locked" if config.get("relocked", True) else "ready"
+
+
 def project_entry(root: pathlib.Path) -> dict[str, Any]:
     root = root.resolve()
     has_memory = (root / "codex" / "codex_long_memory.md").exists() and (
@@ -145,6 +192,7 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
         "completion_gate": completion_gate,
         "managed_rules_status": managed_rules_status,
         "managed_hooks_status": managed_hooks_status,
+        "ui_design_status": ui_design_status(root),
         "plugin_status": loop_superpowers.plugin_status(),
         "last_opened_at": now(),
     }
@@ -629,6 +677,51 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     ensure_file(project_root / "codex" / "memory_proposals.md", f"# {name} Memory Proposals\n\n## Pending Project Long-Memory Candidates\n", changes)
     ensure_file(project_root / "codex" / "codex_context_packet.md", f"# {name} Context Packet\n\nGenerated: {now()}\n", changes)
     ensure_file(project_root / "codex" / "shared_memory_context_packet.md", f"# {name} Shared Memory Context Packet\n\nGenerated: {now()}\n", changes)
+    ui_root = project_root / "codex" / "ui_design"
+    ensure_file(
+        ui_root / "config.json",
+        json.dumps(
+            ui_design_config(project_root),
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        changes,
+    )
+    ensure_file(
+        ui_root / "preferences.json",
+        json.dumps(
+            {"schema_version": 1, "overrides": {}},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        changes,
+    )
+    ensure_file(
+        ui_root / "active-skills.json",
+        json.dumps(
+            {"schema_version": 1, "execution_order": [], "skills": []},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        changes,
+    )
+    ensure_file(
+        ui_root / "approvals.json",
+        json.dumps(
+            {
+                "schema_version": 1,
+                "package_approvals": {},
+                "project_global_approval": None,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ),
+        changes,
+    )
     append_if_missing(project_root / "AGENTS.md", f"# {name} Codex Instructions", agent_memory_block(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "# " + name + " Shared Memory Instructions", claude_md(project_root), changes)
     append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
