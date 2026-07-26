@@ -41,6 +41,25 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertTrue((root / "codex/ui_design/active-skills.json").exists())
             self.assertTrue((root / "codex/ui_design/preferences.json").exists())
             self.assertTrue((root / "codex/ui_design/approvals.json").exists())
+            self.assertTrue(
+                (root / ".codex/hooks/ui_design_gate_hook.py").exists()
+            )
+            self.assertTrue(
+                (root / ".claude/hooks/ui_design_gate_hook.py").exists()
+            )
+            for settings_path in (
+                root / ".codex/hooks.json",
+                root / ".claude/settings.json",
+            ):
+                settings = json.loads(settings_path.read_text(encoding="utf-8"))
+                pre_tool = settings["hooks"]["PreToolUse"]
+                self.assertTrue(
+                    any(
+                        "ui_design_gate_hook.py" in hook["command"]
+                        for entry in pre_tool
+                        for hook in entry["hooks"]
+                    )
+                )
             context_path = root / "codex/ui_design/effective-context.json"
             self.assertTrue(context_path.exists())
             context = json.loads(context_path.read_text(encoding="utf-8"))
@@ -210,6 +229,62 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "old managed hook\n")
             self.assertTrue(any(item["status"] == "backup" for item in result["changes"]))
+
+    def test_hook_upgrade_merges_ui_gate_entry_and_preserves_unrelated_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = pathlib.Path(temp_value)
+            settings_path = project / ".codex/hooks.json"
+            settings_path.parent.mkdir(parents=True)
+            custom = {
+                "custom": "keep",
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "CustomTool",
+                            "hooks": [{"type": "command", "command": "custom-hook"}],
+                        }
+                    ],
+                    "PostToolUse": [
+                        {"hooks": [{"type": "command", "command": "post-hook"}]}
+                    ],
+                },
+            }
+            settings_path.write_text(json.dumps(custom), encoding="utf-8")
+
+            first = memory_project.upgrade_memory_hooks(project)
+            merged = json.loads(settings_path.read_text(encoding="utf-8"))
+            second = memory_project.upgrade_memory_hooks(project)
+
+            self.assertEqual(merged["custom"], "keep")
+            self.assertEqual(merged["hooks"]["PostToolUse"], custom["hooks"]["PostToolUse"])
+            commands = [
+                hook["command"]
+                for entry in merged["hooks"]["PreToolUse"]
+                for hook in entry["hooks"]
+            ]
+            self.assertIn("custom-hook", commands)
+            self.assertTrue(any("ui_design_gate_hook.py" in item for item in commands))
+            self.assertTrue(any(item["status"] == "backup" for item in first["changes"]))
+            self.assertFalse(any(item["status"] == "backup" for item in second["changes"]))
+
+    def test_hook_upgrade_reports_malformed_settings_without_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            project = pathlib.Path(temp_value)
+            settings_path = project / ".claude/settings.json"
+            settings_path.parent.mkdir(parents=True)
+            original = "{not-json\n"
+            settings_path.write_text(original, encoding="utf-8")
+
+            result = memory_project.upgrade_memory_hooks(project)
+
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
+            self.assertTrue(
+                any(
+                    item["path"] == str(settings_path.resolve())
+                    and item["status"] == "conflict"
+                    for item in result["changes"]
+                )
+            )
 
     def test_upgrade_managed_rules_preserves_user_text_and_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

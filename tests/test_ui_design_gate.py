@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -446,6 +447,101 @@ class DesignPackageLifecycleTest(unittest.TestCase):
             ),
             ["web/src/New.tsx"],
         )
+
+    def test_cross_agent_hook_protocol_denies_and_allows_without_third_party_runtime(self) -> None:
+        self.enable_gate()
+        template = ROOT / "templates/ui_design/ui_design_gate_hook.py"
+        hook_paths = {
+            "codex": self.project / ".codex/hooks/ui_design_gate_hook.py",
+            "claude": self.project / ".claude/hooks/ui_design_gate_hook.py",
+        }
+        for path in hook_paths.values():
+            path.parent.mkdir(parents=True)
+            path.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+
+        deny_payloads = {
+            "codex": {
+                "tool_name": "apply_patch",
+                "tool_input": {
+                    "patch": "*** Update File: web/src/checkout/Form.tsx\n"
+                },
+            },
+            "claude": {
+                "tool_name": "Edit",
+                "tool_input": {"file_path": "web/src/checkout/Form.tsx"},
+            },
+        }
+        for agent, payload in deny_payloads.items():
+            completed = subprocess.run(
+                [sys.executable, str(hook_paths[agent])],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            output = json.loads(completed.stdout)
+            decision = output["hookSpecificOutput"]
+            self.assertEqual(decision["permissionDecision"], "deny")
+            self.assertIn("Approve", decision["permissionDecisionReason"])
+
+        design_write = subprocess.run(
+            [sys.executable, str(hook_paths["claude"])],
+            input=json.dumps(
+                {
+                    "tool_name": "Write",
+                    "tool_input": {
+                        "file_path": (
+                            "codex/ui_design/design-packages/checkout-redesign/design-brief.md"
+                        )
+                    },
+                }
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(design_write.returncode, 0, design_write.stderr)
+        self.assertEqual(design_write.stdout, "")
+
+        bash_deny = subprocess.run(
+            [sys.executable, str(hook_paths["codex"])],
+            input=json.dumps(
+                {
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "touch web/src/checkout/New.tsx"},
+                }
+            ),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(
+            json.loads(bash_deny.stdout)["hookSpecificOutput"]["permissionDecision"],
+            "deny",
+        )
+
+        package = gate.create_design_package(
+            self.project,
+            "checkout-redesign",
+            self.manifest,
+            idempotency_key="hook-create-001",
+        )
+        gate.approve_design_package(
+            self.project,
+            "checkout-redesign",
+            expected_digest=package["digest"],
+            idempotency_key="hook-approve-001",
+        )
+        allowed = subprocess.run(
+            [sys.executable, str(hook_paths["codex"])],
+            input=json.dumps(deny_payloads["codex"]),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(allowed.returncode, 0, allowed.stderr)
+        self.assertEqual(allowed.stdout, "")
 
 
 if __name__ == "__main__":

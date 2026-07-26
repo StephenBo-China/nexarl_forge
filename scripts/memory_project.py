@@ -29,6 +29,9 @@ CODEX_LOOP_DIR = pathlib.Path.home() / ".codex" / "loop_engineering"
 CLAUDE_LOOP_DIR = pathlib.Path.home() / ".claude" / "loop_engineering"
 DEFAULT_STAGING_HOST = "root@8.210.155.175"
 DEFAULT_BASE_PORT = 8081
+UI_DESIGN_GATE_HOOK_TEMPLATE = (
+    APP_ROOT / "templates" / "ui_design" / "ui_design_gate_hook.py"
+)
 
 
 def now() -> str:
@@ -78,6 +81,10 @@ def ui_design_config(_root: pathlib.Path) -> dict[str, Any]:
         "design_artifact_paths": ["codex/ui_design/design-packages/**"],
         "generated_paths": [],
         "test_artifact_paths": [],
+        "hook_smoke_test": {
+            "codex": {"status": "not_run"},
+            "claude": {"status": "not_run"},
+        },
     }
 
 
@@ -223,6 +230,16 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
         if not path.exists():
             hook_states.append("missing")
         elif path.read_text(encoding="utf-8") == hook_script(root, source):
+            hook_states.append("current")
+        else:
+            hook_states.append("upgrade_available")
+    for path in (
+        root / ".codex" / "hooks" / "ui_design_gate_hook.py",
+        root / ".claude" / "hooks" / "ui_design_gate_hook.py",
+    ):
+        if not path.exists():
+            hook_states.append("missing")
+        elif path.read_text(encoding="utf-8") == ui_design_gate_hook_text():
             hook_states.append("current")
         else:
             hook_states.append("upgrade_available")
@@ -712,20 +729,160 @@ if __name__ == "__main__":
 '''
 
 
+def _gate_hook_entry(agent: str) -> dict[str, Any]:
+    return {
+        "matcher": "apply_patch|Edit|Write|Bash|exec_command|mcp__filesystem__.*",
+        "hooks": [
+            {
+                "type": "command",
+                "command": (
+                    "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/."
+                    f"{agent}/hooks/ui_design_gate_hook.py\""
+                ),
+                "timeout": 10,
+                "statusMessage": "Checking UI design approval",
+            }
+        ],
+    }
+
+
+def _hooks_document(agent: str) -> dict[str, Any]:
+    hook_path = f".{agent}/hooks/shared_memory_hook.py"
+    command = f'/usr/bin/python3 "$(git rev-parse --show-toplevel)/{hook_path}"'
+    return {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup|resume|clear|compact",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{command} session_start",
+                            "timeout": 10,
+                            "statusMessage": "Loading project memory",
+                        }
+                    ],
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{command} user_prompt_submit",
+                            "timeout": 10,
+                            "statusMessage": "Recording project memory context",
+                        }
+                    ]
+                }
+            ],
+            "PreCompact": [
+                {
+                    "matcher": "manual|auto",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{command} pre_compact",
+                            "timeout": 10,
+                            "statusMessage": "Preserving project memory",
+                        }
+                    ],
+                }
+            ],
+            "PostCompact": [
+                {
+                    "matcher": "manual|auto",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{command} post_compact",
+                            "timeout": 10,
+                            "statusMessage": "Refreshing project memory",
+                        }
+                    ],
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": f"{command} stop",
+                            "timeout": 10,
+                            "statusMessage": "Finalizing project memory checkpoint",
+                        }
+                    ]
+                }
+            ],
+            "PreToolUse": [_gate_hook_entry(agent)],
+        }
+    }
+
+
 def codex_hooks_json() -> str:
-    return """{
-  "hooks": {
-    "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "/usr/bin/python3 \\"$(git rev-parse --show-toplevel)/.codex/hooks/shared_memory_hook.py\\" session_start", "timeout": 10, "statusMessage": "Loading project memory"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 \\"$(git rev-parse --show-toplevel)/.codex/hooks/shared_memory_hook.py\\" user_prompt_submit", "timeout": 10, "statusMessage": "Recording project memory context"}]}],
-    "PreCompact": [{"matcher": "manual|auto", "hooks": [{"type": "command", "command": "/usr/bin/python3 \\"$(git rev-parse --show-toplevel)/.codex/hooks/shared_memory_hook.py\\" pre_compact", "timeout": 10, "statusMessage": "Preserving project memory"}]}],
-    "PostCompact": [{"matcher": "manual|auto", "hooks": [{"type": "command", "command": "/usr/bin/python3 \\"$(git rev-parse --show-toplevel)/.codex/hooks/shared_memory_hook.py\\" post_compact", "timeout": 10, "statusMessage": "Refreshing project memory"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 \\"$(git rev-parse --show-toplevel)/.codex/hooks/shared_memory_hook.py\\" stop", "timeout": 10, "statusMessage": "Finalizing project memory checkpoint"}]}]
-  }
-}"""
+    return json.dumps(_hooks_document("codex"), ensure_ascii=False, indent=2) + "\n"
 
 
 def claude_settings_json() -> str:
-    return codex_hooks_json().replace(".codex/hooks/shared_memory_hook.py", ".claude/hooks/shared_memory_hook.py")
+    return json.dumps(_hooks_document("claude"), ensure_ascii=False, indent=2) + "\n"
+
+
+def ui_design_gate_hook_text() -> str:
+    return UI_DESIGN_GATE_HOOK_TEMPLATE.read_text(encoding="utf-8")
+
+
+def _is_managed_gate_entry(entry: Any) -> bool:
+    if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+        return False
+    return any(
+        isinstance(hook, dict)
+        and "ui_design_gate_hook.py" in str(hook.get("command", ""))
+        for hook in entry["hooks"]
+    )
+
+
+def _merge_gate_hook_config(
+    path: pathlib.Path, agent: str, changes: list[dict[str, str]]
+) -> None:
+    if not path.exists():
+        content = codex_hooks_json() if agent == "codex" else claude_settings_json()
+        loop_superpowers.atomic_write_text(path, content)
+        changes.append({"path": str(path), "status": "created"})
+        return
+    original = path.read_text(encoding="utf-8")
+    try:
+        value = json.loads(original)
+    except json.JSONDecodeError:
+        changes.append({"path": str(path), "status": "conflict"})
+        return
+    if not isinstance(value, dict):
+        changes.append({"path": str(path), "status": "conflict"})
+        return
+    hooks = value.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        changes.append({"path": str(path), "status": "conflict"})
+        return
+    entries = hooks.setdefault("PreToolUse", [])
+    if not isinstance(entries, list):
+        changes.append({"path": str(path), "status": "conflict"})
+        return
+    expected = _gate_hook_entry(agent)
+    updated_entries = [entry for entry in entries if not _is_managed_gate_entry(entry)]
+    updated_entries.append(expected)
+    if entries == updated_entries:
+        changes.append({"path": str(path), "status": "existing"})
+        return
+    hooks["PreToolUse"] = updated_entries
+    backup = loop_superpowers.timestamped_backup(path)
+    loop_superpowers.atomic_write_text(
+        path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    )
+    changes.extend(
+        [
+            {"path": str(backup), "status": "backup"},
+            {"path": str(path), "status": "upgraded"},
+        ]
+    )
 
 
 def init_project(root: str | pathlib.Path) -> dict[str, Any]:
@@ -796,9 +953,21 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
     ensure_file(project_root / ".codex" / "hooks.json", codex_hooks_json(), changes)
+    _merge_gate_hook_config(project_root / ".codex" / "hooks.json", "codex", changes)
     ensure_file(project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex"), changes)
+    ensure_file(
+        project_root / ".codex" / "hooks" / "ui_design_gate_hook.py",
+        ui_design_gate_hook_text(),
+        changes,
+    )
     ensure_file(project_root / ".claude" / "settings.json", claude_settings_json(), changes)
+    _merge_gate_hook_config(project_root / ".claude" / "settings.json", "claude", changes)
     ensure_file(project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude"), changes)
+    ensure_file(
+        project_root / ".claude" / "hooks" / "ui_design_gate_hook.py",
+        ui_design_gate_hook_text(),
+        changes,
+    )
     ensure_file(project_root / ".claude" / "rules" / "shared-memory.md", shared_memory_rule(project_root), changes)
     append_if_missing(
         project_root / ".claude" / "rules" / "shared-memory.md",
@@ -818,6 +987,8 @@ def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
     for path, content in (
         (project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex")),
         (project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude")),
+        (project_root / ".codex" / "hooks" / "ui_design_gate_hook.py", ui_design_gate_hook_text()),
+        (project_root / ".claude" / "hooks" / "ui_design_gate_hook.py", ui_design_gate_hook_text()),
     ):
         path.parent.mkdir(parents=True, exist_ok=True)
         current = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -831,6 +1002,12 @@ def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
         path.write_text(content, encoding="utf-8")
         path.chmod(0o755)
         changes.append({"path": str(path), "status": "upgraded"})
+    _merge_gate_hook_config(
+        project_root / ".codex" / "hooks.json", "codex", changes
+    )
+    _merge_gate_hook_config(
+        project_root / ".claude" / "settings.json", "claude", changes
+    )
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 
