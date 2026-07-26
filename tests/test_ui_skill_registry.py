@@ -12,6 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import ui_skill_registry as registry
+import ui_skill_validator as validator
 
 
 class UISkillRegistryTest(unittest.TestCase):
@@ -19,6 +20,19 @@ class UISkillRegistryTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.temp = pathlib.Path(self.temporary.name)
         self.fixture = ROOT / "tests/fixtures/ui_skills/minimal"
+        self.with_script = ROOT / "tests/fixtures/ui_skills/with-script"
+        self.broken = self.temp / "broken"
+        self.broken.mkdir()
+        (self.broken / "SKILL.md").write_text(
+            """---
+name: sample-ui
+description: Broken duplicate skill.
+---
+
+[Missing reference](references/nope.md)
+""",
+            encoding="utf-8",
+        )
         self.environment = mock.patch.dict(
             os.environ, {"UI_DESIGN_HOME": str(self.temp / "ui-design-home")}
         )
@@ -79,6 +93,60 @@ class UISkillRegistryTest(unittest.TestCase):
         self.assertEqual(loaded["targets"], ["claude", "codex"])
         audit = (self.temp / "ui-design-home/audit.jsonl").read_text(encoding="utf-8")
         self.assertIn(draft["id"], audit)
+
+    def test_validator_reports_scripts_without_running_them(self) -> None:
+        marker = self.with_script / "executed"
+
+        report = validator.validate_package(self.with_script, installed_names=set())
+
+        self.assertTrue(report["valid"], report)
+        self.assertEqual(report["scripts"][0]["path"], "scripts/build.py")
+        self.assertFalse(marker.exists())
+        self.assertEqual(report["license"], "MIT")
+        self.assertEqual(len(report["digest"]), 64)
+
+    def test_validator_rejects_missing_reference_and_name_conflict(self) -> None:
+        report = validator.validate_package(
+            self.broken, installed_names={"sample-ui"}
+        )
+
+        self.assertFalse(report["valid"])
+        codes = {item["code"] for item in report["errors"]}
+        self.assertIn("name_conflict", codes)
+        self.assertIn("missing_reference", codes)
+
+    def test_validator_rejects_symlinks_and_invalid_metadata(self) -> None:
+        package = self.temp / "unsafe"
+        package.mkdir()
+        (package / "SKILL.md").write_text(
+            "---\nname: Bad Name\ndescription:\n---\n", encoding="utf-8"
+        )
+        (package / "escape").symlink_to(self.fixture / "SKILL.md")
+
+        report = validator.validate_package(package, installed_names=set())
+
+        codes = {item["code"] for item in report["errors"]}
+        self.assertIn("invalid_name", codes)
+        self.assertIn("missing_description", codes)
+        self.assertIn("symlink", codes)
+
+    def test_validator_checks_references_in_nested_markdown_files(self) -> None:
+        package = self.temp / "nested-reference"
+        (package / "references").mkdir(parents=True)
+        (package / "SKILL.md").write_text(
+            "---\nname: nested-ui\ndescription: Nested reference test.\n---\n"
+            "[Guide](references/guide.md)\n",
+            encoding="utf-8",
+        )
+        (package / "references/guide.md").write_text(
+            "[Missing](details.md)\n", encoding="utf-8"
+        )
+
+        report = validator.validate_package(package, installed_names=set())
+
+        self.assertIn(
+            "missing_reference", {item["code"] for item in report["errors"]}
+        )
 
 
 if __name__ == "__main__":
