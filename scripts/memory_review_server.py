@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 import memory_project
 import memory_review_queue as review
 import ui_design_cli
+import ui_design_gate
 import ui_design_preferences
 import ui_skill_publisher
 import ui_skill_registry
@@ -25,10 +26,26 @@ HOST = review.REVIEW_HOST
 PORT = review.REVIEW_PORT
 
 
-UI_DESIGN_GET_ROUTES = {"/api/ui-design/context", "/api/ui-skills"}
+UI_DESIGN_GET_ROUTES = {
+    "/api/ui-design/context",
+    "/api/ui-design/project-config",
+    "/api/ui-design/packages",
+    "/api/ui-skills",
+}
 UI_DESIGN_POST_ROUTES = {
     "/api/ui-design/preferences/global",
     "/api/ui-design/preferences/project",
+    "/api/ui-design/project-config/set-mode",
+    "/api/ui-design/project-config/set-paths",
+    "/api/ui-design/project-config/enable-hard-gate",
+    "/api/ui-design/project-config/relock",
+    "/api/ui-design/packages/create",
+    "/api/ui-design/packages/revise",
+    "/api/ui-design/packages/approve",
+    "/api/ui-design/packages/reject",
+    "/api/ui-design/packages/request-revision",
+    "/api/ui-design/packages/invalidate",
+    "/api/ui-design/baseline/approve",
     "/api/ui-skills/import",
     "/api/ui-skills/validate",
     "/api/ui-skills/request-revision",
@@ -41,6 +58,13 @@ UI_DESIGN_POST_ROUTES = {
     "/api/ui-skills/ignore-unmanaged",
 }
 UI_DESIGN_CONFIRMED_ROUTES = {
+    "/api/ui-design/project-config/set-mode",
+    "/api/ui-design/project-config/enable-hard-gate",
+    "/api/ui-design/project-config/relock",
+    "/api/ui-design/packages/approve",
+    "/api/ui-design/packages/reject",
+    "/api/ui-design/packages/invalidate",
+    "/api/ui-design/baseline/approve",
     "/api/ui-skills/approve",
     "/api/ui-skills/publish",
     "/api/ui-skills/rollback",
@@ -59,12 +83,23 @@ def ui_design_error_status(error: Exception) -> int:
             ui_skill_registry.InvalidTransition,
             ui_skill_publisher.IdempotencyConflict,
             ui_skill_publisher.TargetDigestConflict,
+            ui_design_gate.DigestConflict,
+            ui_design_gate.IdempotencyConflict,
         ),
     ):
         return 409
     if isinstance(error, ui_skill_registry.RegistryError) and "idempotency" in str(error):
         return 409
-    if isinstance(error, (ValueError, ui_design_preferences.PreferenceValidationError)):
+    if isinstance(error, ui_design_gate.DesignPackageNotFound):
+        return 404
+    if isinstance(
+        error,
+        (
+            ValueError,
+            ui_design_preferences.PreferenceValidationError,
+            ui_design_gate.GateValidationError,
+        ),
+    ):
         return 400
     return 500
 
@@ -106,6 +141,33 @@ def _skill_namespace(command: str, **values: object) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
+def _project_from(value: object) -> pathlib.Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("project is required")
+    return pathlib.Path(value).expanduser()
+
+
+def _design_namespace(command: str, **values: object) -> argparse.Namespace:
+    defaults = {
+        "command": "ui-design",
+        "ui_design_command": command,
+        "project_config_command": None,
+        "package_command": None,
+        "baseline_command": None,
+        "project": None,
+        "mode": None,
+        "json_file": None,
+        "manifest": None,
+        "task": None,
+        "digest": None,
+        "reason": "",
+        "confirmed": False,
+        "idempotency_key": None,
+    }
+    defaults.update(values)
+    return argparse.Namespace(**defaults)
+
+
 def ui_design_get(path: str, query: dict[str, object]) -> dict:
     if path == "/api/ui-design/context":
         raw_project = query.get("project") or str(review.PROJECT_ROOT)
@@ -117,6 +179,28 @@ def ui_design_get(path: str, query: dict[str, object]) -> dict:
             "global_preferences": ui_design_preferences.load_global_preferences(),
             "project_preferences": ui_design_preferences.load_project_overrides(project),
             "effective_preferences": ui_design_preferences.effective_preferences(project),
+        }
+    if path in {"/api/ui-design/project-config", "/api/ui-design/packages"}:
+        raw_project = query.get("project") or str(review.PROJECT_ROOT)
+        if isinstance(raw_project, list):
+            raw_project = raw_project[0] if raw_project else ""
+        project = _project_from(raw_project)
+        if path == "/api/ui-design/packages":
+            return ui_design_cli.dispatch(
+                _design_namespace(
+                    "package", package_command="list", project=str(project)
+                )
+            )
+        config = ui_design_cli.dispatch(
+            _design_namespace(
+                "project-config", project_config_command="show", project=str(project)
+            )
+        )
+        return {
+            "config": config,
+            "gate_status": ui_design_gate.gate_status(project),
+            "packages": ui_design_gate.list_design_packages(project),
+            "audit": ui_design_gate.audit_history(project),
         }
     if path == "/api/ui-skills":
         raw_project = query.get("project")
@@ -170,6 +254,87 @@ def ui_design_post(path: str, body: dict) -> dict:
             if command == "set-project" and not body.get("project"):
                 raise ValueError("project is required")
             return ui_design_cli.dispatch(args)
+
+    if path.startswith("/api/ui-design/project-config/"):
+        project = _project_from(body.get("project"))
+        command = path.rsplit("/", 1)[-1]
+        if command == "set-paths":
+            paths = body.get("paths")
+            if not isinstance(paths, dict):
+                raise ValueError("paths must be an object")
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", encoding="utf-8"
+            ) as handle:
+                json.dump(paths, handle, ensure_ascii=False)
+                handle.flush()
+                return ui_design_cli.dispatch(
+                    _design_namespace(
+                        "project-config",
+                        project_config_command=command,
+                        project=str(project),
+                        json_file=handle.name,
+                        idempotency_key=key,
+                    )
+                )
+        return ui_design_cli.dispatch(
+            _design_namespace(
+                "project-config",
+                project_config_command=command,
+                project=str(project),
+                mode=body.get("mode"),
+                confirmed=body.get("confirmed") is True,
+                idempotency_key=key,
+            )
+        )
+
+    if path.startswith("/api/ui-design/packages/"):
+        project = _project_from(body.get("project"))
+        command = path.rsplit("/", 1)[-1]
+        if command in {"create", "revise"}:
+            manifest = body.get("manifest")
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest must be an object")
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".json", encoding="utf-8"
+            ) as handle:
+                json.dump(manifest, handle, ensure_ascii=False)
+                handle.flush()
+                return ui_design_cli.dispatch(
+                    _design_namespace(
+                        "package",
+                        package_command=command,
+                        project=str(project),
+                        task=body.get("task_id"),
+                        manifest=handle.name,
+                        idempotency_key=key,
+                    )
+                )
+        return ui_design_cli.dispatch(
+            _design_namespace(
+                "package",
+                package_command=command,
+                project=str(project),
+                task=body.get("task_id"),
+                digest=body.get("digest"),
+                reason=body.get("reason", ""),
+                confirmed=body.get("confirmed") is True,
+                idempotency_key=key,
+            )
+        )
+
+    if path == "/api/ui-design/baseline/approve":
+        project = _project_from(body.get("project"))
+        return ui_design_cli.dispatch(
+            _design_namespace(
+                "baseline",
+                baseline_command="approve",
+                project=str(project),
+                task=body.get("task_id"),
+                digest=body.get("digest"),
+                confirmed=body.get("confirmed") is True,
+                idempotency_key=key,
+            )
+        )
 
     command = path.rsplit("/", 1)[-1].replace("request-revision", "request-revision")
     values = {
@@ -486,8 +651,8 @@ def page() -> str:
     .view-tabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 3px; border: 1px solid var(--line-soft); background: #1b1b1b; border-radius: 9px; width: fit-content; }
     .view-tabs button { border: 0; background: transparent; color: var(--text-subtle); min-height: 30px; padding: 6px 10px; }
     .view-tabs button.active { background: var(--panel-hover); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
-    .toolbar, .memory-toolbar, .project-toolbar, .design-toolbar, .ui-skill-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--line-soft); border-radius: var(--radius); background: #1b1b1b; }
-    .memory-toolbar, .project-toolbar, .design-toolbar, .ui-skill-toolbar { display: none; }
+    .toolbar, .memory-toolbar, .project-toolbar, .design-toolbar, .ui-design-approval-toolbar, .ui-skill-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--line-soft); border-radius: var(--radius); background: #1b1b1b; }
+    .memory-toolbar, .project-toolbar, .design-toolbar, .ui-design-approval-toolbar, .ui-skill-toolbar { display: none; }
     .toolbar select { min-width: 134px; }
     .memory-toolbar input { min-width: min(360px, 72vw); }
     .project-toolbar input:first-child { min-width: min(560px, 80vw); flex: 1 1 420px; }
@@ -565,6 +730,7 @@ def page() -> str:
         <button id="memoryTab" onclick="setView('memory')">已生效记忆</button>
         <button id="projectTab" onclick="setView('projects')">项目管理</button>
         <button id="designPreferencesTab" onclick="setView('designPreferences')">设计偏好</button>
+        <button id="uiDesignApprovalTab" onclick="setView('uiDesignApproval')">UI 设计审批</button>
         <button id="uiSkillsTab" onclick="setView('uiSkills')">UI Skills</button>
         <button id="loopDocTab" onclick="setView('loopDocs')">Loop 说明</button>
         <button id="strategyTab" onclick="setView('strategy')">记忆策略</button>
@@ -614,6 +780,12 @@ def page() -> str:
         <button class="primary" onclick="saveGlobalPreferences()">保存全局偏好</button>
         <button onclick="saveProjectPreferences()">保存项目覆盖</button>
       </div>
+      <div id="uiDesignApprovalToolbar" class="ui-design-approval-toolbar">
+        <button onclick="loadUIDesignApproval()">刷新审批状态</button>
+        <button onclick="saveUIDesignPaths()">保存路径配置</button>
+        <button class="primary" onclick="enableUIDesignGate()">Smoke test 并启用硬门禁</button>
+        <button class="danger" onclick="relockUIDesignGate()">立即重新锁定</button>
+      </div>
       <div id="uiSkillToolbar" class="ui-skill-toolbar">
         <button onclick="loadUISkills()">扫描并刷新</button>
         <select id="uiSkillScope"><option value="global">全局双端</option><option value="project">当前项目双端</option></select>
@@ -628,6 +800,7 @@ let queue = {items: [], counts: {}};
 let activeMemory = {sources: []};
 let projectState = {current_project: '', registry: {projects: []}, recommend_port: 8081};
 let uiDesignContext = null;
+let uiDesignApprovalState = {config: {}, gate_status: {}, packages: [], audit: []};
 let uiSkillState = {items: [], discovered: []};
 let currentView = 'review';
 
@@ -712,6 +885,7 @@ function setView(view) {
   document.getElementById('memoryTab').classList.toggle('active', view === 'memory');
   document.getElementById('projectTab').classList.toggle('active', view === 'projects');
   document.getElementById('designPreferencesTab').classList.toggle('active', view === 'designPreferences');
+  document.getElementById('uiDesignApprovalTab').classList.toggle('active', view === 'uiDesignApproval');
   document.getElementById('uiSkillsTab').classList.toggle('active', view === 'uiSkills');
   document.getElementById('loopDocTab').classList.toggle('active', view === 'loopDocs');
   document.getElementById('strategyTab').classList.toggle('active', view === 'strategy');
@@ -719,6 +893,7 @@ function setView(view) {
   document.getElementById('memoryToolbar').style.display = view === 'memory' ? 'flex' : 'none';
   document.getElementById('projectToolbar').style.display = view === 'projects' ? 'flex' : 'none';
   document.getElementById('designToolbar').style.display = view === 'designPreferences' ? 'flex' : 'none';
+  document.getElementById('uiDesignApprovalToolbar').style.display = view === 'uiDesignApproval' ? 'flex' : 'none';
   document.getElementById('uiSkillToolbar').style.display = view === 'uiSkills' ? 'flex' : 'none';
   if (view === 'designPreferences') {
     loadDesignPreferences().catch(err => showMessage(err.message));
@@ -726,6 +901,10 @@ function setView(view) {
   }
   if (view === 'uiSkills') {
     loadUISkills().catch(err => showMessage(err.message));
+    return;
+  }
+  if (view === 'uiDesignApproval') {
+    loadUIDesignApproval().catch(err => showMessage(err.message));
     return;
   }
   if (view === 'strategy') {
@@ -1137,6 +1316,126 @@ async function saveProjectPreferences() {
   });
   showMessage('项目设计偏好已保存');
   await loadDesignPreferences();
+}
+
+async function loadUIDesignApproval() {
+  const project = projectState.current_project || '';
+  uiDesignApprovalState = await api(`/api/ui-design/project-config?project=${encodeURIComponent(project)}`);
+  renderUIDesignApproval();
+}
+
+function pathLines(value) {
+  return [...new Set(String(value || '').split(/\\r?\\n/).map(x => x.trim()).filter(Boolean))];
+}
+
+function designPackageActions(item, mode) {
+  const task = esc(item.task_id);
+  const digest = esc(item.digest);
+  const actions = [];
+  if (item.status !== 'approved') {
+    if (mode === 'project_global') {
+      actions.push(`<button class="primary" data-ui-design-action="approve-baseline" data-task="${task}" data-digest="${digest}">批准为项目基线</button>`);
+    } else {
+      actions.push(`<button class="primary" data-ui-design-action="approve" data-task="${task}" data-digest="${digest}">批准此设计包</button>`);
+    }
+  }
+  actions.push(`<button data-ui-design-action="request-revision" data-task="${task}">要求修改</button>`);
+  actions.push(`<button class="danger" data-ui-design-action="reject" data-task="${task}">拒绝</button>`);
+  if (item.status === 'approved') actions.push(`<button class="danger" data-ui-design-action="invalidate" data-task="${task}">显式失效</button>`);
+  return actions.join('');
+}
+
+function renderUIDesignApproval() {
+  if (currentView !== 'uiDesignApproval') return;
+  const config = uiDesignApprovalState.config || {};
+  const gateStatus = uiDesignApprovalState.gate_status || {};
+  const packages = uiDesignApprovalState.packages || [];
+  const audit = uiDesignApprovalState.audit || [];
+  const smoke = config.hook_smoke_test || {};
+  document.getElementById('counts').innerHTML = [
+    `模式 ${config.gate_mode || 'design_package'}`,
+    `硬门禁 ${config.hard_gate_enabled ? '已启用' : '未启用'}`,
+    `当前决策 ${gateStatus.decision || '未配置'}`,
+    `待审批 ${packages.filter(x => x.status !== 'approved').length}`
+  ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
+  const packageCards = packages.map(item => {
+    const manifest = item.manifest || {};
+    const documents = Object.entries(item.design_documents || {}).map(([name, content]) => `
+      <details class="memory-entry"><summary>${esc(name)}</summary><pre>${esc(content || '（尚未填写）')}</pre></details>
+    `).join('');
+    return `<section class="item">
+      <div class="item-head"><div><div class="summary">${esc(manifest.title || item.task_id)}</div>
+        <div class="meta">${esc(item.task_id)} · ${esc(item.status)} · ${esc(manifest.classification || '')}</div>
+        <div class="label-row"><span class="tag">摘要 ${esc(item.digest)}</span><span class="tag">页面 ${esc((manifest.pages || []).join(', ') || '未声明')}</span><span class="tag">组件 ${esc((manifest.components || []).join(', ') || '未声明')}</span></div>
+      </div><span class="tag">${esc(config.gate_mode || 'design_package')}</span></div>
+      <div class="content-title">允许修改的正式前端范围</div><pre class="doc-section">${esc((manifest.allowed_file_patterns || []).join('\\n'))}</pre>
+      <div class="content-title">设计、交互与响应式说明（安全文本预览）</div>${documents || '<div class="empty">没有设计文档。</div>'}
+      <details class="memory-entry"><summary>审批与摘要差异</summary><pre>${esc(JSON.stringify({approval: item.approval || null, current_digest: item.digest, superseded_digest: (item.approval || {}).superseded_digest || null}, null, 2))}</pre></details>
+      <div class="actions">${designPackageActions(item, config.gate_mode)}</div>
+    </section>`;
+  }).join('');
+  const auditRows = audit.map(item => `<div class="meta">${esc(item.at)} · ${esc(item.event)} · ${esc(item.task_id || '')} · ${esc(item.status || '')}</div>`).join('');
+  document.getElementById('items').innerHTML = `
+    <div class="doc">
+      <section class="doc-hero"><h2>UI 设计审批</h2><p>可见界面任务在批准前只允许调研、读取代码以及编写设计稿、原型和交互说明；批准后才按项目模式解锁正式前端文件。纯后端或无界面任务不触发。</p></section>
+      <div class="doc-grid">
+        <section class="item"><div class="item-head"><div><div class="summary">审批模式</div><div class="meta"><code>design_package</code> 按任务、版本和文件范围批准；<code>project_global</code> 批准一次项目基线后解锁全部正式前端，直到重锁或基线变化。</div></div></div>
+          <div class="actions"><select id="uiGateMode"><option value="design_package" ${config.gate_mode === 'design_package' ? 'selected' : ''}>design_package（按设计包）</option><option value="project_global" ${config.gate_mode === 'project_global' ? 'selected' : ''}>project_global（全项目）</option></select><button onclick="changeUIDesignMode()">确认切换并重锁</button></div>
+        </section>
+        <section class="item"><div class="item-head"><div><div class="summary">硬门禁与双端 Hook</div><div class="meta">Codex：${esc((smoke.codex || {}).status || 'not_run')} · Claude：${esc((smoke.claude || {}).status || 'not_run')} · 当前：${config.hard_gate_enabled ? '已启用' : '未启用'}</div></div><span class="tag">${esc(gateStatus.status || 'missing')}</span></div><pre class="doc-section">${esc(JSON.stringify(gateStatus, null, 2))}</pre></section>
+      </div>
+      <section class="item"><div class="item-head"><div><div class="summary">项目路径分类</div><div class="meta">每行一个项目相对 glob；保存路径会关闭硬门禁并要求重新 smoke test。</div></div></div>
+        <div class="doc-grid">
+          <label class="doc-section"><strong>正式前端路径</strong><textarea id="formalFrontendPaths">${esc((config.formal_frontend_paths || []).join('\\n'))}</textarea></label>
+          <label class="doc-section"><strong>设计产物路径</strong><textarea id="designArtifactPaths">${esc((config.design_artifact_paths || []).join('\\n'))}</textarea></label>
+          <label class="doc-section"><strong>生成代码路径</strong><textarea id="generatedPaths">${esc((config.generated_paths || []).join('\\n'))}</textarea></label>
+          <label class="doc-section"><strong>测试产物路径</strong><textarea id="testArtifactPaths">${esc((config.test_artifact_paths || []).join('\\n'))}</textarea></label>
+        </div>
+      </section>
+      <div class="section-title">待审批设计包</div>${packageCards || '<div class="empty">暂无设计包。代理可先生成设计包与设计文档，再回到这里审批。</div>'}
+      <section class="doc-section"><h3>审计历史</h3>${auditRows || '<div class="meta">暂无 UI 设计审批事件。</div>'}</section>
+    </div>`;
+}
+
+async function uiDesignApprovalMutation(route, payload, dangerous, message) {
+  if (dangerous && !confirm(message || '确认执行此 UI 设计审批操作？')) return null;
+  const result = await api(`/api/ui-design/${route}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...payload, project: projectState.current_project, confirmed: dangerous, idempotency_key: idempotencyKey(`ui-design-${route.replaceAll('/', '-')}`)})});
+  await loadUIDesignApproval();
+  return result;
+}
+
+async function changeUIDesignMode() {
+  const mode = document.getElementById('uiGateMode').value;
+  await uiDesignApprovalMutation('project-config/set-mode', {mode}, true, mode === 'project_global' ? '确认切换为全项目一次批准模式？切换会立即重锁，之后需批准项目 UI 基线。' : '确认切换为按设计包审批模式？切换会立即重锁。');
+}
+
+async function saveUIDesignPaths() {
+  await uiDesignApprovalMutation('project-config/set-paths', {paths: {
+    formal_frontend_paths: pathLines(document.getElementById('formalFrontendPaths').value),
+    design_artifact_paths: pathLines(document.getElementById('designArtifactPaths').value),
+    generated_paths: pathLines(document.getElementById('generatedPaths').value),
+    test_artifact_paths: pathLines(document.getElementById('testArtifactPaths').value)
+  }}, false);
+  showMessage('UI 路径已保存；硬门禁需重新 smoke test 后启用');
+}
+
+async function enableUIDesignGate() {
+  await uiDesignApprovalMutation('project-config/enable-hard-gate', {}, true, '确认在临时夹具中验证 Codex 与 Claude Hook，并在双端均通过后启用正式前端硬门禁？');
+}
+
+async function relockUIDesignGate() {
+  await uiDesignApprovalMutation('project-config/relock', {}, true, '确认立即重新锁定正式前端开发？');
+}
+
+async function handleUIDesignApprovalAction(button) {
+  const action = button.dataset.uiDesignAction;
+  const task_id = button.dataset.task;
+  const digest = button.dataset.digest;
+  if (action === 'approve') await uiDesignApprovalMutation('packages/approve', {task_id, digest}, true, '确认批准此摘要与声明文件范围？');
+  if (action === 'approve-baseline') await uiDesignApprovalMutation('baseline/approve', {task_id, digest}, true, '确认批准此设计包为全项目 UI 基线并解锁正式前端？');
+  if (action === 'request-revision') await uiDesignApprovalMutation('packages/request-revision', {task_id, reason: prompt('请输入修改要求') || '需要补充设计说明'}, false);
+  if (action === 'reject') await uiDesignApprovalMutation('packages/reject', {task_id, reason: prompt('请输入拒绝原因') || ''}, true, '确认拒绝此设计包？');
+  if (action === 'invalidate') await uiDesignApprovalMutation('packages/invalidate', {task_id, reason: prompt('请输入失效原因') || '范围已变化'}, true, '确认让此设计包审批立即失效？');
 }
 
 async function loadUISkills() {
@@ -1681,6 +1980,11 @@ async function deleteActiveMemory(sourceId, itemId) {
 }
 
 document.getElementById('items').addEventListener('click', event => {
+  const uiDesignButton = event.target.closest('button[data-ui-design-action]');
+  if (uiDesignButton) {
+    handleUIDesignApprovalAction(uiDesignButton).catch(err => showMessage(err.message));
+    return;
+  }
   const uiSkillButton = event.target.closest('button[data-ui-action]');
   if (uiSkillButton) {
     handleUISkillAction(uiSkillButton).catch(err => showMessage(err.message));

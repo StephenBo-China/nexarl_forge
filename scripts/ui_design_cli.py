@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import Any
 
 import ui_design_preferences as preferences
+import ui_design_gate as gate
 import ui_design_store as store
 import ui_skill_discovery as discovery
 import ui_skill_publisher as publisher
@@ -115,6 +116,69 @@ def register_parsers(sub: argparse._SubParsersAction) -> None:
     set_project.add_argument("--project", required=True)
     set_project.add_argument("--json-file", required=True)
     _idempotency_argument(set_project)
+
+    project_config = design_sub.add_parser("project-config")
+    project_config_sub = project_config.add_subparsers(
+        dest="project_config_command", required=True
+    )
+    project_config_show = project_config_sub.add_parser("show")
+    project_config_show.add_argument("--project", required=True)
+    set_mode = project_config_sub.add_parser("set-mode")
+    set_mode.add_argument("--project", required=True)
+    set_mode.add_argument(
+        "--mode", choices=["design_package", "project_global"], required=True
+    )
+    set_mode.add_argument("--confirmed", action="store_true")
+    _idempotency_argument(set_mode)
+    set_paths = project_config_sub.add_parser("set-paths")
+    set_paths.add_argument("--project", required=True)
+    set_paths.add_argument("--json-file", required=True)
+    _idempotency_argument(set_paths)
+    enable_gate = project_config_sub.add_parser("enable-hard-gate")
+    enable_gate.add_argument("--project", required=True)
+    enable_gate.add_argument("--confirmed", action="store_true")
+    _idempotency_argument(enable_gate)
+    relock = project_config_sub.add_parser("relock")
+    relock.add_argument("--project", required=True)
+    relock.add_argument("--confirmed", action="store_true")
+    _idempotency_argument(relock)
+
+    package = design_sub.add_parser("package")
+    package_sub = package.add_subparsers(dest="package_command", required=True)
+    package_list = package_sub.add_parser("list")
+    package_list.add_argument("--project", required=True)
+    package_show = package_sub.add_parser("show")
+    package_show.add_argument("--project", required=True)
+    package_show.add_argument("--task", required=True)
+    package_create = package_sub.add_parser("create")
+    package_create.add_argument("--project", required=True)
+    package_create.add_argument("--manifest", required=True)
+    _idempotency_argument(package_create)
+    package_revise = package_sub.add_parser("revise")
+    package_revise.add_argument("--project", required=True)
+    package_revise.add_argument("--task", required=True)
+    package_revise.add_argument("--manifest", required=True)
+    _idempotency_argument(package_revise)
+    for command_name in ("approve", "reject", "request-revision", "invalidate"):
+        command_parser = package_sub.add_parser(command_name)
+        command_parser.add_argument("--project", required=True)
+        command_parser.add_argument("--task", required=True)
+        if command_name == "approve":
+            command_parser.add_argument("--digest", required=True)
+        else:
+            command_parser.add_argument("--reason", default="")
+        if command_name in {"approve", "reject", "invalidate"}:
+            command_parser.add_argument("--confirmed", action="store_true")
+        _idempotency_argument(command_parser)
+
+    baseline = design_sub.add_parser("baseline")
+    baseline_sub = baseline.add_subparsers(dest="baseline_command", required=True)
+    baseline_approve = baseline_sub.add_parser("approve")
+    baseline_approve.add_argument("--project", required=True)
+    baseline_approve.add_argument("--task", required=True)
+    baseline_approve.add_argument("--digest", required=True)
+    baseline_approve.add_argument("--confirmed", action="store_true")
+    _idempotency_argument(baseline_approve)
 
 
 def _fingerprint(operation: str, payload: dict[str, Any]) -> str:
@@ -577,6 +641,106 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 "ui-design.preferences.set-project",
                 {"project": args.project, "value": value},
                 lambda: _save_project(pathlib.Path(args.project), value),
+            )
+
+    if args.command == "ui-design" and args.ui_design_command == "project-config":
+        project = pathlib.Path(args.project)
+        if args.project_config_command == "show":
+            return gate.get_project_config(project)
+        if args.project_config_command == "set-mode":
+            return gate.set_gate_mode(
+                project,
+                args.mode,
+                confirmed=args.confirmed,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.project_config_command == "set-paths":
+            value = _read_json(args.json_file)
+            return gate.set_project_paths(
+                project, value, idempotency_key=args.idempotency_key
+            )
+        if args.project_config_command == "enable-hard-gate":
+            return gate.enable_hard_gate(
+                project,
+                confirmed=args.confirmed,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.project_config_command == "relock":
+            return gate.relock_project(
+                project,
+                confirmed=args.confirmed,
+                idempotency_key=args.idempotency_key,
+            )
+
+    if args.command == "ui-design" and args.ui_design_command == "package":
+        project = pathlib.Path(args.project)
+        if args.package_command == "list":
+            return {"items": gate.list_design_packages(project)}
+        if args.package_command == "show":
+            return gate.get_design_package(project, args.task)
+        if args.package_command in {"create", "revise"}:
+            manifest = _read_json(args.manifest)
+            if not isinstance(manifest, dict):
+                raise ValueError("design package manifest must be an object")
+            task_id = (
+                str(manifest.get("task_id", ""))
+                if args.package_command == "create"
+                else args.task
+            )
+            if args.package_command == "create":
+                return gate.create_design_package(
+                    project,
+                    task_id,
+                    manifest,
+                    idempotency_key=args.idempotency_key,
+                )
+            return gate.revise_design_package(
+                project,
+                task_id,
+                manifest,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.package_command in {"approve", "reject", "invalidate"}:
+            if getattr(args, "confirmed", False) is not True:
+                raise PermissionError("explicit confirmation is required")
+        if args.package_command == "approve":
+            return gate.approve_design_package(
+                project,
+                args.task,
+                expected_digest=args.digest,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.package_command == "reject":
+            return gate.reject_design_package(
+                project,
+                args.task,
+                reason=args.reason,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.package_command == "request-revision":
+            return gate.request_design_revision(
+                project,
+                args.task,
+                reason=args.reason,
+                idempotency_key=args.idempotency_key,
+            )
+        if args.package_command == "invalidate":
+            return gate.invalidate_design_package(
+                project,
+                args.task,
+                reason=args.reason,
+                idempotency_key=args.idempotency_key,
+            )
+
+    if args.command == "ui-design" and args.ui_design_command == "baseline":
+        if args.baseline_command == "approve":
+            if args.confirmed is not True:
+                raise PermissionError("explicit confirmation is required")
+            return gate.approve_project_baseline(
+                pathlib.Path(args.project),
+                args.task,
+                expected_digest=args.digest,
+                idempotency_key=args.idempotency_key,
             )
     raise ValueError("unsupported UI design command")
 

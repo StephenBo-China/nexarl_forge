@@ -12,6 +12,8 @@ import pathlib
 import re
 import shutil
 import shlex
+import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from typing import Any
@@ -351,12 +353,17 @@ def get_design_package(project_root: pathlib.Path, task_id: str) -> dict[str, An
     if not package_root.is_dir():
         raise DesignPackageNotFound(task_id)
     manifest = _read_manifest(package_root)
+    declared = _declared_files(package_root, manifest)
     digest = design_package_digest(package_root)
     approval = _load_approvals(project_root)["package_approvals"].get(task_id)
     return {
         "task_id": task_id,
         "root": str(package_root),
         "manifest": manifest,
+        "design_documents": {
+            path.relative_to(package_root).as_posix(): path.read_text(encoding="utf-8")
+            for path in declared
+        },
         "digest": digest,
         "status": approval.get("status", "pending_approval")
         if isinstance(approval, dict)
@@ -374,6 +381,30 @@ def list_design_packages(project_root: pathlib.Path) -> list[dict[str, Any]]:
         for path in sorted(root.iterdir())
         if path.is_dir()
     ]
+
+
+def audit_history(project_root: pathlib.Path, *, limit: int = 100) -> list[dict[str, Any]]:
+    if limit < 1:
+        return []
+    path = _ui_root(project_root) / "audit.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    items: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise GateValidationError(f"invalid UI design audit log: {path}: {error}") from error
+        if not isinstance(item, dict):
+            raise GateValidationError(f"invalid UI design audit log entry: {path}")
+        items.append(item)
+        if len(items) >= limit:
+            break
+    return items
 
 
 def revise_design_package(
@@ -435,12 +466,270 @@ def _config(project_root: pathlib.Path) -> dict[str, Any]:
         value = store.read_json_strict(path)
     except (OSError, json.JSONDecodeError) as error:
         raise GateValidationError(f"invalid UI gate config: {path}: {error}") from error
-    if not isinstance(value, dict) or value.get("gate_mode") not in {
-        "design_package",
-        "project_global",
-    }:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != 1
+        or value.get("gate_mode") not in {"design_package", "project_global"}
+    ):
         raise GateValidationError(f"invalid UI gate config: {path}")
+    for key in (
+        "formal_frontend_paths",
+        "design_artifact_paths",
+        "generated_paths",
+        "test_artifact_paths",
+    ):
+        _safe_patterns(value.get(key, []), label=key)
     return value
+
+
+CONFIG_PATH_FIELDS = (
+    "formal_frontend_paths",
+    "design_artifact_paths",
+    "generated_paths",
+    "test_artifact_paths",
+)
+
+
+def get_project_config(project_root: pathlib.Path) -> dict[str, Any]:
+    """Return a defensive copy of the validated project UI gate config."""
+    return copy.deepcopy(_config(project_root))
+
+
+def _require_confirmed(confirmed: bool, operation: str) -> None:
+    if confirmed is not True:
+        raise PermissionError(f"explicit confirmation is required to {operation}")
+
+
+def _write_config(project_root: pathlib.Path, config: dict[str, Any]) -> None:
+    store.atomic_write_json(_ui_root(project_root) / "config.json", config)
+
+
+def set_gate_mode(
+    project_root: pathlib.Path,
+    mode: str,
+    *,
+    confirmed: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    _require_confirmed(confirmed, "change the UI gate mode")
+    if mode not in {"design_package", "project_global"}:
+        raise GateValidationError(f"unsupported gate mode: {mode}")
+
+    def operation(_approvals: dict[str, Any]) -> dict[str, Any]:
+        config = _config(project_root)
+        config["gate_mode"] = mode
+        config["relocked"] = True
+        _write_config(project_root, config)
+        return copy.deepcopy(config)
+
+    result, changed = _mutate(
+        project_root,
+        idempotency_key=idempotency_key,
+        operation="project-config.set-mode",
+        payload={"mode": mode},
+        callback=operation,
+    )
+    if changed:
+        _audit(project_root, "project_gate_mode_changed", {"status": mode})
+        _refresh_context(project_root)
+    return result
+
+
+def set_project_paths(
+    project_root: pathlib.Path,
+    paths: dict[str, Any],
+    *,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    if not isinstance(paths, dict):
+        raise GateValidationError("paths must be an object")
+    unknown = sorted(set(paths) - set(CONFIG_PATH_FIELDS))
+    if unknown:
+        raise GateValidationError(f"unknown UI path field: {unknown[0]}")
+    normalized = {
+        key: _safe_patterns(value, label=key) for key, value in paths.items()
+    }
+
+    def operation(_approvals: dict[str, Any]) -> dict[str, Any]:
+        config = _config(project_root)
+        config.update(normalized)
+        config["relocked"] = True
+        config["hard_gate_enabled"] = False
+        config["hook_smoke_test"] = {
+            "codex": {"status": "not_run"},
+            "claude": {"status": "not_run"},
+        }
+        _write_config(project_root, config)
+        return copy.deepcopy(config)
+
+    result, changed = _mutate(
+        project_root,
+        idempotency_key=idempotency_key,
+        operation="project-config.set-paths",
+        payload={"paths": normalized},
+        callback=operation,
+    )
+    if changed:
+        _audit(project_root, "project_gate_paths_changed", {"status": "configured"})
+        _refresh_context(project_root)
+    return result
+
+
+def _hook_smoke_result(
+    hook_path: pathlib.Path, agent: str, formal_pattern: str, design_pattern: str
+) -> dict[str, Any]:
+    if not hook_path.is_file():
+        return {"status": "failed", "reason": f"installed {agent} hook is missing"}
+    with tempfile.TemporaryDirectory(prefix=f"ui-gate-smoke-{agent}-") as value:
+        root = pathlib.Path(value)
+        copied_hook = root / f".{agent}" / "hooks" / "ui_design_gate_hook.py"
+        copied_hook.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(hook_path, copied_hook)
+        config = {
+            "schema_version": 1,
+            "enabled": True,
+            "hard_gate_enabled": True,
+            "gate_mode": "design_package",
+            "relocked": True,
+            "formal_frontend_paths": [formal_pattern],
+            "design_artifact_paths": [design_pattern],
+            "generated_paths": [],
+            "test_artifact_paths": [],
+        }
+        store.atomic_write_json(root / "codex/ui_design/config.json", config)
+        store.atomic_write_json(
+            root / "codex/ui_design/approvals.json",
+            {
+                "schema_version": 1,
+                "package_approvals": {},
+                "project_global_approval": None,
+            },
+        )
+        payloads = (
+            (
+                "formal_frontend_deny",
+                {
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": formal_pattern.removesuffix("**") + "smoke.tsx"},
+                },
+                True,
+            ),
+            (
+                "design_artifact_allow",
+                {
+                    "tool_name": "Write",
+                    "tool_input": {"file_path": design_pattern.removesuffix("**") + "smoke.md"},
+                },
+                False,
+            ),
+        )
+        checks: dict[str, str] = {}
+        for name, payload, should_deny in payloads:
+            completed = subprocess.run(
+                [sys.executable, str(copied_hook)],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            denied = False
+            if completed.stdout.strip():
+                try:
+                    output = json.loads(completed.stdout)
+                    denied = (
+                        output.get("hookSpecificOutput", {}).get("permissionDecision")
+                        == "deny"
+                    )
+                except json.JSONDecodeError:
+                    denied = False
+            passed = completed.returncode == 0 and denied is should_deny
+            checks[name] = "passed" if passed else "failed"
+            if not passed:
+                return {
+                    "status": "failed",
+                    "checks": checks,
+                    "reason": completed.stderr.strip() or "unexpected hook decision",
+                }
+        return {"status": "passed", "checks": checks}
+
+
+def smoke_test_installed_hooks(project_root: pathlib.Path) -> dict[str, Any]:
+    config = _config(project_root)
+    formal = config.get("formal_frontend_paths", [])
+    design = config.get("design_artifact_paths", [])
+    if not formal:
+        raise GateValidationError("formal_frontend_paths must be configured first")
+    if not design:
+        raise GateValidationError("design_artifact_paths must be configured first")
+    root = pathlib.Path(project_root).expanduser().resolve()
+    return {
+        agent: _hook_smoke_result(
+            root / f".{agent}" / "hooks" / "ui_design_gate_hook.py",
+            agent,
+            "web/src/**",
+            "codex/ui_design/design-packages/**",
+        )
+        for agent in ("codex", "claude")
+    }
+
+
+def enable_hard_gate(
+    project_root: pathlib.Path,
+    *,
+    confirmed: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    _require_confirmed(confirmed, "enable the UI hard gate")
+
+    def operation(_approvals: dict[str, Any]) -> dict[str, Any]:
+        config = _config(project_root)
+        smoke = smoke_test_installed_hooks(project_root)
+        config["hook_smoke_test"] = smoke
+        if any(item.get("status") != "passed" for item in smoke.values()):
+            _write_config(project_root, config)
+            raise GateValidationError("both Codex and Claude UI gate smoke tests must pass")
+        config["hard_gate_enabled"] = True
+        _write_config(project_root, config)
+        return copy.deepcopy(config)
+
+    result, changed = _mutate(
+        project_root,
+        idempotency_key=idempotency_key,
+        operation="project-config.enable-hard-gate",
+        payload={"confirmed": True},
+        callback=operation,
+    )
+    if changed:
+        _audit(project_root, "project_hard_gate_enabled", {"status": "enabled"})
+        _refresh_context(project_root)
+    return result
+
+
+def relock_project(
+    project_root: pathlib.Path,
+    *,
+    confirmed: bool,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    _require_confirmed(confirmed, "relock the project UI gate")
+
+    def operation(_approvals: dict[str, Any]) -> dict[str, Any]:
+        config = _config(project_root)
+        config["relocked"] = True
+        _write_config(project_root, config)
+        return copy.deepcopy(config)
+
+    result, changed = _mutate(
+        project_root,
+        idempotency_key=idempotency_key,
+        operation="project-config.relock",
+        payload={"confirmed": True},
+        callback=operation,
+    )
+    if changed:
+        _audit(project_root, "project_gate_relocked", {"status": "relocked"})
+        _refresh_context(project_root)
+    return result
 
 
 def approve_design_package(
