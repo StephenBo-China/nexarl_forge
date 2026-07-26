@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import shutil
 import stat
+import subprocess
 import tempfile
 import urllib.request
 import zipfile
@@ -15,6 +17,17 @@ from typing import Any
 
 DEFAULT_MAX_FILES = 2_000
 DEFAULT_MAX_BYTES = 100 * 1024 * 1024
+
+FRONTEND_DESIGN_REPOSITORY = "anthropics/skills"
+FRONTEND_DESIGN_PATH = "skills/frontend-design"
+FRONTEND_DESIGN_REVISION = "b29e7cf65e5cb78a5ac33d582270551bc74a14eb"
+
+UI_UX_PRO_MAX_REPOSITORY = "nextlevelbuilder/ui-ux-pro-max-skill"
+UI_UX_PRO_MAX_RELEASE = "v2.11.0"
+UI_UX_PRO_MAX_REVISION = "6142b073958df645d0fb27e682428e69599386dc"
+UI_UX_PRO_MAX_CLI_PACKAGE = "ui-ux-pro-max-cli"
+UI_UX_PRO_MAX_CLI_VERSION = "2.11.0"
+UI_UX_PRO_MAX_NPM_SHASUM = "2ff4d811cf1dded593b9d1f37bad65ffa80cb87c"
 
 
 class SourceError(ValueError):
@@ -254,4 +267,166 @@ def import_github(
         "repository": repository,
         "path": skill_path,
         "revision": revision,
+    }
+
+
+def _require_pin(label: str, actual: str, expected: str) -> None:
+    if actual != expected:
+        raise SourceError(f"{label} must be pinned to {expected}; received {actual}")
+
+
+def bootstrap_frontend_design(
+    destination: pathlib.Path,
+    *,
+    revision: str,
+    downloader: Callable[[dict[str, str], pathlib.Path], None] | None = None,
+) -> dict[str, Any]:
+    """Stage the reviewed Anthropic frontend-design revision as one common variant."""
+    _require_pin("frontend-design revision", revision, FRONTEND_DESIGN_REVISION)
+    source = import_github(
+        FRONTEND_DESIGN_REPOSITORY,
+        FRONTEND_DESIGN_PATH,
+        revision,
+        destination,
+        downloader=downloader,
+    )
+    source.update(
+        {
+            "type": "bootstrap",
+            "source_type": "github",
+            "url": (
+                f"https://github.com/{FRONTEND_DESIGN_REPOSITORY}/tree/"
+                f"{revision}/{FRONTEND_DESIGN_PATH}"
+            ),
+            "variants": {
+                "common": {"path": ".", "digest": _tree_digest(destination)}
+            },
+        }
+    )
+    return source
+
+
+def _tree_digest(root: pathlib.Path) -> str:
+    import ui_design_store as store
+
+    return store.tree_digest(pathlib.Path(root))
+
+
+def _npm_metadata(package: str, version: str) -> dict[str, Any]:
+    url = f"https://registry.npmjs.org/{package}/{version}"
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+def _run_ui_ux_generator(request: dict[str, str], target: pathlib.Path) -> dict[str, Any]:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "npx",
+        "--yes",
+        f"{request['package']}@{request['cli_version']}",
+        "init",
+        "--ai",
+        request["agent"],
+        "--output",
+        str(target),
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=target.parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "command": command,
+        "stdout_summary": completed.stdout[-2_000:],
+    }
+
+
+def bootstrap_ui_ux_pro_max(
+    destination: pathlib.Path,
+    *,
+    release: str,
+    revision: str,
+    cli_version: str,
+    expected_npm_shasum: str,
+    npm_metadata: Callable[[str, str], dict[str, Any]] | None = None,
+    runner: Callable[[dict[str, str], pathlib.Path], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Generate immutable Codex and Claude variants using reviewed upstream pins."""
+    _require_pin("UI UX Pro Max release", release, UI_UX_PRO_MAX_RELEASE)
+    _require_pin("UI UX Pro Max revision", revision, UI_UX_PRO_MAX_REVISION)
+    _require_pin("UI UX Pro Max CLI version", cli_version, UI_UX_PRO_MAX_CLI_VERSION)
+    _require_pin(
+        "UI UX Pro Max npm shasum",
+        expected_npm_shasum,
+        UI_UX_PRO_MAX_NPM_SHASUM,
+    )
+    metadata = (npm_metadata or _npm_metadata)(UI_UX_PRO_MAX_CLI_PACKAGE, cli_version)
+    actual_shasum = metadata.get("dist", {}).get("shasum")
+    if actual_shasum != expected_npm_shasum:
+        raise SourceError(
+            "UI UX Pro Max npm metadata shasum mismatch: "
+            f"expected {expected_npm_shasum}, received {actual_shasum}"
+        )
+
+    destination = _check_destination(destination)
+    generate = runner or _run_ui_ux_generator
+    with tempfile.TemporaryDirectory(prefix="ui-ux-pro-max-generate-") as value:
+        generated_root = pathlib.Path(value) / "bundle"
+        variants_root = generated_root / "variants"
+        variants: dict[str, dict[str, str]] = {}
+        generation: dict[str, dict[str, Any]] = {}
+        for agent in ("codex", "claude"):
+            target = variants_root / agent
+            request = {
+                "agent": agent,
+                "package": UI_UX_PRO_MAX_CLI_PACKAGE,
+                "cli_version": cli_version,
+                "release": release,
+                "revision": revision,
+            }
+            result = generate(request, target)
+            _validate_source_tree(
+                target, max_files=DEFAULT_MAX_FILES, max_bytes=DEFAULT_MAX_BYTES
+            )
+            variants[agent] = {
+                "path": f"variants/{agent}",
+                "digest": _tree_digest(target),
+            }
+            generation[agent] = {
+                "command": list(result.get("command", [])),
+                "stdout_summary": str(result.get("stdout_summary", ""))[-2_000:],
+            }
+        generated_root.mkdir(parents=True, exist_ok=True)
+        (generated_root / "SKILL.md").write_text(
+            "---\n"
+            "name: ui-ux-pro-max\n"
+            "description: Use when reviewing the generated Codex and Claude UI UX Pro Max variants.\n"
+            "---\n\n"
+            "# UI UX Pro Max\n\n"
+            "This approval bundle contains pinned, agent-specific generated variants.\n",
+            encoding="utf-8",
+        )
+        _copy_tree_atomically(
+            generated_root,
+            destination,
+            max_files=DEFAULT_MAX_FILES,
+            max_bytes=DEFAULT_MAX_BYTES,
+        )
+
+    return {
+        "type": "bootstrap",
+        "source_type": "github+npm",
+        "repository": UI_UX_PRO_MAX_REPOSITORY,
+        "url": (
+            f"https://github.com/{UI_UX_PRO_MAX_REPOSITORY}/tree/{revision}"
+        ),
+        "release": release,
+        "revision": revision,
+        "cli_package": UI_UX_PRO_MAX_CLI_PACKAGE,
+        "cli_version": cli_version,
+        "npm_shasum": expected_npm_shasum,
+        "variants": variants,
+        "generation": generation,
     }

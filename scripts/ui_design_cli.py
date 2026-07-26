@@ -21,6 +21,7 @@ import ui_skill_validator as validator
 
 
 COMMANDS = {"ui-skill", "ui-design"}
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _idempotency_argument(parser: argparse.ArgumentParser) -> None:
@@ -47,6 +48,20 @@ def register_parsers(sub: argparse._SubParsersAction) -> None:
     import_parser.add_argument("--targets", default="codex,claude")
     import_parser.add_argument("--version-label", default="1.0.0")
     _idempotency_argument(import_parser)
+
+    bootstrap = skill_sub.add_parser("bootstrap")
+    bootstrap.add_argument(
+        "bootstrap_name",
+        choices=["frontend-design", "ui-ux-pro-max", "ui-design-workflow"],
+    )
+    bootstrap.add_argument("--revision")
+    bootstrap.add_argument("--release")
+    bootstrap.add_argument("--cli-version")
+    bootstrap.add_argument("--expected-npm-shasum")
+    bootstrap.add_argument("--scope", choices=["global", "project"], default="global")
+    bootstrap.add_argument("--project")
+    bootstrap.add_argument("--targets", default="codex,claude")
+    _idempotency_argument(bootstrap)
 
     validate = skill_sub.add_parser("validate")
     validate.add_argument("draft_id")
@@ -200,6 +215,111 @@ def _import_skill(args: argparse.Namespace) -> dict[str, Any]:
     return _idempotent(args.idempotency_key, "ui-skill.import", payload, operation)
 
 
+def _validate_bundle(
+    root: pathlib.Path, source: dict[str, Any]
+) -> dict[str, Any]:
+    installed = set(registry.load_registry()["packages"])
+    report = validator.validate_package(root, installed_names=installed)
+    variant_reports: dict[str, dict[str, Any]] = {}
+    for agent, descriptor in source.get("variants", {}).items():
+        if not isinstance(descriptor, dict):
+            raise ValueError(f"invalid variant metadata for {agent}")
+        relative = pathlib.PurePosixPath(str(descriptor.get("path", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"unsafe variant path for {agent}")
+        variant_root = root.joinpath(*relative.parts)
+        variant_report = validator.validate_package(
+            variant_root, installed_names=installed
+        )
+        if variant_report.get("digest") != descriptor.get("digest"):
+            variant_report.setdefault("errors", []).append(
+                {
+                    "code": "variant_digest_mismatch",
+                    "message": f"variant digest mismatch for {agent}",
+                }
+            )
+            variant_report["valid"] = False
+        variant_reports[agent] = variant_report
+    report["variant_reports"] = variant_reports
+    report["valid"] = report.get("valid") is True and all(
+        item.get("valid") is True for item in variant_reports.values()
+    )
+    return report
+
+
+def _bootstrap_skill(args: argparse.Namespace) -> dict[str, Any]:
+    payload = {
+        "name": args.bootstrap_name,
+        "revision": args.revision,
+        "release": args.release,
+        "cli_version": args.cli_version,
+        "expected_npm_shasum": args.expected_npm_shasum,
+        "scope": args.scope,
+        "project": args.project,
+        "targets": args.targets,
+    }
+
+    def operation() -> dict[str, Any]:
+        with tempfile.TemporaryDirectory(prefix="ui-skill-bootstrap-") as value:
+            imported_root = pathlib.Path(value) / "package"
+            if args.bootstrap_name == "frontend-design":
+                revision = args.revision or sources.FRONTEND_DESIGN_REVISION
+                source = sources.bootstrap_frontend_design(
+                    imported_root, revision=revision
+                )
+                version_label = revision[:12]
+            elif args.bootstrap_name == "ui-ux-pro-max":
+                source = sources.bootstrap_ui_ux_pro_max(
+                    imported_root,
+                    release=args.release or sources.UI_UX_PRO_MAX_RELEASE,
+                    revision=args.revision or sources.UI_UX_PRO_MAX_REVISION,
+                    cli_version=args.cli_version or sources.UI_UX_PRO_MAX_CLI_VERSION,
+                    expected_npm_shasum=(
+                        args.expected_npm_shasum
+                        or sources.UI_UX_PRO_MAX_NPM_SHASUM
+                    ),
+                )
+                version_label = source["cli_version"]
+            else:
+                template = PROJECT_ROOT / "templates/ui_design/skills/ui-design-workflow"
+                source = sources.import_local(template, imported_root)
+                source.update(
+                    {
+                        "type": "bootstrap",
+                        "source_type": "manager_template",
+                        "variants": {
+                            "common": {
+                                "path": ".",
+                                "digest": registry.package_digest(imported_root),
+                            }
+                        },
+                    }
+                )
+                version_label = "1.0.0"
+
+            report = _validate_bundle(imported_root, source)
+            if not report["valid"]:
+                raise ValueError(json.dumps(report, ensure_ascii=False))
+            draft = registry.create_draft(
+                name=report["name"],
+                source=source,
+                package_root=imported_root,
+                scope=_scope(args.scope, args.project),
+                targets=_targets(args.targets),
+                version_label=version_label,
+            )
+            return registry.set_validation_report(
+                draft["id"], report, expected_digest=draft["digest"]
+            )
+
+    return _idempotent(
+        args.idempotency_key,
+        f"ui-skill.bootstrap.{args.bootstrap_name}",
+        payload,
+        operation,
+    )
+
+
 def _show_draft(draft_id: str) -> dict[str, Any]:
     draft = registry.get_draft(draft_id)
     skill_path = pathlib.Path(draft["draft_path"]) / "content" / "SKILL.md"
@@ -273,6 +393,8 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             return _show_draft(args.draft_id)
         if command == "import":
             return _import_skill(args)
+        if command == "bootstrap":
+            return _bootstrap_skill(args)
         if command == "validate":
             return _validate_draft(args)
         if command == "request-revision":

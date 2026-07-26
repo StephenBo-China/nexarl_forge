@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import ui_skill_registry as registry
 import ui_skill_sources as sources
 import ui_skill_validator as validator
+import ui_skill_publisher as publisher
 import memory_review
 
 
@@ -231,6 +232,101 @@ description: Broken duplicate skill.
         self.assertEqual(result["revision"], "abc123")
         self.assertEqual(result["repository"], "owner/repo")
         self.assertTrue((destination / "SKILL.md").exists())
+
+    def test_frontend_design_bootstrap_is_pinned_and_common(self) -> None:
+        destination = self.temp / "frontend-design"
+        requests = []
+
+        def downloader(request: dict[str, str], target: pathlib.Path) -> None:
+            requests.append(request)
+            shutil.copytree(self.fixture, target)
+
+        result = sources.bootstrap_frontend_design(
+            destination,
+            revision=sources.FRONTEND_DESIGN_REVISION,
+            downloader=downloader,
+        )
+
+        self.assertEqual(requests[0]["repository"], "anthropics/skills")
+        self.assertEqual(requests[0]["path"], "skills/frontend-design")
+        self.assertEqual(requests[0]["revision"], sources.FRONTEND_DESIGN_REVISION)
+        self.assertEqual(result["variants"]["common"]["path"], ".")
+        self.assertEqual(len(result["variants"]["common"]["digest"]), 64)
+
+    def test_ui_ux_bootstrap_stages_variants_and_publication_never_runs_cli(self) -> None:
+        bundle = self.temp / "ui-ux-pro-max"
+        calls = []
+
+        def runner(request: dict[str, str], target: pathlib.Path) -> dict:
+            calls.append({"request": request, "target": str(target)})
+            self.assertNotEqual(target.parent, bundle)
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text(
+                "---\nname: ui-ux-pro-max\ndescription: Generated UI UX guidance.\n"
+                f"---\n# {request['agent']} variant\n",
+                encoding="utf-8",
+            )
+            return {"command": ["npx", "pinned-cli"], "stdout_summary": "generated"}
+
+        source = sources.bootstrap_ui_ux_pro_max(
+            bundle,
+            release=sources.UI_UX_PRO_MAX_RELEASE,
+            revision=sources.UI_UX_PRO_MAX_REVISION,
+            cli_version=sources.UI_UX_PRO_MAX_CLI_VERSION,
+            expected_npm_shasum=sources.UI_UX_PRO_MAX_NPM_SHASUM,
+            npm_metadata=lambda package, version: {
+                "name": package,
+                "version": version,
+                "dist": {"shasum": sources.UI_UX_PRO_MAX_NPM_SHASUM},
+            },
+            runner=runner,
+        )
+        draft = registry.create_draft(
+            name="ui-ux-pro-max",
+            source=source,
+            package_root=bundle,
+            scope={"type": "global"},
+            targets=["codex", "claude"],
+            version_label=sources.UI_UX_PRO_MAX_CLI_VERSION,
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+        before_publish = len(calls)
+        targets = {
+            "codex": self.temp / "published/codex/ui-ux-pro-max",
+            "claude": self.temp / "published/claude/ui-ux-pro-max",
+        }
+
+        publisher.publish(
+            approved,
+            targets=targets,
+            idempotency_key="variant-publish-001",
+        )
+
+        self.assertEqual(len(calls), before_publish)
+        self.assertEqual({item["request"]["agent"] for item in calls}, {"codex", "claude"})
+        self.assertEqual(source["release"], "v2.11.0")
+        self.assertEqual(source["revision"], sources.UI_UX_PRO_MAX_REVISION)
+        self.assertEqual(source["cli_version"], "2.11.0")
+        self.assertEqual(source["npm_shasum"], sources.UI_UX_PRO_MAX_NPM_SHASUM)
+        self.assertIn("# codex variant", (targets["codex"] / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertIn("# claude variant", (targets["claude"] / "SKILL.md").read_text(encoding="utf-8"))
+        self.assertNotIn("variants", {path.name for path in targets["codex"].iterdir()})
+
+    def test_bootstrap_cli_creates_validated_manager_workflow_draft(self) -> None:
+        code, draft = self.run_cli(
+            [
+                "ui-skill",
+                "bootstrap",
+                "ui-design-workflow",
+                "--idempotency-key",
+                "bootstrap-workflow-001",
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(draft["name"], "ui-design-workflow")
+        self.assertEqual(draft["status"], "validated")
+        self.assertEqual(draft["targets"], ["claude", "codex"])
 
     def run_cli(self, arguments: list[str]) -> tuple[int, dict]:
         original = sys.argv

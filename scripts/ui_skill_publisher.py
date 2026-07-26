@@ -67,6 +67,7 @@ def _fingerprint(
     digest: str | None,
     targets: dict[str, pathlib.Path],
     expected: dict[str, str | None],
+    desired: dict[str, str | None],
 ) -> str:
     payload = {
         "operation": operation,
@@ -74,6 +75,7 @@ def _fingerprint(
         "digest": digest,
         "targets": {key: str(value) for key, value in sorted(targets.items())},
         "expected": expected,
+        "desired": desired,
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -94,6 +96,39 @@ def _validate_targets(name: str, targets: dict[str, pathlib.Path]) -> dict[str, 
 
 def _current_digest(path: pathlib.Path) -> str | None:
     return registry.package_digest(path) if path.is_dir() else None
+
+
+def _package_variants(
+    package_path: pathlib.Path,
+    digest: str,
+    agents: set[str],
+    variants: dict[str, Any] | None,
+) -> tuple[dict[str, pathlib.Path], dict[str, str]]:
+    package_path = pathlib.Path(package_path)
+    if not variants:
+        return (
+            {agent: package_path for agent in agents},
+            {agent: digest for agent in agents},
+        )
+    roots: dict[str, pathlib.Path] = {}
+    digests: dict[str, str] = {}
+    package_resolved = package_path.resolve()
+    for agent in agents:
+        descriptor = variants.get(agent) or variants.get("common")
+        if not isinstance(descriptor, dict):
+            raise PublishError(f"approved package has no variant for {agent}")
+        relative = pathlib.PurePosixPath(str(descriptor.get("path", "")))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise PublishError(f"unsafe approved variant path for {agent}")
+        root = package_path.joinpath(*relative.parts).resolve()
+        if not root.is_relative_to(package_resolved):
+            raise PublishError(f"approved variant escapes package for {agent}")
+        variant_digest = descriptor.get("digest")
+        if not isinstance(variant_digest, str) or len(variant_digest) != 64:
+            raise PublishError(f"approved variant digest is invalid for {agent}")
+        roots[agent] = root
+        digests[agent] = variant_digest
+    return roots, digests
 
 
 def _transition_if_registered(
@@ -151,12 +186,27 @@ def _run_transaction(
     idempotency_key: str,
     replace: Callable[[pathlib.Path, pathlib.Path], None],
     approved: dict[str, Any] | None = None,
+    variants: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not idempotency_key:
         raise PublishError("idempotency_key is required")
     targets = _validate_targets(name, targets)
+    package_paths: dict[str, pathlib.Path] = {}
+    desired_target_digests: dict[str, str | None] = {
+        agent: None for agent in targets
+    }
+    if package_path is not None:
+        package_paths, resolved_digests = _package_variants(
+            pathlib.Path(package_path), str(digest), set(targets), variants
+        )
+        desired_target_digests.update(resolved_digests)
     fingerprint = _fingerprint(
-        operation, name, digest, targets, expected_target_digests
+        operation,
+        name,
+        digest,
+        targets,
+        expected_target_digests,
+        desired_target_digests,
     )
     try:
         prior = registry.idempotency_result(idempotency_key, fingerprint)
@@ -168,6 +218,12 @@ def _run_transaction(
         package_path = pathlib.Path(package_path)
         if not package_path.is_dir() or registry.package_digest(package_path) != digest:
             raise PublishError("approved package is missing or its digest changed")
+        for agent, source in package_paths.items():
+            if (
+                not source.is_dir()
+                or registry.package_digest(source) != desired_target_digests[agent]
+            ):
+                raise PublishError(f"approved package variant changed for {agent}")
 
     transaction_id = f"deploy-{uuid.uuid4().hex}"
     stages: dict[str, pathlib.Path] = {}
@@ -195,8 +251,8 @@ def _run_transaction(
                     )
                 if package_path is not None:
                     stage = target.with_name(f".{target.name}.stage-{transaction_id}")
-                    shutil.copytree(package_path, stage)
-                    if registry.package_digest(stage) != digest:
+                    shutil.copytree(package_paths[agent], stage)
+                    if registry.package_digest(stage) != desired_target_digests[agent]:
                         raise PublishError(f"staged digest mismatch for {agent}")
                     stages[agent] = stage
 
@@ -222,8 +278,10 @@ def _run_transaction(
             target_digests = {
                 agent: _current_digest(target) for agent, target in targets.items()
             }
-            desired = digest if package_path is not None else None
-            if any(value != desired for value in target_digests.values()):
+            if any(
+                value != desired_target_digests[agent]
+                for agent, value in target_digests.items()
+            ):
                 raise PublishError("one or more published targets failed digest verification")
             report = {
                 "transaction_id": transaction_id,
@@ -312,6 +370,7 @@ def publish(
         idempotency_key=idempotency_key,
         replace=replace,
         approved=approved,
+        variants=approved.get("source", {}).get("variants"),
     )
 
 
@@ -331,6 +390,7 @@ def rollback(
         expected_target_digests=expected_target_digests,
         idempotency_key=idempotency_key,
         replace=os.replace,
+        variants=approved_version.get("source", {}).get("variants"),
     )
 
 

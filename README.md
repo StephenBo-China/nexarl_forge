@@ -284,6 +284,34 @@ Reject obvious noisy personal candidates:
 python3 scripts/memory_review.py reject-noise-personal --apply
 ```
 
+### Bootstrap Managed UI Design Skills
+
+Create reviewable, validated drafts for the manager workflow and the two
+initial UI design skills:
+
+```bash
+python3 scripts/memory_review.py ui-skill bootstrap ui-design-workflow \
+  --idempotency-key bootstrap-ui-design-workflow-001
+
+python3 scripts/memory_review.py ui-skill bootstrap frontend-design \
+  --revision b29e7cf65e5cb78a5ac33d582270551bc74a14eb \
+  --idempotency-key bootstrap-frontend-design-001
+
+python3 scripts/memory_review.py ui-skill bootstrap ui-ux-pro-max \
+  --release v2.11.0 \
+  --revision 6142b073958df645d0fb27e682428e69599386dc \
+  --cli-version 2.11.0 \
+  --expected-npm-shasum 2ff4d811cf1dded593b9d1f37bad65ffa80cb87c \
+  --idempotency-key bootstrap-ui-ux-pro-max-001
+```
+
+Bootstrap never approves or publishes a skill. Each draft remains visible in
+the review console until the user explicitly approves and publishes it. The UI
+UX Pro Max bootstrap needs normal network and sandbox approval to inspect npm
+metadata and run its pinned generator. Generation happens in temporary
+directories; publication later copies the approved Codex or Claude variant and
+does not invoke `npx`.
+
 ## How To Associate Codex With This Project
 
 On another computer, clone this repository and tell Codex:

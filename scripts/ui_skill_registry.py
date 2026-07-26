@@ -384,6 +384,9 @@ def approve_draft(draft_id: str, *, expected_digest: str) -> dict[str, Any]:
                 "digest": current_digest,
                 "package_path": str(version_root),
                 "version_id": version_id,
+                "source": copy.deepcopy(record.get("source", {})),
+                "scope": copy.deepcopy(record.get("scope", {})),
+                "targets": copy.deepcopy(record.get("targets", [])),
             }
         )
         _write_registry(value)
