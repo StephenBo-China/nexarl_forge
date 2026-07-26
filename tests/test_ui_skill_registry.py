@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import os
 import pathlib
 import shutil
@@ -16,6 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import ui_skill_registry as registry
 import ui_skill_sources as sources
 import ui_skill_validator as validator
+import memory_review
 
 
 class UISkillRegistryTest(unittest.TestCase):
@@ -210,6 +214,145 @@ description: Broken duplicate skill.
         self.assertEqual(result["revision"], "abc123")
         self.assertEqual(result["repository"], "owner/repo")
         self.assertTrue((destination / "SKILL.md").exists())
+
+    def run_cli(self, arguments: list[str]) -> tuple[int, dict]:
+        original = sys.argv
+        output = io.StringIO()
+        try:
+            sys.argv = ["memory_review.py", *arguments]
+            with contextlib.redirect_stdout(output):
+                code = memory_review.main()
+        finally:
+            sys.argv = original
+        return code, json.loads(output.getvalue())
+
+    def test_nested_cli_parses_pinned_github_import_and_requires_idempotency(self) -> None:
+        parser = memory_review.build_parser()
+        args = parser.parse_args(
+            [
+                "ui-skill",
+                "import",
+                "--github",
+                "owner/repo",
+                "--path",
+                "skills/sample",
+                "--revision",
+                "abc123",
+                "--scope",
+                "global",
+                "--targets",
+                "codex,claude",
+                "--idempotency-key",
+                "import-001",
+            ]
+        )
+
+        self.assertEqual(args.command, "ui-skill")
+        self.assertEqual(args.ui_skill_command, "import")
+        self.assertEqual(args.github, "owner/repo")
+        self.assertEqual(args.idempotency_key, "import-001")
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    ["ui-skill", "approve", "draft-1", "--digest", "0" * 64]
+                )
+
+    def test_cli_imports_local_skill_as_visible_draft_and_lists_it(self) -> None:
+        code, imported = self.run_cli(
+            [
+                "ui-skill",
+                "import",
+                "--local",
+                str(self.fixture),
+                "--scope",
+                "global",
+                "--targets",
+                "codex,claude",
+                "--idempotency-key",
+                "local-import-001",
+            ]
+        )
+        list_code, listed = self.run_cli(["ui-skill", "list"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(list_code, 0)
+        self.assertEqual(imported["status"], "validated")
+        self.assertEqual(listed["items"][0]["id"], imported["id"])
+        self.assertTrue(listed["items"][0]["validation_report"]["valid"])
+
+    def test_cli_sets_project_preferences_and_shows_effective_value(self) -> None:
+        project = self.temp / "project"
+        override_file = self.temp / "override.json"
+        override_file.write_text(
+            json.dumps(
+                {"visual.radius": {"mode": "replace", "value": "3px"}}
+            ),
+            encoding="utf-8",
+        )
+
+        set_code, saved = self.run_cli(
+            [
+                "ui-design",
+                "preferences",
+                "set-project",
+                "--project",
+                str(project),
+                "--json-file",
+                str(override_file),
+                "--idempotency-key",
+                "project-pref-001",
+            ]
+        )
+        show_code, shown = self.run_cli(
+            ["ui-design", "preferences", "show", "--project", str(project)]
+        )
+
+        self.assertEqual(set_code, 0)
+        self.assertEqual(show_code, 0)
+        self.assertEqual(saved["status"], "saved")
+        self.assertEqual(shown["effective"]["value"]["visual"]["radius"], "3px")
+
+    def test_cli_publish_uses_project_root_recorded_in_draft_scope(self) -> None:
+        project = self.temp / "project-target"
+        draft = registry.create_draft(
+            name="sample-ui",
+            source={"type": "local"},
+            package_root=self.fixture,
+            scope={"type": "project", "root": str(project)},
+            targets=["codex", "claude"],
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+
+        code, published = self.run_cli(
+            [
+                "ui-skill",
+                "publish",
+                draft["id"],
+                "--digest",
+                approved["digest"],
+                "--idempotency-key",
+                "project-publish-001",
+            ]
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(published["status"], "published")
+        self.assertTrue((project / ".agents/skills/sample-ui/SKILL.md").exists())
+        self.assertTrue((project / ".claude/skills/sample-ui/SKILL.md").exists())
+
+        disable_code, disabled = self.run_cli(
+            [
+                "ui-skill",
+                "disable",
+                "sample-ui",
+                "--idempotency-key",
+                "project-disable-001",
+            ]
+        )
+        self.assertEqual(disable_code, 0)
+        self.assertEqual(disabled["status"], "disabled")
+        self.assertFalse((project / ".agents/skills/sample-ui").exists())
+        self.assertFalse((project / ".claude/skills/sample-ui").exists())
 
 
 if __name__ == "__main__":

@@ -228,6 +228,82 @@ def record_deployment(
         _write_registry(value)
 
 
+def record_idempotent_result(
+    result: dict[str, Any], *, idempotency_key: str, fingerprint: str
+) -> None:
+    with store.exclusive_lock(registry_lock_path()):
+        value = load_registry()
+        existing = value["idempotency"].get(idempotency_key)
+        if existing and existing.get("fingerprint") != fingerprint:
+            raise RegistryError(
+                f"idempotency key reused with different arguments: {idempotency_key}"
+            )
+        value["idempotency"][idempotency_key] = {
+            "fingerprint": fingerprint,
+            "result": copy.deepcopy(result),
+        }
+        _write_registry(value)
+
+
+def set_validation_report(
+    draft_id: str, report: dict[str, Any], *, expected_digest: str
+) -> dict[str, Any]:
+    with store.exclusive_lock(registry_lock_path()):
+        value = load_registry()
+        record = value["drafts"].get(draft_id)
+        if not isinstance(record, dict):
+            raise DraftNotFound(draft_id)
+        content_root = pathlib.Path(record["draft_path"]) / "content"
+        current_digest = package_digest(content_root)
+        if current_digest != expected_digest or record.get("digest") != expected_digest:
+            raise DigestConflict(
+                f"draft digest changed: expected {expected_digest}, current {current_digest}"
+            )
+        valid = report.get("valid") is True
+        current_status = record.get("status")
+        if valid and current_status == "draft":
+            record["status"] = "validated"
+        elif not valid and current_status == "validated":
+            record["status"] = "draft"
+        elif current_status not in {"draft", "validated"}:
+            raise InvalidTransition(
+                f"cannot validate draft from {current_status}"
+            )
+        record["validation_report"] = copy.deepcopy(report)
+        record["updated_at"] = _now()
+        _write_registry(value)
+        updated = copy.deepcopy(record)
+    _audit("draft_validated" if valid else "draft_validation_failed", updated)
+    return updated
+
+
+def request_revision(draft_id: str, reason: str) -> dict[str, Any]:
+    return transition_draft(draft_id, "draft", details={"revision_reason": reason})
+
+
+def reject_draft(draft_id: str, reason: str = "") -> dict[str, Any]:
+    return transition_draft(draft_id, "rejected", details={"rejection_reason": reason})
+
+
+def get_version(name: str, version_id: str) -> dict[str, Any]:
+    versions = load_registry()["packages"].get(name, [])
+    for version in versions:
+        if version.get("version_id") == version_id:
+            return {"name": name, **copy.deepcopy(version)}
+    raise RegistryError(f"unknown skill version: {name}@{version_id}")
+
+
+def latest_deployment(name: str) -> dict[str, Any] | None:
+    reports = [
+        report
+        for report in load_registry()["deployments"].values()
+        if report.get("name") == name and report.get("status") in {"published", "disabled"}
+    ]
+    if not reports:
+        return None
+    return copy.deepcopy(max(reports, key=lambda report: report.get("at", "")))
+
+
 def complete_publication(
     draft_id: str,
     report: dict[str, Any],
