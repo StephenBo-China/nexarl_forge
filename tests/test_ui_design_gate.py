@@ -106,6 +106,20 @@ class DesignPackageLifecycleTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def enable_gate(self, *, mode: str = "design_package") -> dict:
+        config = memory_project.ui_design_config(self.project)
+        config.update(
+            {
+                "hard_gate_enabled": True,
+                "gate_mode": mode,
+                "formal_frontend_paths": ["web/src/**"],
+            }
+        )
+        (self.project / "codex/ui_design/config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        return config
+
     def test_design_package_change_invalidates_digest_bound_approval(self) -> None:
         package = gate.create_design_package(
             self.project,
@@ -238,6 +252,200 @@ class DesignPackageLifecycleTest(unittest.TestCase):
         (root / "undeclared.md").write_text("not declared", encoding="utf-8")
         with self.assertRaises(gate.GateValidationError):
             gate.get_design_package(self.project, "checkout-redesign")
+
+    def test_locked_gate_allows_backend_and_design_artifacts_only(self) -> None:
+        self.enable_gate()
+
+        backend = gate.decide_tool_use(
+            self.project, "Edit", {"file_path": "server/orders.py"}
+        )
+        design = gate.decide_tool_use(
+            self.project,
+            "Write",
+            {
+                "file_path": (
+                    "codex/ui_design/design-packages/checkout-redesign/design-brief.md"
+                )
+            },
+        )
+        frontend = gate.decide_tool_use(
+            self.project, "Edit", {"file_path": "web/src/checkout/Form.tsx"}
+        )
+        frontend_read = gate.decide_tool_use(
+            self.project,
+            "mcp__filesystem__read_file",
+            {"path": "web/src/checkout/Form.tsx"},
+        )
+
+        self.assertEqual(backend["decision"], "allow_non_visual")
+        self.assertEqual(design["decision"], "allow_design_artifact")
+        self.assertEqual(frontend["decision"], "deny_pending_approval")
+        self.assertEqual(frontend_read["decision"], "allow_non_visual")
+
+    def test_design_package_approval_allows_only_declared_current_scope(self) -> None:
+        self.enable_gate()
+        package = gate.create_design_package(
+            self.project,
+            "checkout-redesign",
+            self.manifest,
+            idempotency_key="gate-create-001",
+        )
+        gate.approve_design_package(
+            self.project,
+            "checkout-redesign",
+            expected_digest=package["digest"],
+            idempotency_key="gate-approve-001",
+        )
+        allowed = gate.decide_tool_use(
+            self.project,
+            "apply_patch",
+            {
+                "patch": (
+                    "*** Begin Patch\n"
+                    "*** Update File: web/src/checkout/Form.tsx\n"
+                    "@@\n-old\n+new\n"
+                    "*** End Patch"
+                )
+            },
+        )
+        outside_scope = gate.decide_tool_use(
+            self.project, "Edit", {"file_path": "web/src/profile/Profile.tsx"}
+        )
+        self.assertEqual(allowed["decision"], "allow_approved_frontend_scope")
+        self.assertEqual(outside_scope["decision"], "deny_scope_mismatch")
+
+        package_root = pathlib.Path(package["root"])
+        (package_root / "responsive-spec.md").write_text(
+            "New breakpoint", encoding="utf-8"
+        )
+        invalidated = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/checkout/Form.tsx"}
+        )
+        self.assertEqual(invalidated["decision"], "deny_invalidated_approval")
+
+    def test_project_global_baseline_unlocks_all_frontend_until_relock_or_mode_change(self) -> None:
+        config = self.enable_gate(mode="project_global")
+        config["project_global_baseline_task"] = "checkout-redesign"
+        config_path = self.project / "codex/ui_design/config.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        package = gate.create_design_package(
+            self.project,
+            "checkout-redesign",
+            self.manifest,
+            idempotency_key="baseline-create-001",
+        )
+
+        approval = gate.approve_project_baseline(
+            self.project,
+            "checkout-redesign",
+            expected_digest=package["digest"],
+            idempotency_key="baseline-approve-001",
+        )
+        self.assertEqual(approval["status"], "approved")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertFalse(config["relocked"])
+        self.assertEqual(
+            gate.decide_tool_use(
+                self.project, "Edit", {"file_path": "web/src/profile/Profile.tsx"}
+            )["decision"],
+            "allow_approved_frontend_scope",
+        )
+
+        config["relocked"] = True
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(
+            gate.decide_tool_use(
+                self.project, "Edit", {"file_path": "web/src/profile/Profile.tsx"}
+            )["decision"],
+            "deny_pending_approval",
+        )
+        config.update({"relocked": False, "gate_mode": "design_package"})
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(
+            gate.decide_tool_use(
+                self.project, "Edit", {"file_path": "web/src/profile/Profile.tsx"}
+            )["decision"],
+            "deny_pending_approval",
+        )
+
+    def test_changed_project_global_baseline_invalidates_unlock(self) -> None:
+        config = self.enable_gate(mode="project_global")
+        config["project_global_baseline_task"] = "checkout-redesign"
+        (self.project / "codex/ui_design/config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        package = gate.create_design_package(
+            self.project,
+            "checkout-redesign",
+            self.manifest,
+            idempotency_key="baseline-create-002",
+        )
+        gate.approve_project_baseline(
+            self.project,
+            "checkout-redesign",
+            expected_digest=package["digest"],
+            idempotency_key="baseline-approve-002",
+        )
+        (pathlib.Path(package["root"]) / "design-brief.md").write_text(
+            "Changed baseline", encoding="utf-8"
+        )
+
+        decision = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/App.tsx"}
+        )
+        self.assertEqual(decision["decision"], "deny_invalidated_approval")
+
+    def test_corrupt_config_fails_closed_only_for_frontend_and_unresolved_shell(self) -> None:
+        config = self.enable_gate()
+        config["gate_mode"] = "unsupported"
+        (self.project / "codex/ui_design/config.json").write_text(
+            json.dumps(config), encoding="utf-8"
+        )
+        frontend = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/App.tsx"}
+        )
+        backend = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "server/app.py"}
+        )
+        self.assertEqual(frontend["decision"], "deny_invalid_configuration")
+        self.assertEqual(backend["decision"], "allow_non_visual")
+
+        self.enable_gate()
+        unresolved = gate.decide_tool_use(
+            self.project,
+            "Bash",
+            {"command": "python3 scripts/rewrite_everything.py"},
+        )
+        read_only = gate.decide_tool_use(
+            self.project, "exec_command", {"cmd": "rg -n checkout web/src"}
+        )
+        chained = gate.decide_tool_use(
+            self.project,
+            "exec_command",
+            {"cmd": "rg -n checkout web/src && python3 scripts/rewrite_everything.py"},
+        )
+        self.assertEqual(unresolved["decision"], "deny_pending_approval")
+        self.assertIn("apply_patch", unresolved["reason"])
+        self.assertEqual(read_only["decision"], "allow_non_visual")
+        self.assertEqual(chained["decision"], "deny_pending_approval")
+
+    def test_tool_path_extraction_supports_edit_write_mcp_and_shell(self) -> None:
+        self.assertEqual(
+            gate.extract_candidate_paths("Edit", {"file_path": "web/src/App.tsx"}),
+            ["web/src/App.tsx"],
+        )
+        self.assertEqual(
+            gate.extract_candidate_paths(
+                "mcp__filesystem__write_file", {"path": "web/src/App.tsx"}
+            ),
+            ["web/src/App.tsx"],
+        )
+        self.assertEqual(
+            gate.extract_candidate_paths(
+                "Bash", {"command": "touch web/src/New.tsx"}
+            ),
+            ["web/src/New.tsx"],
+        )
 
 
 if __name__ == "__main__":

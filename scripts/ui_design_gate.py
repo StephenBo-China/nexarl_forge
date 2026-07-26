@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import copy
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import os
 import pathlib
 import re
 import shutil
+import shlex
 import tempfile
 from collections.abc import Callable
 from typing import Any
@@ -80,7 +82,12 @@ def _safe_relative(value: str, *, label: str) -> pathlib.PurePosixPath:
     if not isinstance(value, str) or not value.strip():
         raise GateValidationError(f"{label} must be a non-empty project-relative path")
     path = pathlib.PurePosixPath(value.replace("\\", "/"))
-    if path.is_absolute() or ".." in path.parts or not path.parts:
+    if (
+        path.is_absolute()
+        or re.match(r"^[A-Za-z]:/", value.replace("\\", "/"))
+        or ".." in path.parts
+        or not path.parts
+    ):
         raise GateValidationError(f"unsafe {label}: {value}")
     return path
 
@@ -565,6 +572,12 @@ def invalidate_design_package(
 
 
 def gate_status(project_root: pathlib.Path, *, task_id: str | None = None) -> dict[str, Any]:
+    try:
+        config = _config(project_root)
+    except GateValidationError:
+        config = {}
+    if config.get("gate_mode") == "project_global":
+        return _project_global_gate_status(project_root, config)
     if not task_id:
         return {"decision": "deny_missing_design", "status": "missing"}
     try:
@@ -607,3 +620,433 @@ def gate_status(project_root: pathlib.Path, *, task_id: str | None = None) -> di
         "approval_digest": approval["digest"],
         "allowed_file_patterns": approval.get("allowed_file_patterns", []),
     }
+
+
+PATCH_PATH = re.compile(
+    r"^\*\*\* (?:Add|Update|Delete) File:\s*(.+?)\s*$", re.MULTILINE
+)
+UNIFIED_PATCH_PATH = re.compile(r"^\+\+\+\s+(?:b/)?(.+?)\s*$", re.MULTILINE)
+DIRECT_PATH_KEYS = {
+    "file_path",
+    "filePath",
+    "path",
+    "paths",
+    "target",
+    "target_path",
+    "destination",
+    "destination_path",
+    "filename",
+}
+READ_ONLY_SHELL_COMMANDS = {
+    "cat",
+    "cut",
+    "env",
+    "find",
+    "git",
+    "grep",
+    "head",
+    "ls",
+    "pwd",
+    "rg",
+    "sed",
+    "sort",
+    "tail",
+    "wc",
+    "which",
+}
+MUTATING_SHELL_COMMANDS = {
+    "cp",
+    "install",
+    "mkdir",
+    "mv",
+    "rm",
+    "rmdir",
+    "touch",
+    "truncate",
+}
+
+
+def _shell_tokens(tool_input: dict[str, Any]) -> list[str]:
+    command = tool_input.get("command", tool_input.get("cmd", ""))
+    if not isinstance(command, str) or not command.strip():
+        return []
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return []
+
+
+def _shell_command_name(tokens: list[str]) -> str:
+    if not tokens:
+        return ""
+    index = 0
+    if tokens[0] == "env":
+        index = 1
+        while index < len(tokens) and "=" in tokens[index] and not tokens[index].startswith("-"):
+            index += 1
+    if index >= len(tokens):
+        return ""
+    return pathlib.PurePosixPath(tokens[index]).name
+
+
+def _shell_paths(tokens: list[str]) -> list[str]:
+    command = _shell_command_name(tokens)
+    if command not in MUTATING_SHELL_COMMANDS:
+        return []
+    command_index = next(
+        (index for index, token in enumerate(tokens) if pathlib.PurePosixPath(token).name == command),
+        0,
+    )
+    arguments = [token for token in tokens[command_index + 1 :] if not token.startswith("-")]
+    if command in {"cp", "install", "mv"}:
+        return arguments[-1:] if arguments else []
+    return arguments
+
+
+def _collect_direct_paths(value: Any, *, key: str = "") -> list[str]:
+    if isinstance(value, dict):
+        result: list[str] = []
+        for child_key, child in value.items():
+            if child_key in DIRECT_PATH_KEYS:
+                result.extend(_collect_direct_paths(child, key=child_key))
+        return result
+    if isinstance(value, list):
+        result = []
+        for child in value:
+            result.extend(_collect_direct_paths(child, key=key))
+        return result
+    if isinstance(value, str) and key in DIRECT_PATH_KEYS:
+        return [value]
+    return []
+
+
+def extract_candidate_paths(tool_name: str, tool_input: dict[str, Any]) -> list[str]:
+    lowered = tool_name.lower()
+    paths: list[str] = []
+    if lowered == "apply_patch" or "patch" in tool_input:
+        patch = tool_input.get("patch", tool_input.get("input", ""))
+        if isinstance(patch, str):
+            paths.extend(PATCH_PATH.findall(patch))
+            paths.extend(
+                path for path in UNIFIED_PATCH_PATH.findall(patch) if path != "/dev/null"
+            )
+    if lowered in {"bash", "exec_command"}:
+        paths.extend(_shell_paths(_shell_tokens(tool_input)))
+    else:
+        paths.extend(_collect_direct_paths(tool_input))
+    return list(dict.fromkeys(path.strip() for path in paths if path.strip()))
+
+
+def classify_mutation(tool_name: str, tool_input: dict[str, Any]) -> str:
+    lowered = tool_name.lower()
+    if lowered in {"edit", "write", "apply_patch"}:
+        return "mutation"
+    if lowered.startswith("mcp__filesystem__"):
+        operation = lowered.rsplit("__", 1)[-1]
+        if operation.startswith(("read", "list", "get", "stat", "search")):
+            return "read_only"
+        return "mutation"
+    if lowered not in {"bash", "exec_command"}:
+        return "read_only"
+    raw_command = tool_input.get("command", tool_input.get("cmd", ""))
+    if isinstance(raw_command, str) and any(
+        operator in raw_command for operator in ("&&", "||", ";", "|", ">", "<")
+    ):
+        return "unresolved_mutation"
+    tokens = _shell_tokens(tool_input)
+    command = _shell_command_name(tokens)
+    if not command:
+        return "unresolved_mutation"
+    if command in MUTATING_SHELL_COMMANDS:
+        return "mutation"
+    if command == "git":
+        subcommand = next((token for token in tokens[1:] if not token.startswith("-")), "")
+        return (
+            "read_only"
+            if subcommand in {"status", "diff", "log", "show", "rev-parse", "branch"}
+            else "unresolved_mutation"
+        )
+    if command == "find" and "-delete" in tokens:
+        return "unresolved_mutation"
+    if command == "sed" and any(token.startswith("-i") for token in tokens[1:]):
+        return "unresolved_mutation"
+    if command in READ_ONLY_SHELL_COMMANDS:
+        return "read_only"
+    return "unresolved_mutation"
+
+
+def _normalize_candidate(project_root: pathlib.Path, value: str) -> str:
+    root = pathlib.Path(project_root).expanduser().resolve()
+    raw = pathlib.Path(value).expanduser()
+    candidate = raw.resolve() if raw.is_absolute() else (root / raw).resolve()
+    if not candidate.is_relative_to(root):
+        raise GateValidationError(f"mutation path escapes project root: {value}")
+    return candidate.relative_to(root).as_posix()
+
+
+def _matches(path: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def _safe_patterns(value: Any, *, label: str) -> list[str]:
+    patterns = _string_list(value, label=label)
+    for pattern in patterns:
+        _safe_relative(pattern, label=label)
+    return patterns
+
+
+def _load_config_for_decision(
+    project_root: pathlib.Path,
+) -> tuple[dict[str, Any], str | None]:
+    path = _ui_root(project_root) / "config.json"
+    try:
+        value = store.read_json_strict(path)
+    except (OSError, json.JSONDecodeError) as error:
+        return {}, f"invalid UI gate config {path}: {error}"
+    if not isinstance(value, dict):
+        return {}, f"invalid UI gate config object: {path}"
+    try:
+        if value.get("schema_version") != 1:
+            raise GateValidationError("schema_version must be 1")
+        if value.get("gate_mode") not in {"design_package", "project_global"}:
+            raise GateValidationError("unsupported gate_mode")
+        for key in (
+            "formal_frontend_paths",
+            "design_artifact_paths",
+            "generated_paths",
+            "test_artifact_paths",
+        ):
+            _safe_patterns(value.get(key, []), label=key)
+    except GateValidationError as error:
+        return value, f"invalid UI gate config {path}: {error}"
+    return value, None
+
+
+def _looks_frontend(path: str) -> bool:
+    parts = set(pathlib.PurePosixPath(path).parts)
+    suffix = pathlib.PurePosixPath(path).suffix.lower()
+    return bool(
+        parts & {"web", "frontend", "app", "pages", "components", "mini-program", "miniprogram"}
+        and suffix
+        in {".css", ".html", ".js", ".jsx", ".less", ".scss", ".swift", ".tsx", ".ts", ".vue", ".wxml", ".wxss"}
+    )
+
+
+def _project_global_gate_status(
+    project_root: pathlib.Path, config: dict[str, Any]
+) -> dict[str, Any]:
+    if config.get("relocked", True):
+        return {
+            "decision": "deny_pending_approval",
+            "status": "relocked",
+            "reason": "Project-global UI approval is relocked.",
+        }
+    task_id = config.get("project_global_baseline_task")
+    approvals = _load_approvals(project_root)
+    approval = approvals.get("project_global_approval")
+    if not isinstance(task_id, str) or not isinstance(approval, dict):
+        return {
+            "decision": "deny_pending_approval",
+            "status": "pending_approval",
+            "reason": "Project-global UI baseline approval is required.",
+        }
+    if (
+        approval.get("status") != "approved"
+        or approval.get("task_id") != task_id
+        or approval.get("gate_mode") != "project_global"
+    ):
+        return {
+            "decision": "deny_pending_approval",
+            "status": approval.get("status", "pending_approval"),
+            "reason": "Project-global UI baseline approval is not active.",
+        }
+    try:
+        package = get_design_package(project_root, task_id)
+    except (DesignPackageNotFound, GateValidationError):
+        return {
+            "decision": "deny_invalidated_approval",
+            "status": "invalidated",
+            "reason": "The approved project UI baseline is missing or invalid.",
+        }
+    if package["digest"] != approval.get("digest"):
+        return {
+            "decision": "deny_invalidated_approval",
+            "status": "invalidated",
+            "current_digest": package["digest"],
+            "approval_digest": approval.get("digest"),
+            "reason": "The approved project UI baseline has changed.",
+        }
+    return {
+        "decision": "allow_approved_frontend_scope",
+        "status": "approved",
+        "current_digest": package["digest"],
+        "approval_digest": approval["digest"],
+    }
+
+
+def _design_package_path_decision(
+    project_root: pathlib.Path, formal_paths: list[str]
+) -> dict[str, Any]:
+    approvals = _load_approvals(project_root).get("package_approvals", {})
+    approved = [
+        item
+        for item in approvals.values()
+        if isinstance(item, dict)
+        and item.get("status") == "approved"
+        and item.get("gate_mode") == "design_package"
+    ]
+    if not approved:
+        return {
+            "decision": "deny_pending_approval",
+            "status": "pending_approval",
+            "reason": "Approve a design package before modifying formal frontend code.",
+        }
+    for path in formal_paths:
+        matching = [
+            item
+            for item in approved
+            if _matches(path, item.get("allowed_file_patterns", []))
+        ]
+        if not matching:
+            return {
+                "decision": "deny_scope_mismatch",
+                "status": "approved",
+                "path": path,
+                "reason": "The frontend path is outside every approved design package.",
+            }
+        valid = False
+        invalidated: dict[str, Any] | None = None
+        for item in matching:
+            try:
+                package = get_design_package(project_root, item["task_id"])
+            except (DesignPackageNotFound, GateValidationError):
+                invalidated = item
+                continue
+            if package["digest"] == item.get("digest"):
+                valid = True
+                break
+            invalidated = {
+                **item,
+                "current_digest": package["digest"],
+            }
+        if not valid:
+            return {
+                "decision": "deny_invalidated_approval",
+                "status": "invalidated",
+                "path": path,
+                "current_digest": (invalidated or {}).get("current_digest"),
+                "approval_digest": (invalidated or {}).get("digest"),
+                "reason": "The design package changed after approval.",
+            }
+    return {
+        "decision": "allow_approved_frontend_scope",
+        "status": "approved",
+        "paths": formal_paths,
+    }
+
+
+def decide_tool_use(
+    project_root: pathlib.Path, tool_name: str, tool_input: dict[str, Any]
+) -> dict[str, Any]:
+    mutation = classify_mutation(tool_name, tool_input)
+    if mutation == "read_only":
+        return {"decision": "allow_non_visual", "reason": "Read-only operation."}
+    config, config_error = _load_config_for_decision(project_root)
+    if config.get("enabled") is False or config.get("hard_gate_enabled") is False:
+        return {"decision": "allow_non_visual", "reason": "UI hard gate is disabled."}
+
+    raw_paths = extract_candidate_paths(tool_name, tool_input)
+    if mutation == "unresolved_mutation" and not raw_paths:
+        if config.get("gate_mode") == "project_global" and config_error is None:
+            global_status = _project_global_gate_status(project_root, config)
+            if global_status["decision"] == "allow_approved_frontend_scope":
+                return global_status
+        return {
+            "decision": "deny_invalid_configuration"
+            if config_error
+            else "deny_pending_approval",
+            "reason": (
+                "Mutating shell command paths cannot be resolved while the UI gate is locked; "
+                "use apply_patch or a file-specific write tool."
+            ),
+        }
+    try:
+        paths = [_normalize_candidate(project_root, path) for path in raw_paths]
+    except GateValidationError as error:
+        return {"decision": "deny_invalid_configuration", "reason": str(error)}
+    if not paths:
+        return {"decision": "allow_non_visual", "reason": "No project mutation path."}
+
+    formal_patterns = config.get("formal_frontend_paths", [])
+    formal = [
+        path
+        for path in paths
+        if _matches(path, formal_patterns) or (config_error and _looks_frontend(path))
+    ]
+    if not formal:
+        design_patterns = config.get("design_artifact_paths", [])
+        if paths and all(_matches(path, design_patterns) for path in paths):
+            return {
+                "decision": "allow_design_artifact",
+                "paths": paths,
+                "reason": "The mutation is inside configured design-artifact paths.",
+            }
+        return {
+            "decision": "allow_non_visual",
+            "paths": paths,
+            "reason": "The mutation does not touch formal frontend paths.",
+        }
+    if config_error:
+        return {
+            "decision": "deny_invalid_configuration",
+            "paths": formal,
+            "reason": config_error,
+        }
+    if config.get("gate_mode") == "project_global":
+        return _project_global_gate_status(project_root, config)
+    return _design_package_path_decision(project_root, formal)
+
+
+def approve_project_baseline(
+    project_root: pathlib.Path,
+    task_id: str,
+    *,
+    expected_digest: str,
+    idempotency_key: str,
+) -> dict[str, Any]:
+    config = _config(project_root)
+    if config.get("gate_mode") != "project_global":
+        raise GateValidationError("project baseline approval requires project_global mode")
+    if config.get("project_global_baseline_task") != task_id:
+        raise GateValidationError("task does not match project_global_baseline_task")
+
+    def operation(approvals: dict[str, Any]) -> dict[str, Any]:
+        package = get_design_package(project_root, task_id)
+        if package["digest"] != expected_digest:
+            raise DigestConflict(
+                f"design package digest changed: expected {expected_digest}, current {package['digest']}"
+            )
+        record = {
+            "task_id": task_id,
+            "status": "approved",
+            "digest": package["digest"],
+            "gate_mode": "project_global",
+            "at": _now(),
+        }
+        approvals["project_global_approval"] = record
+        current_config = _config(project_root)
+        current_config["relocked"] = False
+        store.atomic_write_json(_ui_root(project_root) / "config.json", current_config)
+        return copy.deepcopy(record)
+
+    result, changed = _mutate(
+        project_root,
+        idempotency_key=idempotency_key,
+        operation="project-baseline.approve",
+        payload={"task_id": task_id, "expected_digest": expected_digest},
+        callback=operation,
+    )
+    if changed:
+        _audit(project_root, "project_baseline_approved", result)
+        _refresh_context(project_root)
+    return result
