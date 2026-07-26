@@ -187,6 +187,7 @@ def _run_transaction(
     replace: Callable[[pathlib.Path, pathlib.Path], None],
     approved: dict[str, Any] | None = None,
     variants: dict[str, Any] | None = None,
+    record_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not idempotency_key:
         raise PublishError("idempotency_key is required")
@@ -294,6 +295,9 @@ def _run_transaction(
                 "targets": {agent: str(path) for agent, path in targets.items()},
                 "at": _now(),
             }
+            if record_metadata is not None:
+                report["scope"] = record_metadata.get("scope", {})
+                report["version_id"] = record_metadata.get("version_id", "")
             store.atomic_write_json(_report_path(transaction_id), report)
             completed = False
             if operation == "publish" and approved is not None:
@@ -371,6 +375,7 @@ def publish(
         replace=replace,
         approved=approved,
         variants=approved.get("source", {}).get("variants"),
+        record_metadata=approved,
     )
 
 
@@ -391,6 +396,7 @@ def rollback(
         idempotency_key=idempotency_key,
         replace=os.replace,
         variants=approved_version.get("source", {}).get("variants"),
+        record_metadata=approved_version,
     )
 
 

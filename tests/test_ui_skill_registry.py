@@ -424,6 +424,15 @@ description: Broken duplicate skill.
         self.assertEqual(show_code, 0)
         self.assertEqual(saved["status"], "saved")
         self.assertEqual(shown["effective"]["value"]["visual"]["radius"], "3px")
+        snapshot = json.loads(
+            (project / "codex/ui_design/effective-context.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            snapshot["preferences"]["effective"]["value"]["visual"]["radius"],
+            "3px",
+        )
 
     def test_cli_publish_uses_project_root_recorded_in_draft_scope(self) -> None:
         project = self.temp / "project-target"
@@ -452,6 +461,21 @@ description: Broken duplicate skill.
         self.assertEqual(published["status"], "published")
         self.assertTrue((project / ".agents/skills/sample-ui/SKILL.md").exists())
         self.assertTrue((project / ".claude/skills/sample-ui/SKILL.md").exists())
+        active = json.loads(
+            (project / "codex/ui_design/active-skills.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual([item["name"] for item in active["skills"]], ["sample-ui"])
+        snapshot = json.loads(
+            (project / "codex/ui_design/effective-context.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            [item["name"] for item in snapshot["active_skills"]["skills"]],
+            ["sample-ui"],
+        )
 
         disable_code, disabled = self.run_cli(
             [
@@ -466,6 +490,12 @@ description: Broken duplicate skill.
         self.assertEqual(disabled["status"], "disabled")
         self.assertFalse((project / ".agents/skills/sample-ui").exists())
         self.assertFalse((project / ".claude/skills/sample-ui").exists())
+        active = json.loads(
+            (project / "codex/ui_design/active-skills.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(active["skills"], [])
 
 
 if __name__ == "__main__":

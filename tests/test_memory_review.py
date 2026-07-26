@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -13,6 +15,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import memory_project
 import memory_review_queue as review
 import loop_superpowers
+import ui_design_preferences as preferences
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
@@ -38,9 +41,89 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertTrue((root / "codex/ui_design/active-skills.json").exists())
             self.assertTrue((root / "codex/ui_design/preferences.json").exists())
             self.assertTrue((root / "codex/ui_design/approvals.json").exists())
+            context_path = root / "codex/ui_design/effective-context.json"
+            self.assertTrue(context_path.exists())
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+            self.assertEqual(context["gate"]["mode"], "design_package")
+            self.assertEqual(context["active_skills"]["skills"], [])
+            for instructions in (
+                root / "AGENTS.md",
+                root / "CLAUDE.md",
+                root / ".claude/rules/shared-memory.md",
+            ):
+                text = instructions.read_text(encoding="utf-8")
+                self.assertIn("codex/ui_design/config.json", text)
+                self.assertIn("codex/ui_design/effective-context.json", text)
+                self.assertIn("codex/ui_design/active-skills.json", text)
+                self.assertIn("codex/ui_design/approvals.json", text)
+                self.assertIn("visible-interface", text)
             self.assertEqual(
                 result["project"]["ui_design_status"], "configuration_required"
             )
+
+    def test_effective_ui_context_merges_preferences_skills_and_gate_state(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "project"
+            root.mkdir()
+            (root / ".git").mkdir()
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = temp / "projects.json"
+                with mock.patch.dict(
+                    os.environ, {"UI_DESIGN_HOME": str(temp / "ui-design-home")}
+                ):
+                    memory_project.init_project(root)
+                    global_value = preferences.default_global_preferences()
+                    global_value["design_principles"] = ["calm hierarchy"]
+                    preferences.save_global_preferences(global_value)
+                    preferences.save_project_overrides(
+                        root,
+                        {
+                            "design_principles": {
+                                "mode": "append",
+                                "value": ["clear primary action"],
+                            }
+                        },
+                    )
+                    memory_project.write_json(
+                        root / "codex/ui_design/active-skills.json",
+                        {
+                            "schema_version": 1,
+                            "execution_order": ["frontend-design", "ui-ux-pro-max"],
+                            "skills": [
+                                {"name": "frontend-design", "version": "pinned"}
+                            ],
+                        },
+                    )
+                    config = memory_project.ui_design_config(root)
+                    config.update({"hard_gate_enabled": True, "relocked": False})
+                    memory_project.write_json(
+                        root / "codex/ui_design/config.json", config
+                    )
+                    memory_project.write_json(
+                        root / "codex/ui_design/approvals.json",
+                        {
+                            "schema_version": 1,
+                            "package_approvals": {"task-1": {"digest": "a" * 64}},
+                            "project_global_approval": None,
+                        },
+                    )
+
+                    snapshot = memory_project.publish_effective_ui_context(root)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            self.assertEqual(
+                snapshot["preferences"]["effective"]["value"]["design_principles"],
+                ["calm hierarchy", "clear primary action"],
+            )
+            self.assertEqual(
+                snapshot["active_skills"]["execution_order"],
+                ["frontend-design", "ui-ux-pro-max"],
+            )
+            self.assertFalse(snapshot["gate"]["relocked"])
+            self.assertIn("task-1", snapshot["gate"]["approvals"]["package_approvals"])
 
     def test_personal_noise_rejects_project_tasks_and_memory_console_commands(self) -> None:
         base = {
@@ -140,6 +223,8 @@ class MemoryReviewQualityTest(unittest.TestCase):
             second = memory_project.upgrade_memory_rules(project)
 
             self.assertIn("Keep this exact text.", updated)
+            self.assertIn("codex/ui_design/effective-context.json", updated)
+            self.assertIn("visible-interface", updated)
             self.assertIn(loop_superpowers.MANAGED_RULE_START, updated)
             self.assertEqual(updated, agents.read_text(encoding="utf-8"))
             self.assertTrue(any(item["status"] == "backup" for item in first["changes"]))

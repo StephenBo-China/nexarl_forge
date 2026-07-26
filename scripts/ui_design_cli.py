@@ -18,6 +18,7 @@ import ui_skill_publisher as publisher
 import ui_skill_registry as registry
 import ui_skill_sources as sources
 import ui_skill_validator as validator
+import memory_project
 
 
 COMMANDS = {"ui-skill", "ui-design"}
@@ -366,6 +367,64 @@ def _previous_digests(
     return dict(latest.get("target_digests", {}))
 
 
+def _scope_projects(scope: dict[str, Any]) -> list[pathlib.Path]:
+    if scope.get("type") == "project":
+        root = scope.get("root")
+        return [pathlib.Path(root)] if root else []
+    projects = []
+    for item in memory_project.registry().get("projects", []):
+        root = item.get("root")
+        if root and (pathlib.Path(root) / "codex/ui_design/config.json").exists():
+            projects.append(pathlib.Path(root))
+    return projects
+
+
+def _sync_active_skill(
+    record: dict[str, Any], report: dict[str, Any], *, enabled: bool
+) -> None:
+    for project in _scope_projects(record.get("scope", {})):
+        path = project / "codex/ui_design/active-skills.json"
+        document = memory_project._read_ui_json(
+            path, {"schema_version": 1, "execution_order": [], "skills": []}
+        )
+        skills = [
+            item
+            for item in document.get("skills", [])
+            if isinstance(item, dict) and item.get("name") != record["name"]
+        ]
+        if enabled:
+            skills.append(
+                {
+                    "name": record["name"],
+                    "version": record.get("version_id", ""),
+                    "digest": record.get("digest", report.get("digest", "")),
+                    "scope": record.get("scope", {}),
+                    "target_digests": report.get("target_digests", {}),
+                }
+            )
+        skills.sort(key=lambda item: item["name"])
+        preferred = {
+            "ui-design-workflow": 0,
+            "frontend-design": 1,
+            "ui-ux-pro-max": 2,
+        }
+        execution_order = [
+            item["name"]
+            for item in sorted(
+                skills,
+                key=lambda item: (preferred.get(item["name"], 100), item["name"]),
+            )
+        ]
+        updated = {
+            "schema_version": 1,
+            "execution_order": execution_order,
+            "skills": skills,
+        }
+        if memory_project.read_json(path, None) != updated:
+            store.atomic_write_json(path, updated, backup=path.exists())
+        memory_project.publish_effective_ui_context(project)
+
+
 def _scan(args: argparse.Namespace) -> dict[str, Any]:
     if args.project:
         bases = publisher.resolve_targets(
@@ -428,11 +487,13 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             approved["previous_target_digests"] = _previous_digests(
                 approved["name"], targets
             )
-            return publisher.publish(
+            report = publisher.publish(
                 approved,
                 targets=targets,
                 idempotency_key=args.idempotency_key,
             )
+            _sync_active_skill(approved, report, enabled=True)
+            return report
         if command == "rollback":
             version = registry.get_version(args.name, args.version)
             latest = registry.latest_deployment(args.name)
@@ -442,12 +503,14 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 agent: pathlib.Path(path)
                 for agent, path in latest.get("targets", {}).items()
             }
-            return publisher.rollback(
+            report = publisher.rollback(
                 version,
                 targets=targets,
                 expected_target_digests=dict(latest["target_digests"]),
                 idempotency_key=args.idempotency_key,
             )
+            _sync_active_skill(version, report, enabled=True)
+            return report
         if command == "disable":
             latest = registry.latest_deployment(args.name)
             if latest is None:
@@ -456,12 +519,23 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 agent: pathlib.Path(path)
                 for agent, path in latest.get("targets", {}).items()
             }
-            return publisher.disable(
+            report = publisher.disable(
                 name=args.name,
                 targets=targets,
                 expected_target_digests=dict(latest["target_digests"]),
                 idempotency_key=args.idempotency_key,
             )
+            _sync_active_skill(
+                {
+                    "name": args.name,
+                    "scope": latest.get("scope", {}),
+                    "version_id": latest.get("version_id", ""),
+                    "digest": latest.get("digest", ""),
+                },
+                report,
+                enabled=False,
+            )
+            return report
         if command == "scan":
             if args.idempotency_key:
                 return _idempotent(
@@ -509,11 +583,16 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
 
 def _save_global(value: dict[str, Any]) -> dict[str, Any]:
     path = preferences.save_global_preferences(value)
-    return {"status": "saved", "path": str(path)}
+    refreshed = []
+    for project in _scope_projects({"type": "global"}):
+        memory_project.publish_effective_ui_context(project)
+        refreshed.append(str(project))
+    return {"status": "saved", "path": str(path), "refreshed_projects": refreshed}
 
 
 def _save_project(
     project: pathlib.Path, value: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
     path = preferences.save_project_overrides(project, value)
+    memory_project.publish_effective_ui_context(project)
     return {"status": "saved", "path": str(path)}

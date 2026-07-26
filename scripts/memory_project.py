@@ -14,6 +14,8 @@ import subprocess
 from typing import Any
 
 import loop_superpowers
+import ui_design_preferences
+import ui_design_store
 
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -110,6 +112,64 @@ def ui_design_status(root: pathlib.Path) -> str:
     if not isinstance(paths, list) or not paths:
         return "configuration_required"
     return "locked" if config.get("relocked", True) else "ready"
+
+
+def _read_ui_json(path: pathlib.Path, default: dict[str, Any]) -> dict[str, Any]:
+    if not path.exists():
+        return default
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid UI design state: {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"invalid UI design state object: {path}")
+    return value
+
+
+def publish_effective_ui_context(root: str | pathlib.Path) -> dict[str, Any]:
+    """Atomically publish the shared, project-effective UI design snapshot."""
+    project_root = normalize_project_root(root)
+    ui_root = project_root / "codex" / "ui_design"
+    config = _read_ui_json(ui_root / "config.json", ui_design_config(project_root))
+    active_skills = _read_ui_json(
+        ui_root / "active-skills.json",
+        {"schema_version": 1, "execution_order": [], "skills": []},
+    )
+    approvals = _read_ui_json(
+        ui_root / "approvals.json",
+        {
+            "schema_version": 1,
+            "package_approvals": {},
+            "project_global_approval": None,
+        },
+    )
+    global_preferences = ui_design_preferences.load_global_preferences()
+    project_preferences = ui_design_preferences.load_project_overrides(project_root)
+    effective_preferences = ui_design_preferences.merge_preferences(
+        global_preferences, project_preferences
+    )
+    snapshot = {
+        "schema_version": 1,
+        "preferences": {
+            "global": global_preferences,
+            "project": {"schema_version": 1, "overrides": project_preferences},
+            "effective": effective_preferences,
+        },
+        "active_skills": active_skills,
+        "gate": {
+            "status": ui_design_status(project_root),
+            "enabled": config.get("enabled") is True,
+            "hard_gate_enabled": config.get("hard_gate_enabled") is True,
+            "mode": config.get("gate_mode", "design_package"),
+            "relocked": config.get("relocked", True),
+            "config": config,
+            "approvals": approvals,
+        },
+    }
+    target = ui_root / "effective-context.json"
+    if read_json(target, None) != snapshot:
+        ui_design_store.atomic_write_json(target, snapshot)
+    return snapshot
 
 
 def project_entry(root: pathlib.Path) -> dict[str, Any]:
@@ -722,6 +782,15 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
         ),
         changes,
     )
+    context_path = ui_root / "effective-context.json"
+    context_existed = context_path.exists()
+    publish_effective_ui_context(project_root)
+    changes.append(
+        {
+            "path": str(context_path),
+            "status": "existing" if context_existed else "created",
+        }
+    )
     append_if_missing(project_root / "AGENTS.md", f"# {name} Codex Instructions", agent_memory_block(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "# " + name + " Shared Memory Instructions", claude_md(project_root), changes)
     append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
@@ -798,6 +867,16 @@ def upgrade_memory_rules(root: str | pathlib.Path) -> dict[str, Any]:
                 {"path": str(backup), "status": "backup"},
                 {"path": str(path), "status": status},
             ]
+        )
+    if (project_root / "codex" / "ui_design" / "config.json").exists():
+        context_path = project_root / "codex" / "ui_design" / "effective-context.json"
+        before = read_json(context_path, {})
+        snapshot = publish_effective_ui_context(project_root)
+        changes.append(
+            {
+                "path": str(context_path),
+                "status": "existing" if before == snapshot else "upgraded",
+            }
         )
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
