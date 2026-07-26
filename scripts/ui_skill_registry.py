@@ -171,6 +171,103 @@ def list_drafts() -> list[dict[str, Any]]:
     return sorted((copy.deepcopy(item) for item in records), key=lambda item: item["created_at"])
 
 
+def transition_draft(
+    draft_id: str,
+    new_status: str,
+    *,
+    expected_digest: str | None = None,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    with store.exclusive_lock(registry_lock_path()):
+        value = load_registry()
+        record = value["drafts"].get(draft_id)
+        if not isinstance(record, dict):
+            raise DraftNotFound(draft_id)
+        if new_status not in DRAFT_TRANSITIONS.get(record.get("status"), set()):
+            raise InvalidTransition(
+                f"cannot transition {draft_id} from {record.get('status')} to {new_status}"
+            )
+        if expected_digest is not None and record.get("digest") != expected_digest:
+            raise DigestConflict(
+                f"draft digest changed: expected {expected_digest}, recorded {record.get('digest')}"
+            )
+        record["status"] = new_status
+        record["updated_at"] = _now()
+        if details:
+            record.setdefault("status_details", {}).update(copy.deepcopy(details))
+        _write_registry(value)
+        updated = copy.deepcopy(record)
+    _audit(f"draft_{new_status}", updated)
+    return updated
+
+
+def idempotency_result(key: str, fingerprint: str) -> dict[str, Any] | None:
+    stored = load_registry()["idempotency"].get(key)
+    if stored is None:
+        return None
+    if stored.get("fingerprint") != fingerprint:
+        raise RegistryError(f"idempotency key reused with different arguments: {key}")
+    return copy.deepcopy(stored.get("result"))
+
+
+def record_deployment(
+    report: dict[str, Any], *, idempotency_key: str, fingerprint: str
+) -> None:
+    with store.exclusive_lock(registry_lock_path()):
+        value = load_registry()
+        existing = value["idempotency"].get(idempotency_key)
+        if existing and existing.get("fingerprint") != fingerprint:
+            raise RegistryError(
+                f"idempotency key reused with different arguments: {idempotency_key}"
+            )
+        value["deployments"][report["transaction_id"]] = copy.deepcopy(report)
+        value["idempotency"][idempotency_key] = {
+            "fingerprint": fingerprint,
+            "result": copy.deepcopy(report),
+        }
+        _write_registry(value)
+
+
+def complete_publication(
+    draft_id: str,
+    report: dict[str, Any],
+    *,
+    expected_digest: str,
+    idempotency_key: str,
+    fingerprint: str,
+) -> dict[str, Any]:
+    with store.exclusive_lock(registry_lock_path()):
+        value = load_registry()
+        record = value["drafts"].get(draft_id)
+        if not isinstance(record, dict):
+            raise DraftNotFound(draft_id)
+        if record.get("status") != "publishing":
+            raise InvalidTransition(
+                f"cannot complete publication from {record.get('status')}"
+            )
+        if record.get("digest") != expected_digest:
+            raise DigestConflict(
+                f"draft digest changed: expected {expected_digest}, recorded {record.get('digest')}"
+            )
+        existing = value["idempotency"].get(idempotency_key)
+        if existing and existing.get("fingerprint") != fingerprint:
+            raise RegistryError(
+                f"idempotency key reused with different arguments: {idempotency_key}"
+            )
+        record["status"] = "published"
+        record["updated_at"] = _now()
+        record.setdefault("status_details", {}).update(copy.deepcopy(report))
+        value["deployments"][report["transaction_id"]] = copy.deepcopy(report)
+        value["idempotency"][idempotency_key] = {
+            "fingerprint": fingerprint,
+            "result": copy.deepcopy(report),
+        }
+        _write_registry(value)
+        updated = copy.deepcopy(record)
+    _audit("draft_published", updated)
+    return updated
+
+
 def approve_draft(draft_id: str, *, expected_digest: str) -> dict[str, Any]:
     with store.exclusive_lock(registry_lock_path()):
         value = load_registry()
