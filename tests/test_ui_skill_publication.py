@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import ui_skill_publisher as publisher
+import ui_skill_discovery as discovery
 import ui_skill_registry as registry
 
 
@@ -193,6 +195,86 @@ class UISkillPublicationTest(unittest.TestCase):
             publisher.publish(
                 self.approved, targets=different, idempotency_key="stable-key"
             )
+
+    def test_discovery_classifies_managed_unknown_ignored_and_drifted(self) -> None:
+        root = self.temp / "scan/codex"
+        fixture = ROOT / "tests/fixtures/ui_skills/minimal"
+        managed_path = root / "managed-ui"
+        unknown_path = root / "unknown-ui"
+        ignored_path = root / "ignored-ui"
+        drifted_path = root / "drifted-ui"
+        for path in (managed_path, unknown_path, ignored_path, drifted_path):
+            shutil.copytree(fixture, path)
+        (unknown_path / "extra").write_text("unknown", encoding="utf-8")
+        (ignored_path / "extra").write_text("ignored", encoding="utf-8")
+        (drifted_path / "extra").write_text("changed", encoding="utf-8")
+        managed_digest = registry.package_digest(managed_path)
+        ignored_digest = registry.package_digest(ignored_path)
+        before = {path: path.stat().st_mtime_ns for path in root.rglob("*")}
+
+        results = discovery.scan(
+            {"codex": [root]},
+            {
+                "targets": {
+                    "codex": {
+                        "managed-ui": managed_digest,
+                        "drifted-ui": "0" * 64,
+                    }
+                },
+                "ignored_fingerprints": [ignored_digest],
+            },
+        )
+
+        statuses = {item["name"]: item["status"] for item in results}
+        self.assertEqual(statuses["managed-ui"], "managed")
+        self.assertEqual(statuses["unknown-ui"], "unmanaged_discovered")
+        self.assertEqual(statuses["ignored-ui"], "unmanaged_ignored")
+        self.assertEqual(statuses["drifted-ui"], "drifted")
+        after = {path: path.stat().st_mtime_ns for path in root.rglob("*")}
+        self.assertEqual(before, after)
+
+    def test_changed_ignored_fingerprint_is_visible_again(self) -> None:
+        root = self.temp / "scan/claude"
+        skill = root / "sample-ui"
+        shutil.copytree(ROOT / "tests/fixtures/ui_skills/minimal", skill)
+        old_digest = registry.package_digest(skill)
+        discovery.ignore_fingerprint(old_digest)
+        (skill / "changed").write_text("new", encoding="utf-8")
+
+        results = discovery.scan_and_persist({"claude": [root]}, {"targets": {}})
+
+        self.assertEqual(results[0]["status"], "unmanaged_discovered")
+        state = discovery.load_discovery_state()
+        self.assertEqual(state["ignored_fingerprints"], [old_digest])
+
+    def test_duplicate_name_with_different_digest_is_flagged(self) -> None:
+        first_root = self.temp / "scan/first"
+        second_root = self.temp / "scan/second"
+        first = first_root / "same-name"
+        second = second_root / "same-name"
+        fixture = ROOT / "tests/fixtures/ui_skills/minimal"
+        shutil.copytree(fixture, first)
+        shutil.copytree(fixture, second)
+        (second / "changed").write_text("different", encoding="utf-8")
+
+        results = discovery.scan(
+            {"codex": [first_root, second_root]}, {"targets": {}}
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(item["name_conflict"] for item in results))
+
+    def test_discovery_ignores_malformed_managed_target_entries(self) -> None:
+        root = self.temp / "scan/malformed"
+        shutil.copytree(
+            ROOT / "tests/fixtures/ui_skills/minimal", root / "sample-ui"
+        )
+
+        results = discovery.scan(
+            {"codex": [root]}, {"targets": {"codex": ["not", "a", "mapping"]}}
+        )
+
+        self.assertEqual(results[0]["status"], "unmanaged_discovered")
 
 
 if __name__ == "__main__":
