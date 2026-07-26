@@ -1,0 +1,4 @@
+interface:
+  display_name: "UI Design Workflow"
+  short_description: "Design approval workflow for visible interfaces"
+  default_prompt: "Use $ui-design-workflow to design and approve this interface before implementation."

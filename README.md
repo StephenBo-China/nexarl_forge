@@ -8,6 +8,11 @@ rejecting project and personal memory candidates.
 The service is designed to be copied to another computer and used directly by
 Codex. It has no third-party Python dependencies; Python 3.10+ is enough.
 
+## 中文使用说明
+
+完整的中文安装、操作、UI 设计审批、UI Skill 管理和故障排查说明，请参阅
+[记忆审核台中文版使用说明书](docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md)。
+
 ## What This Project Provides
 
 - A dark local web console at `http://127.0.0.1:8897/`.
@@ -283,6 +288,177 @@ Reject obvious noisy personal candidates:
 ```bash
 python3 scripts/memory_review.py reject-noise-personal --apply
 ```
+
+### Bootstrap Managed UI Design Skills
+
+Create reviewable, validated drafts for the manager workflow and the two
+initial UI design skills:
+
+```bash
+python3 scripts/memory_review.py ui-skill bootstrap ui-design-workflow \
+  --idempotency-key bootstrap-ui-design-workflow-001
+
+python3 scripts/memory_review.py ui-skill bootstrap frontend-design \
+  --revision b29e7cf65e5cb78a5ac33d582270551bc74a14eb \
+  --idempotency-key bootstrap-frontend-design-001
+
+python3 scripts/memory_review.py ui-skill bootstrap ui-ux-pro-max \
+  --release v2.11.0 \
+  --revision 6142b073958df645d0fb27e682428e69599386dc \
+  --cli-version 2.11.0 \
+  --expected-npm-shasum 2ff4d811cf1dded593b9d1f37bad65ffa80cb87c \
+  --idempotency-key bootstrap-ui-ux-pro-max-001
+```
+
+Bootstrap never approves or publishes a skill. Each draft remains visible in
+the review console until the user explicitly approves and publishes it. The UI
+UX Pro Max bootstrap needs normal network and sandbox approval to inspect npm
+metadata and run its pinned generator. Generation happens in temporary
+directories; publication later copies the approved Codex or Claude variant and
+does not invoke `npx`.
+
+## UI Design Control Plane
+
+The `UI 设计审批`, `设计偏好`, and `UI Skills` console tabs form one shared
+control plane for Codex and Claude Code. For Web, App, and mini-program work,
+agents may research, read code, and create design artifacts before approval,
+but the managed `PreToolUse` hook blocks writes to formal frontend paths. Pure
+backend and non-visual work bypasses this gate.
+
+### Storage, backup, and recovery
+
+Global manager state lives below `UI_DESIGN_HOME` (default
+`~/.codex/ui_design`): global preferences, immutable Skill drafts and versions,
+deployment reports, discovery state, audit records, and idempotency results.
+Each project owns its gate state below `codex/ui_design/`:
+
+```text
+codex/ui_design/config.json
+codex/ui_design/preferences.json
+codex/ui_design/active-skills.json
+codex/ui_design/approvals.json
+codex/ui_design/audit.jsonl
+codex/ui_design/effective-context.json
+codex/ui_design/design-packages/<task-id>/
+```
+
+Managed installs target `CODEX_UI_SKILLS_DIR` and `CLAUDE_UI_SKILLS_DIR`
+(defaults `~/.codex/skills` and `~/.claude/skills`). Tests should always point
+all three environment variables to disposable directories. Atomic writes and
+two-target publication use staging directories; upgrades preserve changed
+managed hooks as timestamped `.bak.*` files. To recover, disable the hard gate,
+inspect `audit.jsonl` and deployment reports, restore the relevant backup, then
+run the hook smoke test before re-enabling. Never delete an unmanaged Skill as
+part of recovery.
+
+### Preferences and gate modes
+
+Global preferences are a complete schema inherited by every project. Project
+overrides use `inherit`, `replace`, `append`, or `clear`; the console shows the
+effective value and source of every field.
+
+Projects choose one approval mode:
+
+- `design_package` (default): approval is bound to one task, package digest,
+  version, and declared file patterns. A changed design document invalidates
+  the approval; undeclared frontend paths remain blocked.
+- `project_global`: a designated baseline design package unlocks all configured
+  formal frontend paths until explicit relock, mode change, or baseline digest
+  change. Switching modes always relocks.
+
+Changing path configuration sets `hard_gate_enabled` to false and resets both
+hook smoke-test results. Enabling the hard gate requires non-empty formal and
+design-artifact paths, explicit confirmation, and passing isolated smoke tests
+for both installed hooks. Generated and test-artifact path lists remain
+separate from formal frontend paths.
+
+```bash
+python3 scripts/memory_review.py ui-design project-config show --project /path/to/repo
+python3 scripts/memory_review.py ui-design project-config set-paths \
+  --project /path/to/repo --json-file /tmp/ui-paths.json \
+  --idempotency-key paths-001
+python3 scripts/memory_review.py ui-design project-config set-mode \
+  --project /path/to/repo --mode design_package --confirmed \
+  --idempotency-key mode-001
+python3 scripts/memory_review.py ui-design project-config enable-hard-gate \
+  --project /path/to/repo --confirmed --idempotency-key gate-001
+python3 scripts/memory_review.py ui-design project-config relock \
+  --project /path/to/repo --confirmed --idempotency-key relock-001
+```
+
+### Design-package lifecycle
+
+A package manifest declares pages, components, design files, and allowed formal
+frontend patterns. `design-brief.md`, `interaction-spec.md`, and
+`responsive-spec.md` are required. Approvals bind the normalized manifest and
+all declared file bytes to one SHA-256 digest.
+
+```bash
+python3 scripts/memory_review.py ui-design package create \
+  --project /path/to/repo --manifest /tmp/design-package.json \
+  --idempotency-key package-create-001
+python3 scripts/memory_review.py ui-design package list --project /path/to/repo
+python3 scripts/memory_review.py ui-design package approve \
+  --project /path/to/repo --task checkout-redesign --digest <sha256> \
+  --confirmed --idempotency-key package-approve-001
+python3 scripts/memory_review.py ui-design package request-revision \
+  --project /path/to/repo --task checkout-redesign \
+  --reason "Add touch error states" \
+  --idempotency-key package-request-revision-001
+python3 scripts/memory_review.py ui-design package invalidate \
+  --project /path/to/repo --task checkout-redesign --reason "Scope changed" \
+  --confirmed --idempotency-key package-invalidate-001
+```
+
+Use `package revise` with a reviewed replacement manifest. In
+`project_global` mode, set `project_global_baseline_task` in the reviewed
+project config and use `ui-design baseline approve` with `--confirmed`. Reject,
+invalidate, mode-change, and hard-gate actions require explicit confirmation.
+
+### UI Skill intake and publication
+
+The manager accepts editor text, a local directory, a ZIP archive, or a pinned
+GitHub repository/path/revision. Imported code is staged and statically
+validated; package scripts are reported but never executed. An agent-created UI
+Skill therefore appears as a visible draft in the console, where the user can
+inspect `SKILL.md`, license, scripts, digest, and diff before approval.
+
+The normal workflow is import → validate → approve → atomic publish to both
+agents. Use `request-revision` to return a draft, `rollback` to restore an
+approved immutable version on both targets, and `disable` to remove the managed
+version from both targets transactionally. Bootstrap creates reviewable drafts
+for `ui-design-workflow`, pinned `frontend-design`, and pinned UI UX Pro Max; it
+does not approve or publish them. Discovery is read-only: unmanaged, ignored,
+conflicting, or drifted Skill directories are reported without modification.
+
+Every mutation requires a unique `--idempotency-key`. Retrying the exact same
+operation returns the recorded result; reusing the key with different arguments
+returns a conflict. Digest conflicts must be resolved by reviewing the current
+content and approving its new digest, never by bypassing the check.
+
+### Hook trust and client boundaries
+
+The project initializer installs dependency-free manager-owned hooks for both
+clients and merges their configuration without replacing unrelated hooks.
+After hook or Skill changes, start fresh Codex and Claude Code sessions so each
+client reloads its configuration. Keep `hard_gate_enabled` false if either
+client fails the block contract.
+
+#### Real-client smoke test
+
+A Real-client smoke test is intentionally separate from deterministic tests. It
+requires explicit user approval before writing real home Skill directories or
+starting real clients. Publish the three approved Skills to both clients, start
+fresh sessions, compare visible names and versions, then use a disposable
+project to prove that design-artifact writes are allowed and formal frontend
+writes are denied before approval. Record the exact hook payload and decision;
+do not enable the real hard gate when either client behaves differently.
+
+The control plane never authorizes a main/master merge, production deployment,
+or write to real Codex/Claude Skill directories by itself. Those remain separate
+user approval boundaries. Prepared forward-test prompts are stored under
+`docs/superpowers/forward-tests/` and must not be dispatched to subagents or
+real clients without explicit authorization.
 
 ## How To Associate Codex With This Project
 

@@ -8,6 +8,7 @@ import json
 import sys
 
 import memory_review_queue as review
+import ui_design_cli
 
 
 def print_items(items: list[dict], status: str | None = None) -> None:
@@ -21,7 +22,7 @@ def print_items(items: list[dict], status: str | None = None) -> None:
         )
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Review shared memory candidates")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -66,7 +67,18 @@ def main() -> int:
     sub.add_parser("refresh")
     sub.add_parser("serve")
 
+    ui_design_cli.register_parsers(sub)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+
     args = parser.parse_args()
+
+    if args.command in ui_design_cli.COMMANDS:
+        print(json.dumps(ui_design_cli.dispatch(args), ensure_ascii=False, indent=2))
+        return 0
 
     if args.command == "list":
         queue = review.load_queue(refresh=True)

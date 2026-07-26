@@ -290,6 +290,21 @@ document before substantial development.
 - Run configured finish validation before claiming the Loop feature is ready.
 - Subagents and parallel agents require explicit user authorization and Loop-safe
   isolated worktrees.
+
+## UI Design Approval Workflow
+
+For every visible-interface task (web, app, or mini-program UI), read all of:
+
+- `codex/ui_design/config.json`
+- `codex/ui_design/effective-context.json`
+- `codex/ui_design/active-skills.json`
+- `codex/ui_design/approvals.json`
+
+Use the effective design preferences, active UI skills, current design package,
+and approval state before implementation. Before explicit user approval, agents
+may research, read code, and create design artifacts, prototypes, and interaction
+specifications, but must not modify formal frontend business code. Pure backend
+or other no-interface tasks bypass this UI design workflow.
 {MANAGED_RULE_END}"""
 
 
