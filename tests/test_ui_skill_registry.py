@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -252,6 +253,55 @@ description: Broken duplicate skill.
         self.assertEqual(requests[0]["revision"], sources.FRONTEND_DESIGN_REVISION)
         self.assertEqual(result["variants"]["common"]["path"], ".")
         self.assertEqual(len(result["variants"]["common"]["digest"]), 64)
+
+    def test_ui_ux_generator_uses_offline_agent_layout_and_copies_only_requested_skill(self) -> None:
+        target = self.temp / "generated" / "codex"
+        calls = []
+
+        def run(command, *, cwd, check, capture_output, text):
+            calls.append(
+                {
+                    "command": command,
+                    "cwd": pathlib.Path(cwd),
+                    "check": check,
+                    "capture_output": capture_output,
+                    "text": text,
+                }
+            )
+            agent = command[command.index("--ai") + 1]
+            agent_root = pathlib.Path(cwd) / (
+                ".codex/skills" if agent == "codex" else ".claude/skills"
+            )
+            skill_root = agent_root / "ui-ux-pro-max"
+            skill_root.mkdir(parents=True)
+            (skill_root / "SKILL.md").write_text(
+                "---\nname: ui-ux-pro-max\ndescription: Generated UI UX guidance.\n---\n",
+                encoding="utf-8",
+            )
+            unrelated = agent_root / "unrelated-generated-skill"
+            unrelated.mkdir()
+            (unrelated / "SKILL.md").write_text(
+                "---\nname: unrelated\ndescription: Must not be copied.\n---\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="generated", stderr="")
+
+        request = {
+            "agent": "codex",
+            "package": sources.UI_UX_PRO_MAX_CLI_PACKAGE,
+            "cli_version": sources.UI_UX_PRO_MAX_CLI_VERSION,
+        }
+        with mock.patch.object(sources.subprocess, "run", side_effect=run):
+            result = sources._run_ui_ux_generator(request, target)
+
+        self.assertEqual(len(calls), 1)
+        command = calls[0]["command"]
+        self.assertIn("--offline", command)
+        self.assertNotIn("--output", command)
+        self.assertNotEqual(calls[0]["cwd"], target.parent)
+        self.assertTrue((target / "SKILL.md").is_file())
+        self.assertFalse((target.parent / "unrelated-generated-skill").exists())
+        self.assertEqual(result["stdout_summary"], "generated")
 
     def test_ui_ux_bootstrap_stages_variants_and_publication_never_runs_cli(self) -> None:
         bundle = self.temp / "ui-ux-pro-max"

@@ -319,24 +319,49 @@ def _npm_metadata(package: str, version: str) -> dict[str, Any]:
 
 
 def _run_ui_ux_generator(request: dict[str, str], target: pathlib.Path) -> dict[str, Any]:
-    target.parent.mkdir(parents=True, exist_ok=True)
+    generated_locations = {
+        "codex": pathlib.Path(".codex/skills/ui-ux-pro-max"),
+        "claude": pathlib.Path(".claude/skills/ui-ux-pro-max"),
+    }
+    agent = request["agent"]
+    if agent not in generated_locations:
+        raise SourceError(f"unsupported UI UX Pro Max agent: {agent}")
     command = [
         "npx",
         "--yes",
         f"{request['package']}@{request['cli_version']}",
         "init",
         "--ai",
-        request["agent"],
-        "--output",
-        str(target),
+        agent,
+        "--offline",
     ]
-    completed = subprocess.run(
-        command,
-        cwd=target.parent,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="ui-ux-pro-max-cli-") as value:
+        workspace = pathlib.Path(value) / "workspace"
+        workspace.mkdir()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=workspace,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as error:
+            detail = (error.stderr or error.stdout or str(error))[-2_000:]
+            raise SourceError(
+                f"UI UX Pro Max generator failed for {agent}: {detail}"
+            ) from error
+        generated = workspace / generated_locations[agent]
+        if not generated.is_dir():
+            raise SourceError(
+                f"UI UX Pro Max generator did not create expected {agent} skill: {generated}"
+            )
+        _copy_tree_atomically(
+            generated,
+            target,
+            max_files=DEFAULT_MAX_FILES,
+            max_bytes=DEFAULT_MAX_BYTES,
+        )
     return {
         "command": command,
         "stdout_summary": completed.stdout[-2_000:],
