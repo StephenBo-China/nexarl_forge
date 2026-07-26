@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
+import zipfile
 from unittest import mock
 
 
@@ -12,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import ui_skill_registry as registry
+import ui_skill_sources as sources
 import ui_skill_validator as validator
 
 
@@ -147,6 +150,66 @@ description: Broken duplicate skill.
         self.assertIn(
             "missing_reference", {item["code"] for item in report["errors"]}
         )
+
+    def test_local_editor_and_valid_zip_sources_create_normalized_packages(self) -> None:
+        local_destination = self.temp / "local-import"
+        editor_destination = self.temp / "editor-import"
+        zip_destination = self.temp / "zip-import"
+        archive = self.temp / "skill.zip"
+        with zipfile.ZipFile(archive, "w") as handle:
+            handle.writestr("package/SKILL.md", (self.fixture / "SKILL.md").read_bytes())
+
+        local = sources.import_local(self.fixture, local_destination)
+        editor = sources.import_editor(
+            {"SKILL.md": (self.fixture / "SKILL.md").read_text(encoding="utf-8")},
+            editor_destination,
+        )
+        zipped = sources.import_zip(archive, zip_destination)
+
+        self.assertEqual(local["type"], "local")
+        self.assertEqual(editor["type"], "editor")
+        self.assertEqual(zipped["type"], "zip")
+        for destination in (local_destination, editor_destination, zip_destination):
+            self.assertTrue((destination / "SKILL.md").is_file())
+
+    def test_zip_slip_symlink_and_limits_are_rejected_before_extraction(self) -> None:
+        bad_zip = self.temp / "bad.zip"
+        with zipfile.ZipFile(bad_zip, "w") as handle:
+            handle.writestr("../../escape", "bad")
+            handle.writestr("SKILL.md", "---\nname: bad\ndescription: bad\n---\n")
+        with self.assertRaises(sources.SourceError):
+            sources.import_zip(bad_zip, self.temp / "bad-output")
+        self.assertFalse((self.temp / "escape").exists())
+
+        symlink_zip = self.temp / "symlink.zip"
+        symlink = zipfile.ZipInfo("link")
+        symlink.create_system = 3
+        symlink.external_attr = 0o120777 << 16
+        with zipfile.ZipFile(symlink_zip, "w") as handle:
+            handle.writestr("SKILL.md", "---\nname: bad\ndescription: bad\n---\n")
+            handle.writestr(symlink, "SKILL.md")
+        with self.assertRaises(sources.SourceError):
+            sources.import_zip(symlink_zip, self.temp / "symlink-output")
+
+        with self.assertRaises(sources.SourceError):
+            sources.import_zip(
+                self.temp / "skill.zip", self.temp / "limited-output", max_files=0
+            )
+
+    def test_github_adapter_records_pinned_revision_with_injected_downloader(self) -> None:
+        destination = self.temp / "github-import"
+
+        result = sources.import_github(
+            "owner/repo",
+            "skills/sample",
+            "abc123",
+            destination,
+            downloader=lambda request, target: shutil.copytree(self.fixture, target),
+        )
+
+        self.assertEqual(result["revision"], "abc123")
+        self.assertEqual(result["repository"], "owner/repo")
+        self.assertTrue((destination / "SKILL.md").exists())
 
 
 if __name__ == "__main__":
