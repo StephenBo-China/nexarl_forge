@@ -8,6 +8,11 @@ rejecting project and personal memory candidates.
 The service is designed to be copied to another computer and used directly by
 Codex. It has no third-party Python dependencies; Python 3.10+ is enough.
 
+## 中文使用说明
+
+完整的中文安装、操作、UI 设计审批、UI Skill 管理和故障排查说明，请参阅
+[记忆审核台中文版使用说明书](docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md)。
+
 ## What This Project Provides
 
 - A dark local web console at `http://127.0.0.1:8897/`.
