@@ -3,20 +3,220 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import importlib
 import os
 import pathlib
 import re
+import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import memory_project
 import memory_review_queue as review
+import ui_design_cli
+import ui_design_preferences
+import ui_skill_publisher
+import ui_skill_registry
 
 
 HOST = review.REVIEW_HOST
 PORT = review.REVIEW_PORT
+
+
+UI_DESIGN_GET_ROUTES = {"/api/ui-design/context", "/api/ui-skills"}
+UI_DESIGN_POST_ROUTES = {
+    "/api/ui-design/preferences/global",
+    "/api/ui-design/preferences/project",
+    "/api/ui-skills/import",
+    "/api/ui-skills/validate",
+    "/api/ui-skills/request-revision",
+    "/api/ui-skills/approve",
+    "/api/ui-skills/publish",
+    "/api/ui-skills/rollback",
+    "/api/ui-skills/disable",
+    "/api/ui-skills/reject",
+    "/api/ui-skills/scan",
+    "/api/ui-skills/ignore-unmanaged",
+}
+UI_DESIGN_CONFIRMED_ROUTES = {
+    "/api/ui-skills/approve",
+    "/api/ui-skills/publish",
+    "/api/ui-skills/rollback",
+    "/api/ui-skills/disable",
+    "/api/ui-skills/reject",
+}
+
+
+def ui_design_error_status(error: Exception) -> int:
+    if isinstance(error, PermissionError):
+        return 403
+    if isinstance(
+        error,
+        (
+            ui_skill_registry.DigestConflict,
+            ui_skill_registry.InvalidTransition,
+            ui_skill_publisher.IdempotencyConflict,
+            ui_skill_publisher.TargetDigestConflict,
+        ),
+    ):
+        return 409
+    if isinstance(error, ui_skill_registry.RegistryError) and "idempotency" in str(error):
+        return 409
+    if isinstance(error, (ValueError, ui_design_preferences.PreferenceValidationError)):
+        return 400
+    return 500
+
+
+def _require_idempotency(body: dict) -> str:
+    key = body.get("idempotency_key")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("idempotency_key is required")
+    return key.strip()
+
+
+def _require_confirmation(path: str, body: dict) -> None:
+    if path in UI_DESIGN_CONFIRMED_ROUTES and body.get("confirmed") is not True:
+        raise PermissionError("explicit confirmation is required")
+
+
+def _skill_namespace(command: str, **values: object) -> argparse.Namespace:
+    defaults = {
+        "command": "ui-skill",
+        "ui_skill_command": command,
+        "draft_id": None,
+        "name": None,
+        "digest": None,
+        "reason": "",
+        "version": None,
+        "project": None,
+        "github": None,
+        "local": None,
+        "zip": None,
+        "editor_json": None,
+        "path": None,
+        "revision": None,
+        "scope": "global",
+        "targets": "codex,claude",
+        "version_label": "1.0.0",
+        "idempotency_key": None,
+    }
+    defaults.update(values)
+    return argparse.Namespace(**defaults)
+
+
+def ui_design_get(path: str, query: dict[str, object]) -> dict:
+    if path == "/api/ui-design/context":
+        raw_project = query.get("project") or str(review.PROJECT_ROOT)
+        if isinstance(raw_project, list):
+            raw_project = raw_project[0] if raw_project else ""
+        project = pathlib.Path(str(raw_project)).expanduser()
+        return {
+            "project": str(project),
+            "global_preferences": ui_design_preferences.load_global_preferences(),
+            "project_preferences": ui_design_preferences.load_project_overrides(project),
+            "effective_preferences": ui_design_preferences.effective_preferences(project),
+        }
+    if path == "/api/ui-skills":
+        raw_project = query.get("project")
+        if isinstance(raw_project, list):
+            raw_project = raw_project[0] if raw_project else None
+        scan = ui_design_cli.dispatch(
+            _skill_namespace("scan", project=str(raw_project) if raw_project else None)
+        )
+        items = []
+        for draft in ui_skill_registry.list_drafts():
+            item = ui_design_cli.dispatch(
+                _skill_namespace("show", draft_id=draft["id"])
+            )
+            deployment = ui_skill_registry.latest_deployment(item["name"])
+            applies = deployment and (
+                deployment.get("digest") == item.get("digest")
+                or (
+                    deployment.get("status") == "disabled"
+                    and item.get("status") == "published"
+                )
+            )
+            item["deployment"] = deployment if applies else None
+            item["deployment_status"] = deployment.get("status") if applies else None
+            items.append(item)
+        return {"items": items, "discovered": scan.get("items", [])}
+    raise ValueError(f"unknown UI design GET route: {path}")
+
+
+def ui_design_post(path: str, body: dict) -> dict:
+    if path not in UI_DESIGN_POST_ROUTES:
+        raise ValueError(f"unknown UI design POST route: {path}")
+    key = _require_idempotency(body)
+    _require_confirmation(path, body)
+
+    if path.startswith("/api/ui-design/preferences/"):
+        value = body.get("value")
+        if not isinstance(value, dict):
+            raise ValueError("value must be an object")
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False)
+            handle.flush()
+            command = "set-global" if path.endswith("/global") else "set-project"
+            args = argparse.Namespace(
+                command="ui-design",
+                ui_design_command="preferences",
+                preference_command=command,
+                json_file=handle.name,
+                project=body.get("project"),
+                idempotency_key=key,
+            )
+            if command == "set-project" and not body.get("project"):
+                raise ValueError("project is required")
+            return ui_design_cli.dispatch(args)
+
+    command = path.rsplit("/", 1)[-1].replace("request-revision", "request-revision")
+    values = {
+        "idempotency_key": key,
+        "project": body.get("project"),
+        "draft_id": body.get("draft_id"),
+        "name": body.get("name"),
+        "digest": body.get("digest"),
+        "reason": body.get("reason", ""),
+        "version": body.get("version"),
+    }
+    if command == "import":
+        source = body.get("source")
+        if not isinstance(source, dict):
+            raise ValueError("source must be an object")
+        source_type = source.get("type")
+        values.update(
+            {
+                "scope": body.get("scope", "global"),
+                "targets": ",".join(body.get("targets", ["codex", "claude"])),
+                "version_label": body.get("version_label", "1.0.0"),
+            }
+        )
+        if source_type == "local":
+            values["local"] = source.get("path")
+            return ui_design_cli.dispatch(_skill_namespace(command, **values))
+        if source_type == "zip":
+            values["zip"] = source.get("path")
+            return ui_design_cli.dispatch(_skill_namespace(command, **values))
+        if source_type == "github":
+            values.update(
+                github=source.get("repo"),
+                path=source.get("path"),
+                revision=source.get("revision"),
+            )
+            return ui_design_cli.dispatch(_skill_namespace(command, **values))
+        if source_type == "editor":
+            files = source.get("files")
+            if not isinstance(files, dict):
+                raise ValueError("editor source files must be an object")
+            with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as handle:
+                json.dump(files, handle, ensure_ascii=False)
+                handle.flush()
+                values["editor_json"] = handle.name
+                return ui_design_cli.dispatch(_skill_namespace(command, **values))
+        raise ValueError(f"unsupported source type: {source_type}")
+    return ui_design_cli.dispatch(_skill_namespace(command, **values))
 
 
 def project_operation(operation: str, body: dict) -> dict:
@@ -286,8 +486,8 @@ def page() -> str:
     .view-tabs { display: flex; gap: 6px; flex-wrap: wrap; padding: 3px; border: 1px solid var(--line-soft); background: #1b1b1b; border-radius: 9px; width: fit-content; }
     .view-tabs button { border: 0; background: transparent; color: var(--text-subtle); min-height: 30px; padding: 6px 10px; }
     .view-tabs button.active { background: var(--panel-hover); color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
-    .toolbar, .memory-toolbar, .project-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--line-soft); border-radius: var(--radius); background: #1b1b1b; }
-    .memory-toolbar, .project-toolbar { display: none; }
+    .toolbar, .memory-toolbar, .project-toolbar, .design-toolbar, .ui-skill-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 10px; border: 1px solid var(--line-soft); border-radius: var(--radius); background: #1b1b1b; }
+    .memory-toolbar, .project-toolbar, .design-toolbar, .ui-skill-toolbar { display: none; }
     .toolbar select { min-width: 134px; }
     .memory-toolbar input { min-width: min(360px, 72vw); }
     .project-toolbar input:first-child { min-width: min(560px, 80vw); flex: 1 1 420px; }
@@ -364,6 +564,8 @@ def page() -> str:
         <button id="reviewTab" class="active" onclick="setView('review')">待审批</button>
         <button id="memoryTab" onclick="setView('memory')">已生效记忆</button>
         <button id="projectTab" onclick="setView('projects')">项目管理</button>
+        <button id="designPreferencesTab" onclick="setView('designPreferences')">设计偏好</button>
+        <button id="uiSkillsTab" onclick="setView('uiSkills')">UI Skills</button>
         <button id="loopDocTab" onclick="setView('loopDocs')">Loop 说明</button>
         <button id="strategyTab" onclick="setView('strategy')">记忆策略</button>
       </div>
@@ -407,6 +609,16 @@ def page() -> str:
         <button onclick="previewLoopUpgradeFromInput()">预览升级 Loop</button>
         <button onclick="upgradeMemoryFromInput()">升级记忆规则/钩子</button>
       </div>
+      <div id="designToolbar" class="design-toolbar">
+        <button onclick="loadDesignPreferences()">刷新设计偏好</button>
+        <button class="primary" onclick="saveGlobalPreferences()">保存全局偏好</button>
+        <button onclick="saveProjectPreferences()">保存项目覆盖</button>
+      </div>
+      <div id="uiSkillToolbar" class="ui-skill-toolbar">
+        <button onclick="loadUISkills()">扫描并刷新</button>
+        <select id="uiSkillScope"><option value="global">全局双端</option><option value="project">当前项目双端</option></select>
+        <button class="primary" onclick="importEditorSkill()">从编辑器导入</button>
+      </div>
       <div id="counts" class="counts"></div>
     </div>
   </header>
@@ -415,6 +627,8 @@ def page() -> str:
 let queue = {items: [], counts: {}};
 let activeMemory = {sources: []};
 let projectState = {current_project: '', registry: {projects: []}, recommend_port: 8081};
+let uiDesignContext = null;
+let uiSkillState = {items: [], discovered: []};
 let currentView = 'review';
 
 function esc(s) {
@@ -497,11 +711,23 @@ function setView(view) {
   document.getElementById('reviewTab').classList.toggle('active', view === 'review');
   document.getElementById('memoryTab').classList.toggle('active', view === 'memory');
   document.getElementById('projectTab').classList.toggle('active', view === 'projects');
+  document.getElementById('designPreferencesTab').classList.toggle('active', view === 'designPreferences');
+  document.getElementById('uiSkillsTab').classList.toggle('active', view === 'uiSkills');
   document.getElementById('loopDocTab').classList.toggle('active', view === 'loopDocs');
   document.getElementById('strategyTab').classList.toggle('active', view === 'strategy');
   document.querySelector('.toolbar').style.display = view === 'review' ? 'flex' : 'none';
   document.getElementById('memoryToolbar').style.display = view === 'memory' ? 'flex' : 'none';
   document.getElementById('projectToolbar').style.display = view === 'projects' ? 'flex' : 'none';
+  document.getElementById('designToolbar').style.display = view === 'designPreferences' ? 'flex' : 'none';
+  document.getElementById('uiSkillToolbar').style.display = view === 'uiSkills' ? 'flex' : 'none';
+  if (view === 'designPreferences') {
+    loadDesignPreferences().catch(err => showMessage(err.message));
+    return;
+  }
+  if (view === 'uiSkills') {
+    loadUISkills().catch(err => showMessage(err.message));
+    return;
+  }
   if (view === 'strategy') {
     renderMemoryStrategy();
     return;
@@ -856,6 +1082,146 @@ function renderProjects(lastResult) {
       ${rows}
     </div>
   `;
+}
+
+function idempotencyKey(prefix) {
+  return `${prefix}-${crypto.randomUUID()}`;
+}
+
+async function loadDesignPreferences() {
+  const project = projectState.current_project || '';
+  uiDesignContext = await api(`/api/ui-design/context?project=${encodeURIComponent(project)}`);
+  renderDesignPreferences();
+}
+
+function renderDesignPreferences() {
+  if (currentView !== 'designPreferences' || !uiDesignContext) return;
+  const effective = uiDesignContext.effective_preferences || {value: {}, sources: {}};
+  document.getElementById('counts').innerHTML = [
+    `项目 ${uiDesignContext.project}`,
+    `覆盖字段 ${Object.keys(uiDesignContext.project_preferences || {}).length}`,
+    `有效字段来源 ${Object.keys(effective.sources || {}).length}`
+  ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
+  document.getElementById('items').innerHTML = `
+    <div class="doc-grid">
+      <section class="item">
+        <div class="item-head"><div><div class="summary">全局设计偏好</div><div class="meta">所有项目继承；保存会创建可审计备份。</div></div><span class="tag">global</span></div>
+        <textarea id="globalPreferences">${esc(JSON.stringify(uiDesignContext.global_preferences || {}, null, 2))}</textarea>
+      </section>
+      <section class="item">
+        <div class="item-head"><div><div class="summary">当前项目覆盖</div><div class="meta">支持 inherit / replace / append / clear。</div></div><span class="tag">project</span></div>
+        <textarea id="projectPreferences">${esc(JSON.stringify(uiDesignContext.project_preferences || {}, null, 2))}</textarea>
+      </section>
+    </div>
+    <section class="item">
+      <div class="item-head"><div><div class="summary">最终生效偏好</div><div class="meta">合并结果及每个字段的 global / project 来源。</div></div><span class="tag">effective</span></div>
+      <textarea readonly>${esc(JSON.stringify(effective, null, 2))}</textarea>
+    </section>`;
+}
+
+async function saveGlobalPreferences() {
+  const value = JSON.parse(document.getElementById('globalPreferences').value);
+  await api('/api/ui-design/preferences/global', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({value, idempotency_key: idempotencyKey('pref-global')})
+  });
+  showMessage('全局设计偏好已保存');
+  await loadDesignPreferences();
+}
+
+async function saveProjectPreferences() {
+  const value = JSON.parse(document.getElementById('projectPreferences').value);
+  await api('/api/ui-design/preferences/project', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({project: projectState.current_project, value, idempotency_key: idempotencyKey('pref-project')})
+  });
+  showMessage('项目设计偏好已保存');
+  await loadDesignPreferences();
+}
+
+async function loadUISkills() {
+  const project = projectState.current_project || '';
+  uiSkillState = await api(`/api/ui-skills?project=${encodeURIComponent(project)}`);
+  renderUISkills();
+}
+
+function skillActions(skill) {
+  const id = esc(skill.id);
+  const digest = esc(skill.digest);
+  const name = esc(skill.name);
+  const status = skill.deployment_status || skill.status;
+  const actions = [];
+  if (['draft', 'validated'].includes(status)) actions.push(`<button data-ui-action="validate" data-id="${id}">重新校验</button>`);
+  if (status === 'validated') actions.push(`<button class="primary" data-ui-action="approve-publish" data-id="${id}" data-digest="${digest}">批准并发布</button>`);
+  if (status === 'validated') actions.push(`<button data-ui-action="request-revision" data-id="${id}">要求修改</button>`);
+  if (['draft', 'validated', 'approved', 'publish_failed'].includes(skill.status)) actions.push(`<button class="danger" data-ui-action="reject" data-id="${id}">拒绝</button>`);
+  if (status === 'approved') actions.push(`<button class="primary" data-ui-action="publish" data-id="${id}" data-digest="${digest}">发布到双端</button>`);
+  if (['published', 'disabled'].includes(status)) actions.push(`<button data-ui-action="rollback" data-name="${name}" data-version="${esc(skill.version_id)}">回滚此版本</button>`);
+  if (status === 'published') actions.push(`<button class="danger" data-ui-action="disable" data-name="${name}">停用双端 Skill</button>`);
+  return actions.join('');
+}
+
+function renderUISkills() {
+  if (currentView !== 'uiSkills') return;
+  const skills = uiSkillState.items || [];
+  const discovered = uiSkillState.discovered || [];
+  document.getElementById('counts').innerHTML = [
+    `受管 Skill ${skills.length}`,
+    `发现目录 ${discovered.length}`,
+    `待审批 ${skills.filter(x => x.status === 'validated').length}`
+  ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
+  const editor = `<section class="item">
+    <div class="item-head"><div><div class="summary">新增 UI Skill</div><div class="meta">粘贴完整 SKILL.md；导入后先静态校验并进入审批，不会自动发布。</div></div><span class="tag">editor</span></div>
+    <textarea id="uiSkillEditor" placeholder="---&#10;name: my-ui-style&#10;description: ...&#10;---&#10;# Instructions"></textarea>
+  </section>`;
+  const managed = skills.map(skill => `<section class="item">
+    <div class="item-head"><div><div class="summary">${esc(skill.name)}</div>
+      <div class="meta">${esc(skill.id)} · ${esc(skill.deployment_status || skill.status)} · ${esc(skill.scope && skill.scope.type)} · ${esc((skill.targets || []).join(' + '))}</div>
+      <div class="label-row"><span class="tag">摘要 ${esc(skill.digest)}</span><span class="tag">来源 ${esc(JSON.stringify(skill.source || {}))}</span><span class="tag">许可证 ${esc(JSON.stringify((skill.validation_report || {}).license || '未声明'))}</span><span class="tag">脚本 ${esc(JSON.stringify((skill.validation_report || {}).scripts || []))}</span></div>
+    </div><span class="tag">${esc(skill.version_label)}</span></div>
+    <div class="content-title">SKILL.md（只读审核内容）</div>
+    <pre class="doc-section">${esc(skill.skill_md || '')}</pre>
+    <details class="memory-entry"><summary>校验报告、差异与发布详情</summary><pre>${esc(JSON.stringify({validation: skill.validation_report || {}, diff: skill.diff || null, details: skill.status_details || {}}, null, 2))}</pre></details>
+    <div class="actions">${skillActions(skill)}</div>
+  </section>`).join('');
+  const unmanaged = discovered.map(item => `<section class="item"><div class="item-head"><div><div class="summary">${esc(item.name || item.path)}</div><div class="meta">${esc(item.status)} · ${esc(item.agent)} · ${esc(item.path)}</div><div class="label-row"><span class="tag">${esc(item.digest)}</span>${item.name_conflict ? '<span class="tag warn">同名摘要冲突</span>' : ''}</div></div></div></section>`).join('');
+  document.getElementById('items').innerHTML = editor + (managed || '<div class="empty">暂无受管 UI Skill。</div>') + (unmanaged ? `<div class="section-title">未管理 Skill（只读发现）</div>${unmanaged}` : '');
+}
+
+async function importEditorSkill() {
+  const skillMD = document.getElementById('uiSkillEditor').value;
+  const scope = document.getElementById('uiSkillScope').value;
+  if (!skillMD.trim()) return showMessage('请粘贴包含 name 与 description frontmatter 的 SKILL.md');
+  await api('/api/ui-skills/import', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
+    source: {type: 'editor', files: {'SKILL.md': skillMD}}, scope, project: scope === 'project' ? projectState.current_project : null, targets: ['codex', 'claude'], idempotency_key: idempotencyKey('skill-import')
+  })});
+  showMessage('UI Skill 已导入待审批');
+  await loadUISkills();
+}
+
+async function uiSkillMutation(route, payload, dangerous, promptText) {
+  if (dangerous && !confirm(promptText || '确认执行此双端 UI Skill 操作？')) return null;
+  const result = await api(`/api/ui-skills/${route}`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...payload, confirmed: dangerous, idempotency_key: idempotencyKey(`skill-${route}`)})});
+  await loadUISkills();
+  return result;
+}
+
+async function handleUISkillAction(button) {
+  const action = button.dataset.uiAction;
+  const draft_id = button.dataset.id;
+  const digest = button.dataset.digest;
+  if (action === 'validate') await uiSkillMutation('validate', {draft_id}, false);
+  if (action === 'request-revision') await uiSkillMutation('request-revision', {draft_id, reason: prompt('请输入修改要求') || '需要修改'}, false);
+  if (action === 'reject') await uiSkillMutation('reject', {draft_id, reason: prompt('请输入拒绝原因') || ''}, true, '确认拒绝此 UI Skill 草稿？');
+  if (action === 'publish') await uiSkillMutation('publish', {draft_id, digest, project: projectState.current_project}, true, '确认原子发布到 Codex 与 Claude Code？');
+  if (action === 'approve-publish') {
+    if (!confirm('确认批准此摘要，并原子发布到 Codex 与 Claude Code？')) return;
+    await api('/api/ui-skills/approve', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, confirmed: true, idempotency_key: idempotencyKey('skill-approve')})});
+    await api('/api/ui-skills/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, project: projectState.current_project, confirmed: true, idempotency_key: idempotencyKey('skill-publish')})});
+    await loadUISkills();
+  }
+  if (action === 'rollback') await uiSkillMutation('rollback', {name: button.dataset.name, version: button.dataset.version, project: projectState.current_project}, true, '确认将 Codex 与 Claude Code 同时回滚到此版本？');
+  if (action === 'disable') await uiSkillMutation('disable', {name: button.dataset.name, project: projectState.current_project}, true, '确认同时停用 Codex 与 Claude Code 中的此 Skill？');
 }
 
 function renderMemoryStrategy() {
@@ -1315,6 +1681,11 @@ async function deleteActiveMemory(sourceId, itemId) {
 }
 
 document.getElementById('items').addEventListener('click', event => {
+  const uiSkillButton = event.target.closest('button[data-ui-action]');
+  if (uiSkillButton) {
+    handleUISkillAction(uiSkillButton).catch(err => showMessage(err.message));
+    return;
+  }
   const memoryButton = event.target.closest('button[data-memory-action]');
   if (memoryButton) {
     const sourceId = memoryButton.dataset.source;
@@ -1365,6 +1736,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path in UI_DESIGN_GET_ROUTES:
+            try:
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                self.send_json(ui_design_get(parsed.path, query))
+            except Exception as exc:  # noqa: BLE001 - local admin tool surfaces errors.
+                self.send_json({"error": str(exc)}, status=ui_design_error_status(exc))
+            return
         if parsed.path == "/health":
             self.send_json({"ok": True, "url": review.REVIEW_URL})
             return
@@ -1390,6 +1768,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         try:
+            if parsed.path in UI_DESIGN_POST_ROUTES:
+                self.send_json(ui_design_post(parsed.path, self.read_json()))
+                return
             if parsed.path == "/api/projects/register":
                 body = self.read_json()
                 payload = switch_project(body.get("project_root", ""))
@@ -1485,11 +1866,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self.send_json({"error": "not found"}, status=404)
         except Exception as exc:  # noqa: BLE001 - local admin tool should surface errors.
-            self.send_json({"error": str(exc)}, status=project_error_status(exc))
+            status = (
+                ui_design_error_status(exc)
+                if parsed.path in UI_DESIGN_POST_ROUTES
+                else project_error_status(exc)
+            )
+            self.send_json({"error": str(exc)}, status=status)
 
 
 def main() -> int:
     review.build_queue()
+    try:
+        ui_design_get("/api/ui-skills", {})
+    except Exception:
+        pass
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Memory review server running at {review.REVIEW_URL}")
     print("Press Ctrl+C to stop.")

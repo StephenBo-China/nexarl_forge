@@ -79,6 +79,7 @@ def register_parsers(sub: argparse._SubParsersAction) -> None:
     _idempotency_argument(disable)
     scan = skill_sub.add_parser("scan")
     scan.add_argument("--project")
+    scan.add_argument("--idempotency-key")
     ignore = skill_sub.add_parser("ignore-unmanaged")
     ignore.add_argument("digest")
     _idempotency_argument(ignore)
@@ -340,6 +341,13 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 idempotency_key=args.idempotency_key,
             )
         if command == "scan":
+            if args.idempotency_key:
+                return _idempotent(
+                    args.idempotency_key,
+                    "ui-skill.scan",
+                    {"project": args.project},
+                    lambda: _scan(args),
+                )
             return _scan(args)
         if command == "ignore-unmanaged":
             return _idempotent(
