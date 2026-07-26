@@ -698,6 +698,39 @@ def page() -> str:
     .doc-section pre { margin: 10px 0 0; padding: 12px; overflow: auto; white-space: pre-wrap; word-break: break-word; color: var(--text-subtle); background: #191919; border: 1px solid var(--line-soft); border-radius: var(--radius); font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
     .doc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; align-items: start; }
     .section-title { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 18px 0 10px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .skill-wizard { max-width: 720px; margin: 0 auto 18px; padding: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+    .skill-wizard[hidden] { display: none; }
+    .skill-wizard-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+    .skill-wizard-head h2 { margin: 0 0 5px; font-size: 18px; }
+    .skill-wizard-head p { margin: 0; color: var(--muted); line-height: 1.55; }
+    .skill-wizard-steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 0; margin: 0 0 18px; list-style: none; }
+    .skill-wizard-step { min-height: 44px; display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--line-soft); border-radius: 7px; color: var(--muted); background: #1b1b1b; }
+    .skill-wizard-step[aria-current="step"] { color: var(--text); border-color: #696969; background: #303030; }
+    .skill-step-number { width: 24px; height: 24px; flex: 0 0 24px; display: grid; place-items: center; border-radius: 999px; border: 1px solid currentColor; font-size: 12px; font-weight: 700; }
+    .skill-source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-top: 14px; }
+    .skill-source-card { min-height: 92px; padding: 14px; text-align: left; display: grid; align-content: start; gap: 5px; }
+    .skill-source-card[aria-checked="true"] { border-color: #d0d0d0; background: #303030; box-shadow: inset 0 0 0 1px #d0d0d0; }
+    .skill-source-card strong { color: var(--text); }
+    .skill-source-card span { color: var(--muted); line-height: 1.45; }
+    .skill-fields { display: grid; gap: 13px; }
+    .skill-field { display: grid; gap: 6px; }
+    .skill-field label, .skill-field legend { color: var(--text-subtle); font-size: 12px; font-weight: 650; }
+    .skill-field input, .skill-field select, .skill-field textarea { width: 100%; border: 1px solid var(--line); background: var(--field); color: var(--text); border-radius: 7px; padding: 9px 10px; outline: none; }
+    .skill-field textarea { min-height: 210px; font: 13px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
+    .skill-field-help { color: var(--muted); font-size: 12px; line-height: 1.5; }
+    .skill-field-error, .skill-submit-error { color: var(--danger); font-size: 12px; line-height: 1.5; }
+    .skill-error-summary { margin-bottom: 12px; padding: 9px 11px; color: var(--danger); background: var(--danger-bg); border: 1px solid #684040; border-radius: 7px; line-height: 1.5; }
+    .skill-targets { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px 0 0; border: 0; }
+    .skill-targets label { display: inline-flex; align-items: center; gap: 7px; min-height: 44px; cursor: pointer; }
+    .skill-review { display: grid; border: 1px solid var(--line-soft); border-radius: 7px; overflow: hidden; }
+    .skill-review-row { display: grid; grid-template-columns: minmax(120px, .35fr) minmax(0, 1fr); gap: 14px; padding: 10px 12px; border-bottom: 1px solid var(--line-soft); }
+    .skill-review-row:last-child { border-bottom: 0; }
+    .skill-review-label { color: var(--muted); }
+    .skill-review-value { color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .skill-safety-note { margin-top: 14px; padding: 11px 12px; color: #ffd08a; background: var(--warning-bg); border-left: 3px solid #b78a45; border-radius: 5px; line-height: 1.6; }
+    .skill-wizard-actions { display: flex; justify-content: space-between; gap: 10px; margin-top: 18px; }
+    .skill-wizard-actions-end { display: flex; gap: 8px; margin-left: auto; }
+    button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     @media (max-width: 760px) {
       header { padding: 10px 12px; }
       .topbar { align-items: flex-start; flex-direction: column; }
@@ -706,6 +739,18 @@ def page() -> str:
       main { padding: 14px 12px 32px; }
       .item-head, .memory-source-head { grid-template-columns: 1fr; display: grid; }
       .actions button, .toolbar button, .project-toolbar button { flex: 1 1 auto; }
+      .skill-wizard { padding: 14px; }
+      .skill-wizard-head { align-items: stretch; }
+      .skill-wizard-steps { gap: 5px; }
+      .skill-wizard-step { display: grid; justify-items: center; align-content: center; padding: 7px 4px; text-align: center; font-size: 11px; }
+      .skill-source-grid { grid-template-columns: 1fr; }
+      .skill-review-row { grid-template-columns: 1fr; gap: 4px; }
+      .skill-wizard-actions { flex-direction: column-reverse; }
+      .skill-wizard-actions-end { width: 100%; flex-direction: column-reverse; }
+      .skill-wizard-actions button, .skill-wizard-actions-end button { width: 100%; min-height: 44px; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .skill-source-card, .skill-wizard-step { transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease; }
     }
   </style>
 </head>
@@ -788,13 +833,18 @@ def page() -> str:
       </div>
       <div id="uiSkillToolbar" class="ui-skill-toolbar">
         <button onclick="loadUISkills()">扫描并刷新</button>
-        <select id="uiSkillScope"><option value="global">全局双端</option><option value="project">当前项目双端</option></select>
-        <button class="primary" onclick="importEditorSkill()">从编辑器导入</button>
+        <button class="primary" onclick="openUISkillImportWizard()">导入 UI Skill</button>
       </div>
       <div id="counts" class="counts"></div>
     </div>
   </header>
-  <main id="items"></main>
+  <main>
+    <section id="uiSkillImportWizard" class="skill-wizard" role="dialog" aria-labelledby="uiSkillWizardTitle" hidden>
+      <div id="uiSkillWizardLive" class="meta" aria-live="polite"></div>
+      <div id="uiSkillWizardContent"></div>
+    </section>
+    <div id="items"></div>
+  </main>
 <script>
 let queue = {items: [], counts: {}};
 let activeMemory = {sources: []};
@@ -802,6 +852,7 @@ let projectState = {current_project: '', registry: {projects: []}, recommend_por
 let uiDesignContext = null;
 let uiDesignApprovalState = {config: {}, gate_status: {}, packages: [], audit: []};
 let uiSkillState = {items: [], discovered: []};
+let uiSkillWizard = defaultUISkillWizardState();
 let currentView = 'review';
 
 function esc(s) {
@@ -1438,6 +1489,346 @@ async function handleUIDesignApprovalAction(button) {
   if (action === 'invalidate') await uiDesignApprovalMutation('packages/invalidate', {task_id, reason: prompt('请输入失效原因') || '范围已变化'}, true, '确认让此设计包审批立即失效？');
 }
 
+function defaultUISkillWizardState() {
+  return {
+    open: false,
+    step: 1,
+    sourceType: '',
+    fields: {
+      skillMD: '',
+      localPath: '',
+      zipPath: '',
+      githubRepo: '',
+      githubPath: '',
+      revision: '',
+      scope: 'global',
+      versionLabel: '1.0.0',
+      codex: true,
+      claude: true
+    },
+    errors: {},
+    submitting: false,
+    dirty: false,
+    idempotencyKey: idempotencyKey('skill-import')
+  };
+}
+
+function clearUISkillWizardLive() {
+  const live = document.getElementById('uiSkillWizardLive');
+  if (live) live.textContent = '';
+}
+
+function wizardError(name) {
+  const message = uiSkillWizard.errors[name];
+  return message ? `<div id="${name}Error" class="skill-field-error">${esc(message)}</div>` : '';
+}
+
+function wizardErrorLink(name) {
+  return uiSkillWizard.errors[name] ? ` aria-invalid="true" aria-describedby="${name}Error"` : '';
+}
+
+function wizardSteps() {
+  const labels = ['1 选择来源', '2 配置导入', '3 确认并校验'];
+  return `<ol class="skill-wizard-steps" aria-label="导入进度">${labels.map((label, index) => {
+    const number = index + 1;
+    const current = number === uiSkillWizard.step ? ' aria-current="step"' : '';
+    return `<li class="skill-wizard-step"${current}><span class="skill-step-number">${number}</span><span>${label}</span></li>`;
+  }).join('')}</ol>`;
+}
+
+function openUISkillImportWizard() {
+  uiSkillWizard = defaultUISkillWizardState();
+  clearUISkillWizardLive();
+  uiSkillWizard.open = true;
+  renderUISkillImportWizard();
+  const wizard = document.getElementById('uiSkillImportWizard');
+  wizard.scrollIntoView({behavior: 'smooth', block: 'start'});
+  document.getElementById('uiSkillWizardTitle').focus();
+}
+
+function closeUISkillImportWizard(force = false) {
+  if (uiSkillWizard.submitting && !force) return;
+  if (!force && uiSkillWizard.dirty && !confirm('确认放弃尚未导入的 UI Skill 信息？')) return;
+  uiSkillWizard = defaultUISkillWizardState();
+  clearUISkillWizardLive();
+  renderUISkillImportWizard();
+  const trigger = document.querySelector('#uiSkillToolbar button.primary');
+  if (trigger) trigger.focus();
+}
+
+function selectUISkillSource(sourceType) {
+  const allowed = ['editor', 'local', 'zip', 'github'];
+  if (!allowed.includes(sourceType) || uiSkillWizard.submitting) return;
+  if (uiSkillWizard.sourceType && uiSkillWizard.sourceType !== sourceType) {
+    for (const name of ['skillMD', 'localPath', 'zipPath', 'githubRepo', 'githubPath', 'revision']) {
+      uiSkillWizard.fields[name] = '';
+    }
+  }
+  uiSkillWizard.sourceType = sourceType;
+  uiSkillWizard.errors = {};
+  uiSkillWizard.dirty = true;
+  renderUISkillImportWizard();
+}
+
+function setUISkillWizardField(name, value) {
+  if (!(name in uiSkillWizard.fields) || uiSkillWizard.submitting) return;
+  uiSkillWizard.fields[name] = value;
+  if (name === 'codex' || name === 'claude') {
+    if (!uiSkillWizard.fields.codex && !uiSkillWizard.fields.claude) {
+      uiSkillWizard.errors.targets = '至少选择 Codex 或 Claude Code 其中一个发布目标。';
+    } else {
+      delete uiSkillWizard.errors.targets;
+    }
+    renderUISkillImportWizard();
+  } else {
+    delete uiSkillWizard.errors[name];
+  }
+  uiSkillWizard.dirty = true;
+}
+
+function wizardErrorSummary() {
+  const count = Object.keys(uiSkillWizard.errors).filter(name => name !== 'submit').length;
+  return count ? `<div class="skill-error-summary" role="alert">请修正以下字段后继续（${count} 项）。</div>` : '';
+}
+
+function sourceSelectionMarkup() {
+  const options = [
+    ['editor', '编辑器', '粘贴完整 SKILL.md'],
+    ['local', '本地目录', '输入包含 SKILL.md 的本机绝对路径'],
+    ['zip', 'ZIP', '输入本机 ZIP 文件绝对路径'],
+    ['github', 'GitHub', '填写仓库、Skill 路径和固定 revision']
+  ];
+  return `<div class="skill-source-grid" role="radiogroup" aria-label="Skill 来源">${options.map(([value, title, detail]) => `
+    <button type="button" class="skill-source-card" role="radio" aria-checked="${uiSkillWizard.sourceType === value}" data-skill-source="${value}" onclick="selectUISkillSource('${value}')">
+      <strong>${title}</strong><span>${detail}</span>
+    </button>`).join('')}</div>${wizardError('sourceType')}`;
+}
+
+function sourceFieldsMarkup() {
+  const fields = uiSkillWizard.fields;
+  if (uiSkillWizard.sourceType === 'editor') {
+    return `<div class="skill-field">
+      <label for="uiSkillEditor">完整 SKILL.md *</label>
+      <textarea id="uiSkillEditor" oninput="setUISkillWizardField('skillMD', this.value)"${wizardErrorLink('skillMD')} placeholder="---&#10;name: my-ui-style&#10;description: ...&#10;---&#10;# Instructions">${esc(fields.skillMD)}</textarea>
+      <div class="skill-field-help">frontmatter 至少包含 name 与 description。</div>${wizardError('skillMD')}
+    </div>`;
+  }
+  if (uiSkillWizard.sourceType === 'local') {
+    return `<div class="skill-field">
+      <label for="uiSkillLocalPath">本地 Skill 目录绝对路径 *</label>
+      <input id="uiSkillLocalPath" value="${esc(fields.localPath)}" oninput="setUISkillWizardField('localPath', this.value)"${wizardErrorLink('localPath')} placeholder="/Users/.../my-ui-skill">
+      <div class="skill-field-help">目录内必须包含 SKILL.md；文件不会上传。</div>${wizardError('localPath')}
+    </div>`;
+  }
+  if (uiSkillWizard.sourceType === 'zip') {
+    return `<div class="skill-field">
+      <label for="uiSkillZipPath">本地 ZIP 绝对路径 *</label>
+      <input id="uiSkillZipPath" value="${esc(fields.zipPath)}" oninput="setUISkillWizardField('zipPath', this.value)"${wizardErrorLink('zipPath')} placeholder="/Users/.../my-ui-skill.zip">
+      <div class="skill-field-help">审核台读取本机 ZIP 并执行路径安全与体积校验；文件不会上传。</div>${wizardError('zipPath')}
+    </div>`;
+  }
+  return `<div class="skill-field">
+      <label for="uiSkillGithubRepo">GitHub 仓库 *</label>
+      <input id="uiSkillGithubRepo" value="${esc(fields.githubRepo)}" oninput="setUISkillWizardField('githubRepo', this.value)"${wizardErrorLink('githubRepo')} placeholder="owner/repository">
+      ${wizardError('githubRepo')}
+    </div>
+    <div class="skill-field">
+      <label for="uiSkillGithubPath">仓库内 Skill 路径 *</label>
+      <input id="uiSkillGithubPath" value="${esc(fields.githubPath)}" oninput="setUISkillWizardField('githubPath', this.value)"${wizardErrorLink('githubPath')} placeholder="skills/my-ui-skill">
+      ${wizardError('githubPath')}
+    </div>
+    <div class="skill-field">
+      <label for="uiSkillGithubRevision">完整 revision *</label>
+      <input id="uiSkillGithubRevision" value="${esc(fields.revision)}" oninput="setUISkillWizardField('revision', this.value)"${wizardErrorLink('revision')} placeholder="40 位 Git 提交哈希">
+      <div class="skill-field-help">必须固定到完整提交哈希，不能使用 main、分支名或浮动标签。</div>${wizardError('revision')}
+    </div>`;
+}
+
+function configurationMarkup() {
+  const fields = uiSkillWizard.fields;
+  return `<div class="skill-fields">
+    ${sourceFieldsMarkup()}
+    <div class="skill-field">
+      <label for="uiSkillScope">作用域 *</label>
+      <select id="uiSkillScope" onchange="setUISkillWizardField('scope', this.value)"${wizardErrorLink('scope')}>
+        <option value="global"${fields.scope === 'global' ? ' selected' : ''}>全局</option>
+        <option value="project"${fields.scope === 'project' ? ' selected' : ''}>当前项目：${esc(projectState.current_project || '未选择')}</option>
+      </select>${wizardError('scope')}
+    </div>
+    <div class="skill-field">
+      <label for="uiSkillVersionLabel">版本标签 *</label>
+      <input id="uiSkillVersionLabel" value="${esc(fields.versionLabel)}" oninput="setUISkillWizardField('versionLabel', this.value)"${wizardErrorLink('versionLabel')} placeholder="1.0.0">
+      ${wizardError('versionLabel')}
+    </div>
+    <fieldset class="skill-field skill-targets"${uiSkillWizard.errors.targets ? ' aria-describedby="targetsError"' : ''}>
+      <legend>发布目标 *</legend>
+      <label><input id="uiSkillTargetCodex" type="checkbox"${fields.codex ? ' checked' : ''} onchange="setUISkillWizardField('codex', this.checked)"> Codex</label>
+      <label><input id="uiSkillTargetClaude" type="checkbox"${fields.claude ? ' checked' : ''} onchange="setUISkillWizardField('claude', this.checked)"> Claude Code</label>
+    </fieldset>${wizardError('targets')}
+  </div>`;
+}
+
+function skillFrontmatterHas(text, key) {
+  const lines = text.split('\\n').map(line => line.trim());
+  if (lines[0] !== '---') return false;
+  const closing = lines.indexOf('---', 1);
+  if (closing < 2) return false;
+  return lines.slice(1, closing).some(line => line.startsWith(`${key}:`) && line.slice(key.length + 1).trim());
+}
+
+function validateUISkillWizardStep(step) {
+  const fields = uiSkillWizard.fields;
+  const errors = {};
+  if (step === 1 && !uiSkillWizard.sourceType) {
+    errors.sourceType = '请选择一种 Skill 来源后继续。';
+  }
+  if (step === 2) {
+    if (uiSkillWizard.sourceType === 'editor') {
+      if (!fields.skillMD.trim()) errors.skillMD = '请粘贴完整 SKILL.md。';
+      else if (!skillFrontmatterHas(fields.skillMD, 'name') || !skillFrontmatterHas(fields.skillMD, 'description')) errors.skillMD = 'SKILL.md frontmatter 必须包含非空的 name 与 description。';
+    }
+    if (uiSkillWizard.sourceType === 'local' && !fields.localPath.trim().startsWith('/')) errors.localPath = '请输入以 / 开头的本机绝对目录路径。';
+    if (uiSkillWizard.sourceType === 'zip' && !fields.zipPath.trim().startsWith('/')) errors.zipPath = '请输入以 / 开头的本机 ZIP 绝对路径。';
+    if (uiSkillWizard.sourceType === 'github') {
+      if (!fields.githubRepo.trim() || !fields.githubRepo.includes('/')) errors.githubRepo = '请输入 owner/repository 格式的 GitHub 仓库。';
+      if (!fields.githubPath.trim()) errors.githubPath = '请输入仓库内 Skill 路径。';
+      if (!/^[0-9a-fA-F]{40}$/.test(fields.revision.trim())) errors.revision = '请输入 40 位完整 Git 提交哈希。';
+    }
+    if (fields.scope === 'project' && !projectState.current_project) errors.scope = '当前未选择项目，请先在项目管理中选择项目。';
+    if (!fields.versionLabel.trim()) errors.versionLabel = '请输入版本标签，例如 1.0.0。';
+    if (!fields.codex && !fields.claude) errors.targets = '至少选择 Codex 或 Claude Code 其中一个发布目标。';
+  }
+  uiSkillWizard.errors = errors;
+  if (Object.keys(errors).length) {
+    renderUISkillImportWizard();
+    const field = Object.keys(errors)[0];
+    const ids = {sourceType: null, skillMD: 'uiSkillEditor', localPath: 'uiSkillLocalPath', zipPath: 'uiSkillZipPath', githubRepo: 'uiSkillGithubRepo', githubPath: 'uiSkillGithubPath', revision: 'uiSkillGithubRevision', scope: 'uiSkillScope', versionLabel: 'uiSkillVersionLabel', targets: 'uiSkillTargetCodex'};
+    requestAnimationFrame(() => {
+      const target = ids[field] ? document.getElementById(ids[field]) : document.querySelector('[data-skill-source]');
+      if (target) target.focus();
+    });
+    return false;
+  }
+  return true;
+}
+
+function nextUISkillWizardStep() {
+  if (uiSkillWizard.submitting || !validateUISkillWizardStep(uiSkillWizard.step)) return;
+  uiSkillWizard.step = Math.min(3, uiSkillWizard.step + 1);
+  renderUISkillImportWizard();
+}
+
+function previousUISkillWizardStep() {
+  if (uiSkillWizard.submitting) return;
+  uiSkillWizard.errors = {};
+  uiSkillWizard.step = Math.max(1, uiSkillWizard.step - 1);
+  renderUISkillImportWizard();
+}
+
+function uiSkillSourceLabel() {
+  return {editor: '编辑器', local: '本地目录', zip: 'ZIP', github: 'GitHub'}[uiSkillWizard.sourceType] || '';
+}
+
+function uiSkillSourceSummary() {
+  const fields = uiSkillWizard.fields;
+  if (uiSkillWizard.sourceType === 'editor') {
+    const firstLine = fields.skillMD.split('\\n').find(line => line.trim()) || '';
+    return `${fields.skillMD.length} 个字符；首行：${firstLine}`;
+  }
+  if (uiSkillWizard.sourceType === 'local') return fields.localPath;
+  if (uiSkillWizard.sourceType === 'zip') return fields.zipPath;
+  return `${fields.githubRepo}/${fields.githubPath}\nrevision ${fields.revision}`;
+}
+
+function reviewMarkup() {
+  const fields = uiSkillWizard.fields;
+  const targets = [fields.codex ? 'Codex' : '', fields.claude ? 'Claude Code' : ''].filter(Boolean).join(' + ');
+  const scope = fields.scope === 'project' ? `当前项目：${projectState.current_project}` : '全局';
+  const rows = [
+    ['来源', uiSkillSourceLabel()],
+    ['来源定位', uiSkillSourceSummary()],
+    ['作用域', scope],
+    ['版本标签', fields.versionLabel],
+    ['发布目标', targets]
+  ];
+  return `<div class="skill-review">${rows.map(([label, value]) => `<div class="skill-review-row"><div class="skill-review-label">${esc(label)}</div><div class="skill-review-value">${esc(value)}</div></div>`).join('')}</div>
+    <div class="skill-safety-note">本操作只创建待审核草稿并执行静态校验，不会自动批准、发布或执行包内脚本。</div>
+    ${uiSkillWizard.errors.submit ? `<div class="skill-submit-error" role="alert">${esc(uiSkillWizard.errors.submit)}</div>` : ''}`;
+}
+
+function uiSkillImportPayload() {
+  const fields = uiSkillWizard.fields;
+  let source;
+  if (uiSkillWizard.sourceType === 'editor') source = {type: 'editor', files: {'SKILL.md': fields.skillMD}};
+  if (uiSkillWizard.sourceType === 'local') source = {type: 'local', path: fields.localPath.trim()};
+  if (uiSkillWizard.sourceType === 'zip') source = {type: 'zip', path: fields.zipPath.trim()};
+  if (uiSkillWizard.sourceType === 'github') source = {type: 'github', repo: fields.githubRepo.trim(), path: fields.githubPath.trim(), revision: fields.revision.trim()};
+  return {
+    source,
+    scope: fields.scope,
+    project: fields.scope === 'project' ? projectState.current_project : null,
+    targets: [fields.codex ? 'codex' : '', fields.claude ? 'claude' : ''].filter(Boolean),
+    version_label: fields.versionLabel.trim(),
+    idempotency_key: uiSkillWizard.idempotencyKey
+  };
+}
+
+async function submitUISkillImport() {
+  if (uiSkillWizard.submitting || !validateUISkillWizardStep(2)) return;
+  uiSkillWizard.submitting = true;
+  uiSkillWizard.errors = {};
+  document.getElementById('uiSkillWizardLive').textContent = '正在导入并校验…';
+  renderUISkillImportWizard();
+  try {
+    const result = await api('/api/ui-skills/import', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(uiSkillImportPayload())});
+    const focusId = result.id ? `ui-skill-${result.id}` : '';
+    closeUISkillImportWizard(true);
+    await loadUISkills();
+    showMessage(`已导入 ${result.name || 'UI Skill'}；草稿 ${result.id || ''}；摘要 ${result.digest || ''}；请查看校验结果后再批准与发布`);
+    requestAnimationFrame(() => {
+      const target = focusId ? document.getElementById(focusId) : null;
+      if (target) target.focus();
+    });
+  } catch (error) {
+    uiSkillWizard.submitting = false;
+    uiSkillWizard.errors = {submit: `导入失败：${error.message} 请检查输入后重试。`};
+    document.getElementById('uiSkillWizardLive').textContent = uiSkillWizard.errors.submit;
+    renderUISkillImportWizard();
+  }
+}
+
+function renderUISkillImportWizard() {
+  const host = document.getElementById('uiSkillImportWizard');
+  if (!host) return;
+  host.hidden = !uiSkillWizard.open;
+  if (!uiSkillWizard.open) {
+    document.getElementById('uiSkillWizardContent').innerHTML = '';
+    return;
+  }
+  const descriptions = {
+    1: '选择 Skill 来源；所有来源都会先进入静态校验。',
+    2: '填写来源信息、作用域、版本标签和发布目标。',
+    3: '核对只读摘要后创建待审核草稿。'
+  };
+  let body = sourceSelectionMarkup();
+  if (uiSkillWizard.step === 2) body = configurationMarkup();
+  if (uiSkillWizard.step === 3) body = reviewMarkup();
+  const previous = uiSkillWizard.step > 1 ? `<button type="button" onclick="previousUISkillWizardStep()"${uiSkillWizard.submitting ? ' disabled' : ''}>返回修改</button>` : '';
+  const selectionDisabled = uiSkillWizard.sourceType ? '' : ' disabled';
+  const fields = uiSkillWizard.fields;
+  const targetsDisabled = !fields.codex && !fields.claude ? ' disabled' : '';
+  const nextDisabled = uiSkillWizard.submitting ? ' disabled' : (uiSkillWizard.step === 1 ? selectionDisabled : targetsDisabled);
+  const next = uiSkillWizard.step < 3
+    ? `<button type="button" class="primary" onclick="nextUISkillWizardStep()"${nextDisabled}>继续</button>`
+    : `<button type="button" class="primary" onclick="submitUISkillImport()"${uiSkillWizard.submitting ? ' disabled' : ''}>${uiSkillWizard.submitting ? '正在导入并校验…' : '导入并静态校验'}</button>`;
+  document.getElementById('uiSkillWizardContent').innerHTML = `
+    <div class="skill-wizard-head"><div><h2 id="uiSkillWizardTitle" tabindex="-1">导入 UI Skill</h2><p>${descriptions[uiSkillWizard.step]}</p></div><button type="button" aria-label="关闭导入向导" onclick="closeUISkillImportWizard()"${uiSkillWizard.submitting ? ' disabled' : ''}>关闭</button></div>
+    ${wizardSteps()}
+    ${wizardErrorSummary()}
+    ${body}
+    <div class="skill-wizard-actions">${previous}<div class="skill-wizard-actions-end"><button type="button" onclick="closeUISkillImportWizard()"${uiSkillWizard.submitting ? ' disabled' : ''}>取消</button>${next}</div></div>`;
+}
+
 async function loadUISkills() {
   const project = projectState.current_project || '';
   uiSkillState = await api(`/api/ui-skills?project=${encodeURIComponent(project)}`);
@@ -1469,11 +1860,7 @@ function renderUISkills() {
     `发现目录 ${discovered.length}`,
     `待审批 ${skills.filter(x => x.status === 'validated').length}`
   ].map(x => `<span class="pill">${esc(x)}</span>`).join('');
-  const editor = `<section class="item">
-    <div class="item-head"><div><div class="summary">新增 UI Skill</div><div class="meta">粘贴完整 SKILL.md；导入后先静态校验并进入审批，不会自动发布。</div></div><span class="tag">editor</span></div>
-    <textarea id="uiSkillEditor" placeholder="---&#10;name: my-ui-style&#10;description: ...&#10;---&#10;# Instructions"></textarea>
-  </section>`;
-  const managed = skills.map(skill => `<section class="item">
+  const managed = skills.map(skill => `<section id="ui-skill-${esc(skill.id)}" class="item" tabindex="-1">
     <div class="item-head"><div><div class="summary">${esc(skill.name)}</div>
       <div class="meta">${esc(skill.id)} · ${esc(skill.deployment_status || skill.status)} · ${esc(skill.scope && skill.scope.type)} · ${esc((skill.targets || []).join(' + '))}</div>
       <div class="label-row"><span class="tag">摘要 ${esc(skill.digest)}</span><span class="tag">来源 ${esc(JSON.stringify(skill.source || {}))}</span><span class="tag">许可证 ${esc(JSON.stringify((skill.validation_report || {}).license || '未声明'))}</span><span class="tag">脚本 ${esc(JSON.stringify((skill.validation_report || {}).scripts || []))}</span></div>
@@ -1484,18 +1871,7 @@ function renderUISkills() {
     <div class="actions">${skillActions(skill)}</div>
   </section>`).join('');
   const unmanaged = discovered.map(item => `<section class="item"><div class="item-head"><div><div class="summary">${esc(item.name || item.path)}</div><div class="meta">${esc(item.status)} · ${esc(item.agent)} · ${esc(item.path)}</div><div class="label-row"><span class="tag">${esc(item.digest)}</span>${item.name_conflict ? '<span class="tag warn">同名摘要冲突</span>' : ''}</div></div></div></section>`).join('');
-  document.getElementById('items').innerHTML = editor + (managed || '<div class="empty">暂无受管 UI Skill。</div>') + (unmanaged ? `<div class="section-title">未管理 Skill（只读发现）</div>${unmanaged}` : '');
-}
-
-async function importEditorSkill() {
-  const skillMD = document.getElementById('uiSkillEditor').value;
-  const scope = document.getElementById('uiSkillScope').value;
-  if (!skillMD.trim()) return showMessage('请粘贴包含 name 与 description frontmatter 的 SKILL.md');
-  await api('/api/ui-skills/import', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({
-    source: {type: 'editor', files: {'SKILL.md': skillMD}}, scope, project: scope === 'project' ? projectState.current_project : null, targets: ['codex', 'claude'], idempotency_key: idempotencyKey('skill-import')
-  })});
-  showMessage('UI Skill 已导入待审批');
-  await loadUISkills();
+  document.getElementById('items').innerHTML = (managed || '<div class="empty"><h2>暂无受管 UI Skill</h2><p>使用“导入 UI Skill”从编辑器、本地目录、ZIP 或 GitHub 创建待审核草稿。</p></div>') + (unmanaged ? `<div class="section-title">未管理 Skill（只读发现）</div>${unmanaged}` : '');
 }
 
 async function uiSkillMutation(route, payload, dangerous, promptText) {
@@ -2012,6 +2388,9 @@ document.getElementById('items').addEventListener('click', event => {
 document.getElementById('status').addEventListener('change', render);
 document.getElementById('scope').addEventListener('change', render);
 document.getElementById('memoryScope').addEventListener('change', renderMemory);
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && uiSkillWizard.open) closeUISkillImportWizard();
+});
 loadQueue().catch(err => showMessage(err.message));
 loadProjects().catch(err => showMessage(err.message));
 </script>

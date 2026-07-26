@@ -414,7 +414,22 @@ Bootstrap 只创建待审核草稿，不自动批准或发布。UI UX Pro Max �
 
 ### 11.3 导入自定义 Skill
 
-从固定 Git revision 导入：
+在网页左侧进入“UI Skills”，点击“导入 UI Skill”，按三步向导操作：
+
+1. **选择来源**：选择编辑器、本地目录、ZIP 或 GitHub。
+2. **配置导入**：填写来源信息，选择全局或当前项目作用域，填写版本标签，并选择 Codex、Claude Code 或双端目标。至少选择一个发布目标。
+3. **确认并校验**：核对只读摘要，点击“导入并静态校验”创建待审核草稿。
+
+四种来源需要填写的内容如下：
+
+- **编辑器**：粘贴完整 `SKILL.md`，frontmatter 至少包含非空的 `name` 和 `description`。
+- **本地目录**：输入本机绝对目录路径，例如 `/Users/name/skills/my-ui-skill`；目录内必须包含 `SKILL.md`。
+- **ZIP**：输入本机 ZIP 文件绝对路径，例如 `/Users/name/skills/my-ui-skill.zip`。
+- **GitHub**：填写 `owner/repository`、仓库内 Skill 路径和 40 位完整 Git 提交哈希。不能使用 `main`、分支名或浮动标签代替固定 revision。
+
+本地目录和 ZIP 均由本机审核台直接读取，不会上传文件。网页导入只执行静态校验并创建草稿，**不会自动批准、发布或执行 Skill 包内脚本**。完成导入后，仍需按 11.4 和 11.5 节查看校验报告、审核摘要、批准并发布。
+
+网页向导和以下 CLI 命令使用同一个后端导入操作。自动化、批量操作或网页不可用时，可以从固定 Git revision 导入：
 
 ```bash
 python3 scripts/memory_review.py ui-skill import \
@@ -427,7 +442,7 @@ python3 scripts/memory_review.py ui-skill import \
   --idempotency-key <唯一幂等键>
 ```
 
-也可以用 `--local <目录>`、`--zip <压缩包>` 或 `--editor-json <文件映射JSON>`。项目级 Skill 使用 `--scope project --project <目标项目路径>`。
+也可以用 `--local <本机绝对目录>`、`--zip <本机ZIP绝对路径>` 或 `--editor-json <文件映射JSON>`。项目级 Skill 使用 `--scope project --project <目标项目路径>`；`--targets` 可填写 `codex`、`claude` 或 `codex,claude`。
 
 ### 11.4 查看、校验与退回修改
 

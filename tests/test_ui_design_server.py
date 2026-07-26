@@ -65,6 +65,87 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(imported["status"], "validated")
         self.assertEqual(listed["items"][0]["id"], imported["id"])
 
+    def test_ui_skill_import_maps_all_source_payloads(self) -> None:
+        cases = (
+            (
+                {"type": "editor", "files": {"SKILL.md": "---\nname: demo\n---\n"}},
+                {
+                    "editor_json": mock.ANY,
+                    "local": None,
+                    "zip": None,
+                    "github": None,
+                    "path": None,
+                },
+            ),
+            (
+                {"type": "local", "path": "/tmp/demo-skill"},
+                {
+                    "editor_json": None,
+                    "local": "/tmp/demo-skill",
+                    "zip": None,
+                    "github": None,
+                    "path": None,
+                },
+            ),
+            (
+                {"type": "zip", "path": "/tmp/demo-skill.zip"},
+                {
+                    "editor_json": None,
+                    "local": None,
+                    "zip": "/tmp/demo-skill.zip",
+                    "github": None,
+                    "path": None,
+                },
+            ),
+            (
+                {
+                    "type": "github",
+                    "repo": "owner/repository",
+                    "path": "skills/demo",
+                    "revision": "a" * 40,
+                },
+                {
+                    "editor_json": None,
+                    "local": None,
+                    "zip": None,
+                    "github": "owner/repository",
+                    "path": "skills/demo",
+                },
+            ),
+        )
+
+        for index, (source, expected) in enumerate(cases, start=1):
+            with self.subTest(source=source["type"]):
+                with mock.patch.object(
+                    server.ui_design_cli,
+                    "dispatch",
+                    return_value={"status": "validated"},
+                ) as dispatch:
+                    result = server.ui_design_post(
+                        "/api/ui-skills/import",
+                        {
+                            "source": source,
+                            "scope": "project",
+                            "project": str(self.project),
+                            "targets": ["codex"],
+                            "version_label": "2.3.4",
+                            "idempotency_key": f"source-map-{index}",
+                        },
+                    )
+
+                namespace = dispatch.call_args.args[0]
+                self.assertEqual(result["status"], "validated")
+                self.assertEqual(namespace.scope, "project")
+                self.assertEqual(namespace.project, str(self.project))
+                self.assertEqual(namespace.targets, "codex")
+                self.assertEqual(namespace.version_label, "2.3.4")
+                self.assertEqual(namespace.revision, source.get("revision"))
+                for key, value in expected.items():
+                    if value is mock.ANY:
+                        self.assertIsNotNone(getattr(namespace, key))
+                    else:
+                        self.assertEqual(getattr(namespace, key), value)
+
     def test_mutating_routes_require_idempotency_and_dangerous_confirmation(self) -> None:
         with self.assertRaises(ValueError) as missing_key:
             server.ui_design_post(
@@ -122,7 +203,32 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertIn("project_global", html)
         self.assertIn("正式前端路径", html)
         self.assertIn("待审批设计包", html)
+        self.assertIn("openUISkillImportWizard()", html)
+        self.assertIn("uiSkillImportWizard", html)
+        self.assertIn("1 选择来源", html)
+        self.assertIn("2 配置导入", html)
+        self.assertIn("3 确认并校验", html)
+        self.assertIn('data-skill-source="${value}"', html)
+        for source, label in (
+            ("editor", "编辑器"),
+            ("local", "本地目录"),
+            ("zip", "ZIP"),
+            ("github", "GitHub"),
+        ):
+            self.assertIn(f"['{source}', '{label}'", html)
+        self.assertIn("uiSkillTargetCodex", html)
+        self.assertIn("uiSkillTargetClaude", html)
+        self.assertIn("aria-current", html)
+        self.assertIn("不会自动批准、发布或执行包内脚本", html)
+        self.assertIn("uiSkillWizard.sourceType ? '' : ' disabled'", html)
+        self.assertIn("!fields.codex && !fields.claude", html)
+        self.assertIn("请修正以下字段后继续", html)
+        self.assertIn("查看校验结果", html)
+        self.assertIn("idempotencyKey: idempotencyKey('skill-import')", html)
+        self.assertIn("idempotency_key: uiSkillWizard.idempotencyKey", html)
+        self.assertIn("clearUISkillWizardLive()", html)
         self.assertNotIn("innerHTML = skill.skill_md", html)
+        self.assertNotIn("importEditorSkill()", html)
 
     def test_operator_docs_cover_ui_control_recovery_and_forward_tests(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
