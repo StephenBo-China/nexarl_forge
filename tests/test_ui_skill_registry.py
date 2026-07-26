@@ -49,6 +49,23 @@ description: Broken duplicate skill.
         self.environment.stop()
         self.temporary.cleanup()
 
+    def test_owned_workflow_skill_contains_required_approval_gate(self) -> None:
+        root = ROOT / "templates/ui_design/skills/ui-design-workflow"
+        report = validator.validate_package(root, installed_names=set())
+
+        self.assertTrue(report["valid"], report)
+        text = (root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("frontend-design", text)
+        self.assertIn("ui-ux-pro-max", text)
+        self.assertIn("Do not modify formal frontend business code", text)
+        self.assertIn("design-package-schema.md", text)
+        self.assertIn("preference-schema.md", text)
+        self.assertIn("codex/ui_design/effective-context.json", text)
+        self.assertIn("pure_backend", text)
+        self.assertIn("explicit user approval", text)
+        self.assertLess(len(text.splitlines()), 500)
+        self.assertTrue((root / "agents/openai.yaml").is_file())
+
     def test_draft_approval_creates_immutable_version(self) -> None:
         draft = registry.create_draft(
             name="sample-ui",
