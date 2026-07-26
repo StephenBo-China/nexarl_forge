@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,7 @@ import memory_review_server as server
 import memory_project
 import memory_review
 import ui_design_gate as gate
+import ui_design_preferences as preferences
 import ui_skill_registry as registry
 
 
@@ -121,6 +123,32 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertIn("正式前端路径", html)
         self.assertIn("待审批设计包", html)
         self.assertNotIn("innerHTML = skill.skill_md", html)
+
+    def test_operator_docs_cover_ui_control_recovery_and_forward_tests(self) -> None:
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for expected in (
+            "UI Design Control Plane",
+            "design_package",
+            "project_global",
+            "request-revision",
+            "CODEX_UI_SKILLS_DIR",
+            "CLAUDE_UI_SKILLS_DIR",
+            "hard_gate_enabled",
+            "idempotency",
+            "Real-client smoke test",
+        ):
+            self.assertIn(expected, readme)
+        prompts = (
+            ROOT
+            / "docs/superpowers/forward-tests/2026-07-26-ui-design-control-plane-prompts.md"
+        ).read_text(encoding="utf-8")
+        for expected in (
+            "Web SaaS checkout redesign",
+            "React Native onboarding flow",
+            "Mini-program appointment booking",
+            "Do not modify formal frontend code before approval",
+        ):
+            self.assertIn(expected, prompts)
 
     def test_project_config_routes_manage_modes_paths_smoke_enable_and_relock(self) -> None:
         memory_project.init_project(self.project)
@@ -406,6 +434,163 @@ class UIDesignServerTest(unittest.TestCase):
 
         self.assertEqual(retry, first)
         self.assertEqual(refreshed["items"][0]["name"], "later-skill")
+
+    def test_end_to_end_ui_design_control_plane_uses_only_disposable_roots(self) -> None:
+        memory_project.init_project(self.project)
+        global_preferences = preferences.default_global_preferences()
+        global_preferences["visual"]["radius"] = "8px"
+        server.ui_design_post(
+            "/api/ui-design/preferences/global",
+            {
+                "value": global_preferences,
+                "idempotency_key": "e2e-global-preferences",
+            },
+        )
+        server.ui_design_post(
+            "/api/ui-design/preferences/project",
+            {
+                "project": str(self.project),
+                "value": {
+                    "visual.radius": {"mode": "replace", "value": "12px"}
+                },
+                "idempotency_key": "e2e-project-preferences",
+            },
+        )
+        effective = server.ui_design_get(
+            "/api/ui-design/context", {"project": str(self.project)}
+        )["effective_preferences"]
+
+        draft = server.ui_design_post(
+            "/api/ui-skills/import",
+            {
+                "source": {"type": "local", "path": str(self.fixture)},
+                "scope": "global",
+                "targets": ["codex", "claude"],
+                "idempotency_key": "e2e-skill-import",
+            },
+        )
+        approved_skill = server.ui_design_post(
+            "/api/ui-skills/approve",
+            {
+                "draft_id": draft["id"],
+                "digest": draft["digest"],
+                "confirmed": True,
+                "idempotency_key": "e2e-skill-approve",
+            },
+        )
+        publication = server.ui_design_post(
+            "/api/ui-skills/publish",
+            {
+                "draft_id": draft["id"],
+                "digest": draft["digest"],
+                "confirmed": True,
+                "idempotency_key": "e2e-skill-publish",
+            },
+        )
+
+        server.ui_design_post(
+            "/api/ui-design/project-config/set-paths",
+            {
+                "project": str(self.project),
+                "paths": {
+                    "formal_frontend_paths": ["web/src/**"],
+                    "design_artifact_paths": [
+                        "codex/ui_design/design-packages/**"
+                    ],
+                    "generated_paths": ["web/generated/**"],
+                    "test_artifact_paths": ["web/tests/**"],
+                },
+                "idempotency_key": "e2e-set-paths",
+            },
+        )
+        server.ui_design_post(
+            "/api/ui-design/project-config/enable-hard-gate",
+            {
+                "project": str(self.project),
+                "confirmed": True,
+                "idempotency_key": "e2e-enable-gate",
+            },
+        )
+        manifest = {
+            "schema_version": 1,
+            "task_id": "checkout-redesign",
+            "title": "Checkout redesign",
+            "classification": "visual_change",
+            "pages": ["checkout"],
+            "components": ["CheckoutForm"],
+            "allowed_file_patterns": ["web/src/checkout/**"],
+            "design_files": [
+                "design-brief.md",
+                "interaction-spec.md",
+                "responsive-spec.md",
+            ],
+            "status": "pending_approval",
+        }
+        package = server.ui_design_post(
+            "/api/ui-design/packages/create",
+            {
+                "project": str(self.project),
+                "manifest": manifest,
+                "idempotency_key": "e2e-package-create",
+            },
+        )
+        denied_before = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/checkout/Form.tsx"}
+        )
+        server.ui_design_post(
+            "/api/ui-design/packages/approve",
+            {
+                "project": str(self.project),
+                "task_id": "checkout-redesign",
+                "digest": package["digest"],
+                "confirmed": True,
+                "idempotency_key": "e2e-package-approve",
+            },
+        )
+        allowed_after = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/checkout/Form.tsx"}
+        )
+        outside_scope = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/profile/Profile.tsx"}
+        )
+        (pathlib.Path(package["root"]) / "interaction-spec.md").write_text(
+            "Changed interaction", encoding="utf-8"
+        )
+        invalidated = gate.decide_tool_use(
+            self.project, "Write", {"file_path": "web/src/checkout/Form.tsx"}
+        )
+
+        unmanaged = self.temp / "codex-skills" / "unmanaged-ui"
+        shutil.copytree(self.fixture, unmanaged)
+        (unmanaged / "SKILL.md").write_text(
+            "---\nname: unmanaged-ui\ndescription: Unmanaged fixture\n---\n# Unmanaged\n",
+            encoding="utf-8",
+        )
+        before_digest = registry.package_digest(unmanaged)
+        before_mtimes = {
+            path.relative_to(unmanaged): path.stat().st_mtime_ns
+            for path in unmanaged.rglob("*")
+        }
+        discovered = server.ui_design_get("/api/ui-skills", {})["discovered"]
+        after_mtimes = {
+            path.relative_to(unmanaged): path.stat().st_mtime_ns
+            for path in unmanaged.rglob("*")
+        }
+
+        self.assertEqual(effective["value"]["visual"]["radius"], "12px")
+        self.assertEqual(approved_skill["status"], "approved")
+        self.assertEqual(publication["status"], "published")
+        self.assertTrue((self.temp / "codex-skills/sample-ui").is_dir())
+        self.assertTrue((self.temp / "claude-skills/sample-ui").is_dir())
+        self.assertEqual(denied_before["decision"], "deny_pending_approval")
+        self.assertEqual(allowed_after["decision"], "allow_approved_frontend_scope")
+        self.assertEqual(outside_scope["decision"], "deny_scope_mismatch")
+        self.assertEqual(invalidated["decision"], "deny_invalidated_approval")
+        self.assertIn(
+            "unmanaged-ui", {item.get("name") for item in discovered}
+        )
+        self.assertEqual(registry.package_digest(unmanaged), before_digest)
+        self.assertEqual(after_mtimes, before_mtimes)
 
 
 if __name__ == "__main__":
