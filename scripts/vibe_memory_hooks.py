@@ -935,6 +935,21 @@ def status(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
     return {"status": state, "path": str(target)}
 
 
+def preview(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
+    """Validate and render a hook repair without writing any filesystem state."""
+    _validate_agent_event(agent, EVENTS[0])
+    target = pathlib.Path(path)
+    _reject_symlink(target)
+    existed = target.exists()
+    current = load_document(target) if existed else {"hooks": {}}
+    expected = merge_document(current, agent, runtime)
+    return {
+        "status": "current" if current == expected else ("drifted" if existed else "missing"),
+        "path": str(target),
+        "document": expected,
+    }
+
+
 def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
     """Create or repair one document and describe its resulting backup, if any."""
     target = pathlib.Path(path)

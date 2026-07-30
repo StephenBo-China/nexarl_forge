@@ -63,14 +63,17 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
     def test_install_delegates_runtime_plist_and_hooks_without_launchctl(self) -> None:
         runtime = self.paths.install_root / "current"
         args = ["install", "--source-root", "/portable/source", "--with-claude-hooks"]
-        with mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", return_value={"version": "1.0.0"}) as install, \
+        with mock.patch("vibe_memory_cli.vibe_memory_install.validate_runtime_source", return_value={"version": "1.0.0"}) as validate, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", return_value={"version": "1.0.0"}) as install, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.prepare_data", return_value={"files": []}) as prepare, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
+                mock.patch("vibe_memory_cli.vibe_memory_hooks.preview", return_value={"status": "missing"}) as preview, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created"}, {"status": "created"}]) as repair, \
                 mock.patch("vibe_memory_cli.subprocess.run") as run:
             code, output, _ = self.invoke(args)
         self.assertEqual(code, 0)
+        validate.assert_called_once_with(pathlib.Path("/portable/source"))
         install.assert_called_once_with(pathlib.Path("/portable/source"), self.paths)
         prepare.assert_called_once_with(self.paths)
         render.assert_called_once_with(self.paths, port=8897)
@@ -79,16 +82,83 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             mock.call(self.home / ".codex/hooks.json", "codex", runtime),
             mock.call(self.home / ".claude/settings.json", "claude-code", runtime),
         ])
+        self.assertEqual(preview.call_count, 2)
         run.assert_not_called()
         self.assertEqual(output["status"], "installed")
 
     def test_install_error_is_nonzero_and_not_hook_degraded(self) -> None:
-        with mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", side_effect=ValueError("unsafe source")):
+        with mock.patch("vibe_memory_cli.vibe_memory_install.validate_runtime_source", side_effect=ValueError("unsafe source")):
             code, output, stderr = self.invoke(["install", "--source-root", "/bad"])
         self.assertEqual(code, 1)
-        self.assertIsNone(output)
-        self.assertIn("install failed", stderr)
+        self.assertEqual(output, {
+            "error": "installation preflight failed",
+            "phase": "preflight",
+            "status": "failed",
+        })
+        self.assertEqual(stderr, "")
         self.assertNotIn("degraded", stderr)
+
+    def test_install_preflight_failure_does_not_activate_or_write(self) -> None:
+        release = self.paths.install_root / "releases/0.9.0"
+        release.mkdir(parents=True)
+        current = self.paths.install_root / "current"
+        current.symlink_to("releases/0.9.0")
+        codex = self.home / ".codex/hooks.json"
+        codex.parent.mkdir(parents=True)
+        codex.write_text("{malformed", encoding="utf-8")
+        plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_text("sentinel plist\n", encoding="utf-8")
+
+        with mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime") as install:
+            code, output, stderr = self.invoke([
+                "install", "--source-root", str(ROOT)
+            ])
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["status"], "failed")
+        self.assertEqual(output["phase"], "preflight")
+        install.assert_not_called()
+        self.assertEqual(os.readlink(current), "releases/0.9.0")
+        self.assertEqual(codex.read_text(encoding="utf-8"), "{malformed")
+        self.assertEqual(plist.read_text(encoding="utf-8"), "sentinel plist\n")
+
+    def test_install_commit_failure_rolls_back_hooks_plist_and_current(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        claude = self.home / ".claude/settings.json"
+        plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        plist.parent.mkdir(parents=True)
+        codex.write_text('{"custom":"codex"}\n', encoding="utf-8")
+        claude.write_text('{"custom":"claude"}\n', encoding="utf-8")
+        plist.write_text("old plist\n", encoding="utf-8")
+        before = {path: path.read_bytes() for path in (codex, claude, plist)}
+        real_repair = vibe_memory_cli.vibe_memory_hooks.repair
+        calls = []
+
+        def fail_second(*arguments: object, **keywords: object) -> object:
+            calls.append(arguments)
+            if len(calls) == 2:
+                raise OSError("injected repair failure")
+            return real_repair(*arguments, **keywords)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", side_effect=fail_second
+        ):
+            code, output, stderr = self.invoke([
+                "install", "--source-root", str(ROOT), "--with-claude-hooks"
+            ])
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["status"], "failed")
+        self.assertEqual(output["phase"], "commit")
+        self.assertTrue(output["rollback"]["ok"])
+        self.assertTrue(output["rollback"]["data_retained"])
+        self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        self.assertFalse(list(codex.parent.glob("hooks.json.bak.*")))
+        self.assertFalse(list(claude.parent.glob("settings.json.bak.*")))
 
     def test_real_install_keeps_codex_and_claude_hooks_on_current_symlink(self) -> None:
         code, output, stderr = self.invoke([

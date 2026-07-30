@@ -6,9 +6,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import pathlib
+import stat
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
@@ -100,24 +103,140 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
     }
 
 
+def _snapshot_managed_file(path: pathlib.Path) -> tuple[bytes, int] | None:
+    if path.is_symlink():
+        raise ValueError("managed path must not be a symlink")
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("managed path must be a regular file")
+        return path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+    except FileNotFoundError:
+        return None
+
+
+def _restore_managed_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None) -> None:
+    if path.is_symlink():
+        raise ValueError("managed path changed to a symlink during rollback")
+    if snapshot is None:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("managed path changed type during rollback")
+        path.unlink()
+        return
+    content, mode = snapshot
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.rollback-", dir=path.parent)
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            raise ValueError("managed path changed to a symlink during rollback")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _snapshot_current(path: pathlib.Path) -> str | None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise ValueError("current runtime must be a managed symlink")
+    return os.readlink(path)
+
+
+def _restore_current(path: pathlib.Path, before: str | None, installed_version: str) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if before is None:
+        if metadata is None:
+            return
+        if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != f"releases/{installed_version}":
+            raise ValueError("current runtime changed concurrently during rollback")
+        path.unlink()
+        return
+    if metadata is not None and stat.S_ISLNK(metadata.st_mode) and os.readlink(path) == before:
+        return
+    if metadata is not None:
+        raise ValueError("current runtime changed concurrently during rollback")
+    path.symlink_to(before)
+
+
 def install_command(args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
-    installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
-    data = vibe_memory_install.prepare_data(paths)
-    plist = vibe_memory_install.render_launch_agent(paths, port=args.port)
-    plist_result = vibe_memory_install.install_launch_agent(paths, plist)
     runtime = paths.install_root / "current"
-    hooks = {
-        "codex": vibe_memory_hooks.repair(
-            _home(paths) / ".codex/hooks.json", "codex", runtime
-        )
-    }
+    home = _home(paths)
+    hook_targets = [(home / ".codex/hooks.json", "codex", "codex")]
     if args.with_claude_hooks:
-        hooks["claude"] = vibe_memory_hooks.repair(
-            _home(paths) / ".claude/settings.json", "claude-code", runtime
-        )
-    _json({"status": "installed", "runtime": installed, "data": data, "launch_agent": plist_result, "hooks": hooks})
-    return 0
+        hook_targets.append((home / ".claude/settings.json", "claude-code", "claude"))
+    launch_agent = home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+    try:
+        validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
+        plist = vibe_memory_install.render_launch_agent(paths, port=args.port)
+        for target, agent, _name in hook_targets:
+            vibe_memory_hooks.preview(target, agent, runtime)
+        snapshots = {target: _snapshot_managed_file(target) for target, _agent, _name in hook_targets}
+        snapshots[launch_agent] = _snapshot_managed_file(launch_agent)
+        current_before = _snapshot_current(runtime)
+    except Exception:
+        _json({"status": "failed", "phase": "preflight", "error": "installation preflight failed"})
+        return 1
+
+    data: dict[str, object] | None = None
+    hooks: dict[str, dict[str, object]] = {}
+    try:
+        installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
+        data = vibe_memory_install.prepare_data(paths)
+        plist_result = vibe_memory_install.install_launch_agent(paths, plist)
+        for target, agent, name in hook_targets:
+            hooks[name] = vibe_memory_hooks.repair(target, agent, runtime)
+        _json({"status": "installed", "runtime": installed, "data": data, "launch_agent": plist_result, "hooks": hooks})
+        return 0
+    except Exception:
+        rollback_errors = []
+        for target, snapshot in snapshots.items():
+            try:
+                _restore_managed_file(target, snapshot)
+            except Exception:
+                rollback_errors.append(str(target))
+        try:
+            _restore_current(runtime, current_before, validated["version"])
+        except Exception:
+            rollback_errors.append(str(runtime))
+        if not rollback_errors:
+            for result in hooks.values():
+                backup = result.get("backup")
+                if not isinstance(backup, str) or not backup:
+                    continue
+                artifact = pathlib.Path(backup)
+                try:
+                    if artifact.is_symlink() or not artifact.is_file():
+                        raise ValueError("hook backup changed type during rollback")
+                    artifact.unlink()
+                except Exception:
+                    rollback_errors.append(str(artifact))
+        _json({
+            "status": "failed",
+            "phase": "commit",
+            "error": "installation commit failed",
+            "rollback": {
+                "ok": not rollback_errors,
+                "failed_paths": rollback_errors,
+                "data_retained": True,
+            },
+        })
+        return 1
 
 
 def status_command(_args: argparse.Namespace) -> int:

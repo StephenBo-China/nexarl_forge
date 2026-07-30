@@ -1056,6 +1056,18 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
         os.close(install_fd)
 
 
+def validate_runtime_source(source_root: pathlib.Path | str) -> dict[str, str]:
+    """Fully validate a release source without creating or activating anything."""
+    expected_entries = _snapshot_source_release(pathlib.Path(source_root))
+    manifest_content = expected_entries["release.json"][1]
+    if manifest_content is None:
+        raise ValueError("release manifest snapshot is missing content")
+    manifest = json.loads(manifest_content.decode("utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("release manifest must contain a JSON object")
+    return {"version": _validate_manifest(manifest)}
+
+
 def _read_launch_agent_template() -> str:
     return _LAUNCH_AGENT_TEMPLATE.read_text(encoding="utf-8")
 

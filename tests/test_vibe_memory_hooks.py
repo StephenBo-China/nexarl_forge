@@ -462,6 +462,23 @@ class DocumentIOTest(unittest.TestCase):
 
 
 class StatusAndRepairTest(unittest.TestCase):
+    def test_preview_validates_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            target = pathlib.Path(value) / "hooks.json"
+            target.write_text('{"hooks": {}}\n', encoding="utf-8")
+            before = target.read_bytes()
+
+            preview = hooks.preview(target, "codex", "/runtime/current")
+
+            self.assertEqual(preview["status"], "drifted")
+            self.assertEqual(target.read_bytes(), before)
+            self.assertFalse(list(target.parent.glob("*.bak.*")))
+
+            target.write_text("{malformed", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                hooks.preview(target, "codex", "/runtime/current")
+            self.assertEqual(target.read_text(encoding="utf-8"), "{malformed")
+
     @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
     def test_repair_converges_e3_active_and_preserves_e1_e2(self) -> None:
         with tempfile.TemporaryDirectory() as value:
