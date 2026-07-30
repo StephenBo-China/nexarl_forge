@@ -21,6 +21,9 @@ import vibe_memory_paths
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 RUNTIME_PATHS = vibe_memory_paths.for_home()
+DEFAULT_WORKTREE_ROOT = pathlib.Path(
+    os.environ.get("CODEX_WORKTREE_ROOT", str(RUNTIME_PATHS.worktree_root))
+).expanduser()
 REGISTRY_PATH = pathlib.Path(
     os.environ.get(
         "MEMORY_REVIEW_PROJECT_REGISTRY",
@@ -1110,8 +1113,8 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
         "worktree": {
             "enabled": True,
             "trigger_phrase": "开 worktree",
-            "root": str(RUNTIME_PATHS.worktree_root),
-            "default_root": str(RUNTIME_PATHS.worktree_root),
+            "root": str(DEFAULT_WORKTREE_ROOT),
+            "default_root": str(DEFAULT_WORKTREE_ROOT),
             "finish_validation_commands": [loop_superpowers.COMPLETION_COMMAND],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,

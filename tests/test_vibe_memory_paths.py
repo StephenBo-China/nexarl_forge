@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -52,3 +54,49 @@ class RuntimePathsTest(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 vibe_memory_paths.read_release_manifest(manifest_path)
+
+
+class WorktreeRootOverrideIntegrationTest(unittest.TestCase):
+    def test_override_controls_generated_and_effective_loop_worktree_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            override = temp / "custom-worktrees"
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(temp / "home"),
+                    "CODEX_WORKTREE_ROOT": str(override),
+                }
+            )
+            script = """
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, str(pathlib.Path.cwd() / "scripts"))
+import memory_project
+import worktree_flow
+
+config = memory_project.loop_config(pathlib.Path("sample-project"), 8082)
+settings = worktree_flow.settings_from_config(config)
+print(json.dumps({
+    "root": config["worktree"]["root"],
+    "default_root": config["worktree"]["default_root"],
+    "effective_root": str(settings["worktree_root"]),
+}))
+"""
+
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            paths = json.loads(result.stdout)
+
+            self.assertEqual(paths["root"], str(override))
+            self.assertEqual(paths["default_root"], str(override))
+            self.assertEqual(paths["effective_root"], str(override.resolve()))
