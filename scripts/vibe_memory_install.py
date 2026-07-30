@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import pathlib
 import plistlib
 import re
-import shutil
 import stat
 from string import Template
 import sys
@@ -15,7 +15,7 @@ from typing import Any
 import uuid
 from xml.sax.saxutils import escape
 
-from vibe_memory_paths import RuntimePaths, read_release_manifest
+from vibe_memory_paths import RuntimePaths
 
 
 _PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -42,10 +42,17 @@ _TRUSTED_SYSTEM_ALIASES = {
 class _AnchoredPath:
     """A display path paired with a directory-fd-relative entry name."""
 
-    def __init__(self, parent_fd: int, entry_name: str, display_path: pathlib.Path) -> None:
+    def __init__(
+        self,
+        parent_fd: int,
+        entry_name: str,
+        display_path: pathlib.Path,
+        directory_fd: int | None = None,
+    ) -> None:
         self.parent_fd = parent_fd
         self.entry_name = entry_name
         self.display_path = display_path
+        self.directory_fd = directory_fd
 
     @property
     def name(self) -> str:
@@ -61,14 +68,21 @@ class _AnchoredPath:
         return self.display_path / child
 
 
-def _is_symlink(path: pathlib.Path) -> bool:
-    try:
-        return path.is_symlink()
-    except OSError:
-        return True
+class TemporaryCleanupConflict(RuntimeError):
+    """Raised when a temporary install entry no longer has its created identity."""
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> str:
+    required = {
+        "app_version",
+        "data_schema_version",
+        "hook_protocol_version",
+        "minimum_python",
+        "platform",
+    }
+    missing = required.difference(manifest)
+    if missing:
+        raise ValueError(f"release manifest missing required fields: {', '.join(sorted(missing))}")
     version = manifest["app_version"]
     if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
         raise ValueError("release app_version must be a semantic version")
@@ -84,40 +98,132 @@ def _validate_manifest(manifest: dict[str, Any]) -> str:
     return version
 
 
-def _validate_source_entry(path: pathlib.Path, *, directory: bool) -> None:
-    if _is_symlink(path):
-        raise ValueError(f"release source may not contain symlinks: {path}")
-    if directory:
-        if not path.is_dir():
-            raise ValueError(f"required release directory is missing: {path.name}")
-    elif not path.is_file():
-        raise ValueError(f"required release file is missing: {path.name}")
+def _identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
 
 
-def _validate_source_tree(source_root: pathlib.Path) -> None:
-    if _is_symlink(source_root) or not source_root.is_dir():
+def _read_regular_file_at(parent_fd: int, name: str, display_path: pathlib.Path) -> bytes:
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"required release file is missing: {display_path}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(f"release source must contain regular files only: {display_path}")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise ValueError(f"unsafe release source file: {display_path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(before):
+            raise ValueError(f"release source file changed while opening: {display_path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            return handle.read()
+    finally:
+        os.close(descriptor)
+
+
+def _open_source_directory_at(parent_fd: int, name: str, display_path: pathlib.Path) -> int:
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError(f"required release directory is missing: {display_path}") from error
+    if not stat.S_ISDIR(before.st_mode):
+        raise ValueError(f"release source must contain real directories only: {display_path}")
+    try:
+        descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+    except OSError as error:
+        raise ValueError(f"unsafe release source directory: {display_path}") from error
+    try:
+        opened = os.fstat(descriptor)
+    except Exception:
+        os.close(descriptor)
+        raise
+    if not stat.S_ISDIR(opened.st_mode) or _identity(opened) != _identity(before):
+        os.close(descriptor)
+        raise ValueError(f"release source directory changed while opening: {display_path}")
+    return descriptor
+
+
+def _snapshot_directory_fd(
+    directory_fd: int,
+    display_root: pathlib.Path,
+    prefix: pathlib.Path,
+) -> dict[str, tuple[str, bytes | None]]:
+    entries: dict[str, tuple[str, bytes | None]] = {}
+    for name in os.listdir(directory_fd):
+        relative = prefix / name
+        display_path = display_root / relative
+        try:
+            metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError(f"release source changed during enumeration: {display_path}") from error
+        if stat.S_ISDIR(metadata.st_mode):
+            child_fd = _open_source_directory_at(directory_fd, name, display_path)
+            try:
+                entries[str(relative)] = ("directory", None)
+                entries.update(_snapshot_directory_fd(child_fd, display_root, relative))
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(metadata.st_mode):
+            entries[str(relative)] = (
+                "file",
+                _read_regular_file_at(directory_fd, name, display_path),
+            )
+        else:
+            raise ValueError(f"release source must contain regular files only: {display_path}")
+    return entries
+
+
+def _snapshot_source_release(
+    source_root: pathlib.Path,
+) -> dict[str, tuple[str, bytes | None]]:
+    try:
+        before = os.lstat(source_root)
+    except OSError as error:
+        raise ValueError("release source root must be a real directory") from error
+    if not stat.S_ISDIR(before.st_mode):
         raise ValueError("release source root must be a real directory")
-    for name in _REQUIRED_DIRECTORIES:
-        _validate_source_entry(source_root / name, directory=True)
-    for name in _REQUIRED_FILES:
-        _validate_source_entry(source_root / name, directory=False)
-    for name in _OPTIONAL_FILES:
-        path = source_root / name
-        if os.path.lexists(str(path)):
-            _validate_source_entry(path, directory=False)
-
-    selected = [source_root / name for name in _REQUIRED_DIRECTORIES]
-    for tree_root in selected:
-        for current, directory_names, file_names in os.walk(str(tree_root), followlinks=False):
-            current_path = pathlib.Path(current)
-            for name in directory_names:
-                child = current_path / name
-                if _is_symlink(child):
-                    raise ValueError(f"release source may not contain symlinks: {child}")
-            for name in file_names:
-                child = current_path / name
-                if _is_symlink(child) or not child.is_file():
-                    raise ValueError(f"release source must contain regular files only: {child}")
+    try:
+        source_fd = os.open(source_root, _DIRECTORY_OPEN_FLAGS)
+    except OSError as error:
+        raise ValueError("release source root must be a real directory") from error
+    try:
+        opened = os.fstat(source_fd)
+        if not stat.S_ISDIR(opened.st_mode) or _identity(opened) != _identity(before):
+            raise ValueError("release source root changed while opening")
+        entries: dict[str, tuple[str, bytes | None]] = {}
+        for name in _REQUIRED_DIRECTORIES:
+            display_path = source_root / name
+            child_fd = _open_source_directory_at(source_fd, name, display_path)
+            try:
+                entries[name] = ("directory", None)
+                entries.update(_snapshot_directory_fd(child_fd, source_root, pathlib.Path(name)))
+            finally:
+                os.close(child_fd)
+        for name in _REQUIRED_FILES:
+            entries[name] = (
+                "file",
+                _read_regular_file_at(source_fd, name, source_root / name),
+            )
+        for name in _OPTIONAL_FILES:
+            try:
+                os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ValueError(f"unsafe optional release file: {source_root / name}") from error
+            entries[name] = (
+                "file",
+                _read_regular_file_at(source_fd, name, source_root / name),
+            )
+        return entries
+    finally:
+        os.close(source_fd)
 
 
 def _validate_install_ancestor_chain(path: pathlib.Path) -> None:
@@ -185,8 +291,8 @@ def _open_install_layout(paths: RuntimePaths) -> tuple[pathlib.Path, int, pathli
     _validate_install_ancestor_chain(requested)
     install_root = _canonical_install_path(requested)
     install_fd = _open_or_create_directory_chain(install_root)
-    os.fchmod(install_fd, 0o700)
     try:
+        os.fchmod(install_fd, 0o700)
         try:
             os.mkdir("releases", 0o700, dir_fd=install_fd)
         except FileExistsError:
@@ -195,7 +301,11 @@ def _open_install_layout(paths: RuntimePaths) -> tuple[pathlib.Path, int, pathli
             releases_fd = os.open("releases", _DIRECTORY_OPEN_FLAGS, dir_fd=install_fd)
         except OSError as error:
             raise ValueError("unsafe releases directory") from error
-        os.fchmod(releases_fd, 0o700)
+        try:
+            os.fchmod(releases_fd, 0o700)
+        except Exception:
+            os.close(releases_fd)
+            raise
     except Exception:
         os.close(install_fd)
         raise
@@ -276,29 +386,12 @@ def _atomic_rename_exclusive(
     _darwin_rename(source, destination, RENAME_EXCL)
 
 
-def _copy_tree_at(source: pathlib.Path, parent_fd: int, name: str) -> None:
-    os.mkdir(name, 0o700, dir_fd=parent_fd)
-    directory_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
-    try:
-        for child in source.iterdir():
-            if child.is_symlink():
-                raise ValueError(f"release source may not contain symlinks: {child}")
-            if child.is_dir():
-                _copy_tree_at(child, directory_fd, child.name)
-            elif child.is_file():
-                _copy_file_at(child, directory_fd, child.name)
-            else:
-                raise ValueError(f"release source must contain regular files only: {child}")
-    finally:
-        os.close(directory_fd)
-
-
-def _copy_file_at(source: pathlib.Path, parent_fd: int, name: str) -> None:
+def _write_file_at(content: bytes, parent_fd: int, name: str) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
     try:
-        with source.open("rb") as source_handle, os.fdopen(descriptor, "wb", closefd=False) as target:
-            shutil.copyfileobj(source_handle, target)
+        with os.fdopen(descriptor, "wb", closefd=False) as target:
+            target.write(content)
             target.flush()
         os.fchmod(descriptor, 0o600)
     finally:
@@ -306,129 +399,60 @@ def _copy_file_at(source: pathlib.Path, parent_fd: int, name: str) -> None:
 
 
 def _copy_release_content(
-    source_root: pathlib.Path,
+    source_snapshot: dict[str, tuple[str, bytes | None]],
     temporary_release: pathlib.Path | _AnchoredPath,
 ) -> None:
     if isinstance(temporary_release, _AnchoredPath):
-        temporary_fd = os.open(
-            temporary_release.entry_name,
-            _DIRECTORY_OPEN_FLAGS,
-            dir_fd=temporary_release.parent_fd,
-        )
+        owns_temporary_fd = temporary_release.directory_fd is None
+        temporary_fd = temporary_release.directory_fd
+        if temporary_fd is None:
+            temporary_fd = os.open(
+                temporary_release.entry_name,
+                _DIRECTORY_OPEN_FLAGS,
+                dir_fd=temporary_release.parent_fd,
+            )
         try:
-            for name in _REQUIRED_DIRECTORIES:
-                _copy_tree_at(source_root / name, temporary_fd, name)
-            for name in (*_REQUIRED_FILES, *_OPTIONAL_FILES):
-                source = source_root / name
-                if source.is_file():
-                    _copy_file_at(source, temporary_fd, name)
+            directory_fds: dict[pathlib.Path, int] = {pathlib.Path(): temporary_fd}
+            try:
+                for raw_relative, (entry_type, _) in sorted(
+                    source_snapshot.items(),
+                    key=lambda item: (len(pathlib.Path(item[0]).parts), item[0]),
+                ):
+                    if entry_type != "directory":
+                        continue
+                    relative = pathlib.Path(raw_relative)
+                    parent_fd = directory_fds[relative.parent]
+                    os.mkdir(relative.name, 0o700, dir_fd=parent_fd)
+                    directory_fds[relative] = os.open(
+                        relative.name,
+                        _DIRECTORY_OPEN_FLAGS,
+                        dir_fd=parent_fd,
+                    )
+                for raw_relative, (entry_type, content) in source_snapshot.items():
+                    if entry_type != "file":
+                        continue
+                    if content is None:
+                        raise ValueError(f"source snapshot file has no content: {raw_relative}")
+                    relative = pathlib.Path(raw_relative)
+                    _write_file_at(content, directory_fds[relative.parent], relative.name)
+            finally:
+                for relative, descriptor in reversed(list(directory_fds.items())):
+                    if relative != pathlib.Path():
+                        os.close(descriptor)
         finally:
-            os.close(temporary_fd)
+            if owns_temporary_fd:
+                os.close(temporary_fd)
         return
-    for name in _REQUIRED_DIRECTORIES:
-        shutil.copytree(str(source_root / name), str(temporary_release / name))
-    for name in (*_REQUIRED_FILES, *_OPTIONAL_FILES):
-        source = source_root / name
-        if source.is_file():
-            shutil.copy2(str(source), str(temporary_release / name))
-
-
-def _make_private_fd(directory_fd: int) -> None:
-    os.fchmod(directory_fd, 0o700)
-    for name in os.listdir(directory_fd):
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise FileExistsError(f"installed release contains a symlink: {name}")
-        if stat.S_ISDIR(metadata.st_mode):
-            child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
-            try:
-                _make_private_fd(child_fd)
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(metadata.st_mode):
-            file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
-            try:
-                os.fchmod(file_fd, 0o600)
-            finally:
-                os.close(file_fd)
-        else:
-            raise FileExistsError(f"installed release contains an unsafe file: {name}")
-
-
-def _make_private(tree: pathlib.Path | _AnchoredPath) -> None:
-    if isinstance(tree, _AnchoredPath):
-        directory_fd = os.open(tree.entry_name, _DIRECTORY_OPEN_FLAGS, dir_fd=tree.parent_fd)
-        try:
-            _make_private_fd(directory_fd)
-        finally:
-            os.close(directory_fd)
-        return
-    tree.chmod(0o700)
-    for current, directory_names, file_names in os.walk(str(tree), followlinks=False):
-        current_path = pathlib.Path(current)
-        for name in directory_names:
-            (current_path / name).chmod(0o700)
-        for name in file_names:
-            (current_path / name).chmod(0o600)
-
-
-def _release_entries_fd(
-    directory_fd: int,
-    prefix: pathlib.Path = pathlib.Path(),
-) -> dict[str, tuple[str, bytes | None]]:
-    entries: dict[str, tuple[str, bytes | None]] = {}
-    for name in os.listdir(directory_fd):
-        relative = prefix / name
-        metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if stat.S_ISLNK(metadata.st_mode):
-            raise FileExistsError(f"existing release contains a symlink: {relative}")
-        if stat.S_ISDIR(metadata.st_mode):
-            entries[str(relative)] = ("directory", None)
-            child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
-            try:
-                entries.update(_release_entries_fd(child_fd, relative))
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(metadata.st_mode):
-            file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
-            try:
-                with os.fdopen(file_fd, "rb", closefd=False) as handle:
-                    entries[str(relative)] = ("file", handle.read())
-            finally:
-                os.close(file_fd)
-        else:
-            raise FileExistsError(f"existing release contains an unsafe file: {relative}")
-    return entries
-
-
-def _release_entries(
-    root: pathlib.Path | _AnchoredPath,
-) -> dict[str, tuple[str, bytes | None]]:
-    if isinstance(root, _AnchoredPath):
-        try:
-            directory_fd = os.open(root.entry_name, _DIRECTORY_OPEN_FLAGS, dir_fd=root.parent_fd)
-        except OSError as error:
-            raise FileExistsError(f"existing release path is unsafe: {root}") from error
-        try:
-            return _release_entries_fd(directory_fd)
-        finally:
-            os.close(directory_fd)
-    entries: dict[str, tuple[str, bytes | None]] = {}
-    if _is_symlink(root) or not root.is_dir():
-        raise FileExistsError(f"existing release path is unsafe: {root}")
-    for current, directory_names, file_names in os.walk(str(root), followlinks=False):
-        current_path = pathlib.Path(current)
-        for name in directory_names:
-            child = current_path / name
-            if _is_symlink(child):
-                raise FileExistsError(f"existing release contains a symlink: {child}")
-            entries[str(child.relative_to(root))] = ("directory", None)
-        for name in file_names:
-            child = current_path / name
-            if _is_symlink(child) or not child.is_file():
-                raise FileExistsError(f"existing release contains an unsafe file: {child}")
-            entries[str(child.relative_to(root))] = ("file", child.read_bytes())
-    return entries
+    for raw_relative, (entry_type, content) in sorted(
+        source_snapshot.items(),
+        key=lambda item: (len(pathlib.Path(item[0]).parts), item[0]),
+    ):
+        destination = temporary_release / raw_relative
+        if entry_type == "directory":
+            destination.mkdir(mode=0o700)
+        elif content is not None:
+            destination.write_bytes(content)
+            destination.chmod(0o600)
 
 
 def _verify_and_make_private_release(
@@ -446,11 +470,7 @@ def _verify_and_make_private_release(
     try:
         opened = os.fstat(directory_fd)
         identity = opened.st_dev, opened.st_ino
-        if _release_entries_fd(directory_fd) != expected_entries:
-            raise FileExistsError(
-                f"release {release.entry_name} already exists with different content"
-            )
-        _make_private_fd(directory_fd)
+        _verify_and_make_private_fd(directory_fd, expected_entries)
         try:
             active = os.stat(
                 release.entry_name,
@@ -469,24 +489,105 @@ def _verify_and_make_private_release(
         os.close(directory_fd)
 
 
-def _source_entries(source_root: pathlib.Path) -> dict[str, tuple[str, bytes | None]]:
+def _pin_release_entries_fd(
+    directory_fd: int,
+    pinned: list[tuple[int, int, str, tuple[int, int, int], bool]],
+    prefix: pathlib.Path = pathlib.Path(),
+) -> dict[str, tuple[str, bytes | None]]:
     entries: dict[str, tuple[str, bytes | None]] = {}
-    for name in _REQUIRED_DIRECTORIES:
-        tree_root = source_root / name
-        entries[name] = ("directory", None)
-        for current, directory_names, file_names in os.walk(str(tree_root), followlinks=False):
-            current_path = pathlib.Path(current)
-            for child_name in directory_names:
-                child = current_path / child_name
-                entries[str(child.relative_to(source_root))] = ("directory", None)
-            for child_name in file_names:
-                child = current_path / child_name
-                entries[str(child.relative_to(source_root))] = ("file", child.read_bytes())
-    for name in (*_REQUIRED_FILES, *_OPTIONAL_FILES):
-        child = source_root / name
-        if child.is_file():
-            entries[name] = ("file", child.read_bytes())
+    for name in os.listdir(directory_fd):
+        relative = prefix / name
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if stat.S_ISLNK(before.st_mode):
+            raise FileExistsError(f"release contains a symlink: {relative}")
+        if stat.S_ISDIR(before.st_mode):
+            descriptor = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+            try:
+                opened = os.fstat(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
+            if _temporary_identity(opened) != _temporary_identity(before):
+                os.close(descriptor)
+                raise FileExistsError(f"release directory changed while opening: {relative}")
+            pinned.append(
+                (descriptor, directory_fd, name, _temporary_identity(opened), True)
+            )
+            entries[str(relative)] = ("directory", None)
+            entries.update(_pin_release_entries_fd(descriptor, pinned, relative))
+        elif stat.S_ISREG(before.st_mode):
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(descriptor)
+            except Exception:
+                os.close(descriptor)
+                raise
+            if _temporary_identity(opened) != _temporary_identity(before):
+                os.close(descriptor)
+                raise FileExistsError(f"release file changed while opening: {relative}")
+            pinned.append(
+                (descriptor, directory_fd, name, _temporary_identity(opened), False)
+            )
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                entries[str(relative)] = ("file", handle.read())
+        else:
+            raise FileExistsError(f"release contains an unsafe file: {relative}")
     return entries
+
+
+def _release_entries_from_pinned_fds(
+    directory_fd: int,
+    pinned: list[tuple[int, int, str, tuple[int, int, int], bool]],
+    prefix: pathlib.Path = pathlib.Path(),
+) -> dict[str, tuple[str, bytes | None]]:
+    children = {
+        name: (descriptor, expected_identity, is_directory)
+        for descriptor, parent_fd, name, expected_identity, is_directory in pinned
+        if parent_fd == directory_fd
+    }
+    if set(os.listdir(directory_fd)) != set(children):
+        raise FileExistsError(f"release directory inventory changed: {prefix or '.'}")
+    entries: dict[str, tuple[str, bytes | None]] = {}
+    for name, (descriptor, expected_identity, is_directory) in children.items():
+        relative = prefix / name
+        try:
+            active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise FileExistsError(f"release entry changed after verification: {relative}") from error
+        if _temporary_identity(active) != expected_identity:
+            raise FileExistsError(f"release entry changed after verification: {relative}")
+        if is_directory:
+            entries[str(relative)] = ("directory", None)
+            entries.update(_release_entries_from_pinned_fds(descriptor, pinned, relative))
+        else:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                entries[str(relative)] = ("file", handle.read())
+    return entries
+
+
+def _verify_and_make_private_fd(
+    directory_fd: int,
+    expected_entries: dict[str, tuple[str, bytes | None]],
+) -> None:
+    pinned: list[tuple[int, int, str, tuple[int, int, int], bool]] = []
+    try:
+        actual_entries = _pin_release_entries_fd(directory_fd, pinned)
+        if actual_entries != expected_entries:
+            raise FileExistsError("release content is incomplete or inconsistent")
+        os.fchmod(directory_fd, 0o700)
+        for descriptor, _, _, _, is_directory in pinned:
+            os.fchmod(descriptor, 0o700 if is_directory else 0o600)
+        final_entries = _release_entries_from_pinned_fds(directory_fd, pinned)
+        if final_entries != expected_entries:
+            raise FileExistsError("release content changed while making permissions private")
+    finally:
+        for descriptor, _, _, _, _ in reversed(pinned):
+            os.close(descriptor)
 
 
 def _entry_exists(parent_fd: int, name: str) -> bool:
@@ -495,6 +596,148 @@ def _entry_exists(parent_fd: int, name: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def _temporary_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _delete_tree_contents_fd(directory_fd: int) -> None:
+    for name in os.listdir(directory_fd):
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict while inspecting {name}"
+            ) from error
+        if stat.S_ISDIR(before.st_mode):
+            try:
+                child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict while opening {name}"
+                ) from error
+            try:
+                if _temporary_identity(os.fstat(child_fd)) != _temporary_identity(before):
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict while opening {name}"
+                    )
+                _delete_tree_contents_fd(child_fd)
+            finally:
+                os.close(child_fd)
+            try:
+                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before removing {name}"
+                ) from error
+            if _temporary_identity(active) != _temporary_identity(before):
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before removing {name}"
+                )
+            os.rmdir(name, dir_fd=directory_fd)
+        else:
+            try:
+                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before unlinking {name}"
+                ) from error
+            if _temporary_identity(active) != _temporary_identity(before):
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before unlinking {name}"
+                )
+            os.unlink(name, dir_fd=directory_fd)
+
+
+def _restore_cleanup_claim(parent_fd: int, quarantine_name: str, temporary_name: str) -> None:
+    try:
+        _darwin_renameat(
+            parent_fd,
+            quarantine_name,
+            parent_fd,
+            temporary_name,
+            RENAME_EXCL,
+        )
+    except OSError as error:
+        raise TemporaryCleanupConflict(
+            f"temporary cleanup conflict; unknown entry preserved as {quarantine_name}"
+        ) from error
+
+
+def _cleanup_owned_temporary(
+    parent_fd: int,
+    temporary_name: str,
+    created_identity: tuple[int, int, int],
+) -> None:
+    while True:
+        quarantine_name = f".cleanup-{uuid.uuid4().hex}"
+        try:
+            _darwin_renameat(
+                parent_fd,
+                temporary_name,
+                parent_fd,
+                quarantine_name,
+                RENAME_EXCL,
+            )
+            break
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict; {temporary_name} could not be claimed"
+            ) from error
+
+    try:
+        claimed = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise TemporaryCleanupConflict(
+            f"temporary cleanup conflict; claimed entry {quarantine_name} disappeared"
+        ) from error
+    if _temporary_identity(claimed) != created_identity:
+        _restore_cleanup_claim(parent_fd, quarantine_name, temporary_name)
+        raise TemporaryCleanupConflict(
+            f"temporary cleanup conflict; unknown entry restored as {temporary_name}"
+        )
+
+    if stat.S_ISDIR(claimed.st_mode):
+        try:
+            directory_fd = os.open(quarantine_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict while opening {quarantine_name}"
+            ) from error
+        try:
+            if _temporary_identity(os.fstat(directory_fd)) != created_identity:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict while opening {quarantine_name}"
+                )
+            _delete_tree_contents_fd(directory_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            active = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict before removing {quarantine_name}"
+            ) from error
+        if _temporary_identity(active) != created_identity:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict before removing {quarantine_name}"
+            )
+        os.rmdir(quarantine_name, dir_fd=parent_fd)
+    else:
+        try:
+            active = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict before unlinking {quarantine_name}"
+            ) from error
+        if _temporary_identity(active) != created_identity:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict before unlinking {quarantine_name}"
+            )
+        os.unlink(quarantine_name, dir_fd=parent_fd)
 
 
 def _managed_current_matches(install_fd: int, link_text: str) -> bool:
@@ -507,24 +750,11 @@ def _managed_current_matches(install_fd: int, link_text: str) -> bool:
 
 def _activate_release(install_root: pathlib.Path, install_fd: int, version: str) -> None:
     link_text = str(pathlib.Path("releases") / version)
-    if _entry_exists(install_fd, "current"):
-        if _managed_current_matches(install_fd, link_text):
-            return
-        raise FileExistsError("current already exists and is not the requested managed link")
-    while True:
-        temporary_name = f".current.tmp-{uuid.uuid4().hex}"
-        try:
-            os.symlink(link_text, temporary_name, dir_fd=install_fd)
-            break
-        except FileExistsError:
-            continue
-    temporary_link = _AnchoredPath(install_fd, temporary_name, install_root / temporary_name)
-    current = _AnchoredPath(install_fd, "current", install_root / "current")
     try:
-        _atomic_rename_exclusive(temporary_link, current)
+        os.symlink(link_text, "current", dir_fd=install_fd)
     except FileExistsError as error:
         if not _managed_current_matches(install_fd, link_text):
-            raise FileExistsError("current appeared concurrently with unknown content") from error
+            raise FileExistsError("current exists with unknown or different content") from error
 
 
 def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dict[str, str]:
@@ -532,10 +762,14 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
     if sys.platform != "darwin":
         raise NotImplementedError("runtime installation requires Darwin atomic rename support")
     source = pathlib.Path(source_root)
-    _validate_source_tree(source)
-    manifest = read_release_manifest(source / "release.json")
+    expected_entries = _snapshot_source_release(source)
+    manifest_content = expected_entries["release.json"][1]
+    if manifest_content is None:
+        raise ValueError("release manifest snapshot is missing content")
+    manifest = json.loads(manifest_content.decode("utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("release manifest must contain a JSON object")
     version = _validate_manifest(manifest)
-    expected_entries = _source_entries(source)
     install_root, install_fd, releases, releases_fd = _open_install_layout(paths)
     try:
         destination = _AnchoredPath(releases_fd, version, releases / version)
@@ -556,24 +790,78 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
             temporary_name,
             releases / temporary_name,
         )
-        temporary_fd = os.open(temporary_name, _DIRECTORY_OPEN_FLAGS, dir_fd=releases_fd)
         try:
-            _copy_release_content(source, temporary_release)
-            if _release_entries_fd(temporary_fd) != expected_entries:
-                raise ValueError("copied release content is incomplete or inconsistent")
-            _make_private_fd(temporary_fd)
+            temporary_fd = os.open(temporary_name, _DIRECTORY_OPEN_FLAGS, dir_fd=releases_fd)
+        except Exception as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict; {temporary_name} could not be opened safely"
+            ) from error
+        try:
+            opened_temporary = os.fstat(temporary_fd)
+        except Exception as error:
+            os.close(temporary_fd)
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict; {temporary_name} ownership could not be established"
+            ) from error
+        temporary_identity = _temporary_identity(opened_temporary)
+        if (
+            not stat.S_ISDIR(opened_temporary.st_mode)
+            or stat.S_IMODE(opened_temporary.st_mode) != 0o700
+            or os.listdir(temporary_fd)
+        ):
+            os.close(temporary_fd)
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict; {temporary_name} is not the created empty directory"
+            )
+        temporary_release.directory_fd = temporary_fd
+        published = False
+        try:
+            _copy_release_content(expected_entries, temporary_release)
+            try:
+                _verify_and_make_private_fd(temporary_fd, expected_entries)
+            except FileExistsError as error:
+                raise ValueError("copied release content is incomplete or inconsistent") from error
+            try:
+                active_before_publish = os.stat(
+                    temporary_name,
+                    dir_fd=releases_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} changed before publication"
+                ) from error
+            if _temporary_identity(active_before_publish) != temporary_identity:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} changed before publication"
+                )
             try:
                 _atomic_rename_exclusive(temporary_release, destination)
+                published = True
             except FileExistsError as error:
                 try:
                     _verify_and_make_private_release(destination, expected_entries)
                 except FileExistsError as conflict:
                     raise conflict from error
-        except Exception:
-            _make_private_fd(temporary_fd)
-            raise
+            try:
+                active_temporary = os.stat(
+                    temporary_name,
+                    dir_fd=releases_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                active_temporary = None
+            if not published and (
+                active_temporary is None
+                or _temporary_identity(active_temporary) != temporary_identity
+            ):
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} changed before publication"
+                )
         finally:
             os.close(temporary_fd)
+            if not published:
+                _cleanup_owned_temporary(releases_fd, temporary_name, temporary_identity)
 
         _activate_release(install_root, install_fd, version)
         return {"version": version}
