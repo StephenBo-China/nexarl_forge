@@ -7,10 +7,12 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import unittest
 from unittest import mock
 
@@ -69,7 +71,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.preview", return_value={"status": "missing"}) as preview, \
-                mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created"}, {"status": "created"}]) as repair, \
+                mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created", "changed": True}, {"status": "created", "changed": True}]) as repair, \
                 mock.patch("vibe_memory_cli.subprocess.run") as run:
             code, output, _ = self.invoke(args)
         self.assertEqual(code, 0)
@@ -156,16 +158,25 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertTrue(output["rollback"]["ok"])
         self.assertTrue(output["rollback"]["data_retained"])
         self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
+        self.assertFalse((self.paths.install_root / "config.json").exists())
         self.assertEqual(before, {path: path.read_bytes() for path in before})
         self.assertFalse(list(codex.parent.glob("hooks.json.bak.*")))
         self.assertFalse(list(claude.parent.glob("settings.json.bak.*")))
 
     def test_real_install_keeps_codex_and_claude_hooks_on_current_symlink(self) -> None:
         code, output, stderr = self.invoke([
-            "install", "--source-root", str(ROOT), "--with-claude-hooks"
+            "install", "--source-root", str(ROOT), "--with-claude-hooks", "--port", "9123"
         ])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(output["status"], "installed")
+        runtime_config = self.paths.install_root / "config.json"
+        self.assertEqual(json.loads(runtime_config.read_text(encoding="utf-8")), {
+            "app_version": "1.0.0",
+            "port": 9123,
+            "schema_version": 1,
+            "service": "vibe-memory",
+        })
+        self.assertEqual(stat.S_IMODE(runtime_config.stat().st_mode), 0o600)
         stable = str(
             self.paths.install_root / "current/scripts/vibe_memory_cli.py"
         )
@@ -191,7 +202,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             )
         }
         code, repeated, stderr = self.invoke([
-            "install", "--source-root", str(ROOT), "--with-claude-hooks"
+            "install", "--source-root", str(ROOT), "--with-claude-hooks", "--port", "9123"
         ])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(repeated["hooks"]["codex"]["status"], "current")
@@ -199,15 +210,26 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(before, {path: path.read_bytes() for path in before})
 
     def test_open_only_invokes_usr_bin_open_after_loopback_health(self) -> None:
-        with mock.patch("vibe_memory_cli.health_ok", return_value=True), mock.patch(
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0"
+        )
+        healthy = {
+            "ok": True,
+            "status": "healthy",
+            "url": "http://127.0.0.1:9123/",
+        }
+        with mock.patch("vibe_memory_cli.health_status", return_value=healthy) as health, mock.patch(
             "vibe_memory_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)
         ) as run:
             code, output, _ = self.invoke(["open"])
         self.assertEqual(code, 0)
-        run.assert_called_once_with(["/usr/bin/open", "http://127.0.0.1:8897/"], check=False)
+        health.assert_called_once_with(self.paths)
+        run.assert_called_once_with(["/usr/bin/open", "http://127.0.0.1:9123/"], check=False)
         self.assertEqual(output["status"], "opened")
 
-        with mock.patch("vibe_memory_cli.health_ok", return_value=False), mock.patch(
+        with mock.patch("vibe_memory_cli.health_status", return_value={
+            "ok": False, "status": "wrong_service", "url": "http://127.0.0.1:9123/"
+        }), mock.patch(
             "vibe_memory_cli.subprocess.run"
         ) as run:
             code, output, stderr = self.invoke(["open"])
@@ -215,6 +237,57 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertIsNone(output)
         self.assertIn("health", stderr)
         run.assert_not_called()
+
+    def test_health_rejects_redirect_and_wrong_service_identity(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0"
+        )
+        redirect = urllib.error.HTTPError(
+            "http://127.0.0.1:9123/health", 302, "Found", {}, None
+        )
+        opener = mock.Mock()
+        opener.open.side_effect = redirect
+        with mock.patch("vibe_memory_cli.urllib.request.build_opener", return_value=opener):
+            redirected = vibe_memory_cli.health_status(self.paths)
+        redirect.close()
+        self.assertFalse(redirected["ok"])
+        self.assertEqual(redirected["status"], "unreachable")
+
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = "http://127.0.0.1:9123/health"
+        response.read.return_value = json.dumps({
+            "ok": True, "service": "something-else", "app_version": "1.0.0"
+        }).encode("utf-8")
+        response.__enter__.return_value = response
+        opener.open.side_effect = None
+        opener.open.return_value = response
+        with mock.patch("vibe_memory_cli.urllib.request.build_opener", return_value=opener):
+            wrong = vibe_memory_cli.health_status(self.paths)
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["status"], "wrong_service")
+
+    def test_health_uses_real_persisted_custom_port(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0"
+        )
+        response = mock.MagicMock()
+        response.status = 200
+        response.geturl.return_value = "http://127.0.0.1:9123/health"
+        response.read.return_value = json.dumps({
+            "ok": True,
+            "service": "vibe-memory",
+            "app_version": "1.0.0",
+            "data_schema_version": 1,
+        }).encode("utf-8")
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch("vibe_memory_cli.urllib.request.build_opener", return_value=opener):
+            health = vibe_memory_cli.health_status(self.paths)
+        self.assertTrue(health["ok"])
+        self.assertEqual(health["url"], "http://127.0.0.1:9123/")
+        opener.open.assert_called_once_with("http://127.0.0.1:9123/health", timeout=0.6)
 
     def test_project_register_list_unregister_and_explicit_init(self) -> None:
         notes = pathlib.Path(self.temporary.name) / "notes"

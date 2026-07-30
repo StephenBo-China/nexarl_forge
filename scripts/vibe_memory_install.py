@@ -1107,6 +1107,91 @@ def render_launch_agent(paths: RuntimePaths, port: int = 8897) -> str:
     return rendered
 
 
+def render_runtime_config(port: int, app_version: str) -> str:
+    if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("port must be an integer from 1 through 65535")
+    if not isinstance(app_version, str) or not _VERSION_PATTERN.fullmatch(app_version):
+        raise ValueError("app_version must be a semantic version")
+    return json.dumps(
+        {
+            "app_version": app_version,
+            "port": port,
+            "schema_version": 1,
+            "service": "vibe-memory",
+        },
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
+
+
+def install_runtime_config(
+    paths: RuntimePaths, *, port: int, app_version: str
+) -> dict[str, object]:
+    content = render_runtime_config(port, app_version).encode("utf-8")
+    parent = pathlib.Path(paths.install_root)
+    _validate_install_ancestor_chain(parent)
+    parent_fd = _open_or_create_directory_chain(_canonical_install_path(parent))
+    name = "config.json"
+    target = parent / name
+    try:
+        if _entry_exists(parent_fd, name):
+            current = _read_regular_file_at(parent_fd, name, target)
+            if current == content:
+                return {"changed": False, "path": str(target)}
+        temporary_name = f".{name}.tmp-{uuid.uuid4().hex}"
+        descriptor = os.open(
+            temporary_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise OSError("short runtime config write")
+                offset += written
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            if _entry_exists(parent_fd, name):
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("runtime config target must be a regular file")
+            os.replace(temporary_name, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        return {"changed": True, "path": str(target)}
+    finally:
+        os.close(parent_fd)
+
+
+def read_runtime_config(paths: RuntimePaths) -> dict[str, object]:
+    target = pathlib.Path(paths.install_root) / "config.json"
+    _validate_install_ancestor_chain(target.parent)
+    canonical_parent = _canonical_install_path(target.parent)
+    parent_fd = os.open(canonical_parent, _DIRECTORY_OPEN_FLAGS)
+    try:
+        raw = _read_regular_file_at(parent_fd, target.name, target)
+    finally:
+        os.close(parent_fd)
+    value = json.loads(raw.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("runtime config must contain an object")
+    expected = render_runtime_config(value.get("port"), value.get("app_version"))
+    normalized = json.loads(expected)
+    if value != normalized:
+        raise ValueError("runtime config has an invalid structure")
+    return value
+
+
 def install_launch_agent(paths: RuntimePaths, content: str) -> dict[str, object]:
     """Atomically install the managed LaunchAgent without following symlinks."""
     home = pathlib.Path(paths.personal_memory).parents[1]

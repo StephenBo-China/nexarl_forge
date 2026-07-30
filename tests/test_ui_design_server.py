@@ -45,6 +45,13 @@ class UIDesignServerTest(unittest.TestCase):
         self.environment.stop()
         self.temporary.cleanup()
 
+    def test_health_payload_has_stable_service_identity_and_version(self) -> None:
+        payload = server.health_payload()
+        self.assertEqual(payload["service"], "vibe-memory")
+        self.assertEqual(payload["app_version"], "1.0.0")
+        self.assertEqual(payload["data_schema_version"], 1)
+        self.assertIs(payload["ok"], True)
+
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(
             "/api/ui-design/context", {"project": str(self.project)}

@@ -20,10 +20,21 @@ import ui_design_gate
 import ui_design_preferences
 import ui_skill_publisher
 import ui_skill_registry
+import vibe_memory_paths
 
 
 HOST = review.REVIEW_HOST
 PORT = review.REVIEW_PORT
+
+
+def health_payload() -> dict[str, object]:
+    manifest = vibe_memory_paths.read_release_manifest(review.APP_ROOT / "release.json")
+    return {
+        "ok": True,
+        "service": "vibe-memory",
+        "app_version": manifest["app_version"],
+        "data_schema_version": manifest["data_schema_version"],
+    }
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -2427,7 +2438,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=ui_design_error_status(exc))
             return
         if parsed.path == "/health":
-            self.send_json({"ok": True, "url": review.REVIEW_URL})
+            self.send_json(health_payload())
             return
         if parsed.path == "/api/queue":
             self.send_json(review.load_queue(refresh=True))

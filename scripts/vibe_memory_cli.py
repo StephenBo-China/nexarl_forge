@@ -28,7 +28,6 @@ except ImportError:
     pass
 
 
-REVIEW_URL = "http://127.0.0.1:8897/"
 DOCTOR_KEYS = ("runtime", "codex_hooks", "claude_hooks", "service", "data")
 
 
@@ -44,12 +43,57 @@ def _json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
 
 
-def health_ok(timeout: float = 0.6) -> bool:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: object, fp: object, code: int, msg: str, headers: object, newurl: str) -> None:
+        return None
+
+
+def health_status(
+    paths: vibe_memory_paths.RuntimePaths, timeout: float = 0.6
+) -> dict[str, object]:
     try:
-        with urllib.request.urlopen(REVIEW_URL + "health", timeout=timeout) as response:
-            return response.status == 200
-    except (OSError, urllib.error.URLError):
-        return False
+        config = vibe_memory_install.read_runtime_config(paths)
+        port = config["port"]
+        url = f"http://127.0.0.1:{port}/"
+    except Exception:
+        return {
+            "ok": False,
+            "status": "config_invalid",
+            "url": None,
+            "action": "run install",
+        }
+    try:
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(url + "health", timeout=timeout) as response:
+            if response.status != 200 or response.geturl() != url + "health":
+                raise ValueError("unexpected health response")
+            raw = response.read(4097)
+            if len(raw) > 4096:
+                raise ValueError("health response is too large")
+            payload = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError):
+        return {
+            "ok": False,
+            "status": "unreachable",
+            "url": url,
+            "action": "start the LaunchAgent service",
+        }
+    identity_ok = (
+        isinstance(payload, dict)
+        and payload.get("ok") is True
+        and payload.get("service") == "vibe-memory"
+        and payload.get("app_version") == config["app_version"]
+    )
+    return {
+        "ok": identity_ok,
+        "status": "healthy" if identity_ok else "wrong_service",
+        "url": url,
+        "action": None if identity_ok else "stop the conflicting service and start Vibe Memory",
+    }
+
+
+def health_ok(paths: vibe_memory_paths.RuntimePaths, timeout: float = 0.6) -> bool:
+    return bool(health_status(paths, timeout=timeout)["ok"])
 
 
 def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str, object]]:
@@ -67,7 +111,7 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
         paths.project_registry,
     )
     data_ok = all(path.is_file() and not path.is_symlink() for path in data_files)
-    service_ok = health_ok()
+    service = health_status(paths)
     return {
         "runtime": {
             "ok": runtime_ok,
@@ -87,12 +131,7 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
             "path": claude["path"],
             "action": None if claude["status"] in {"current", "missing"} else "run install --with-claude-hooks",
         },
-        "service": {
-            "ok": service_ok,
-            "status": "healthy" if service_ok else "unreachable",
-            "url": REVIEW_URL,
-            "action": None if service_ok else "start the LaunchAgent service",
-        },
+        "service": service,
         "data": {
             "ok": data_ok,
             "status": "ready" if data_ok else "missing",
@@ -181,13 +220,16 @@ def install_command(args: argparse.Namespace) -> int:
     if args.with_claude_hooks:
         hook_targets.append((home / ".claude/settings.json", "claude-code", "claude"))
     launch_agent = home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+    runtime_config_path = paths.install_root / "config.json"
     try:
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
         plist = vibe_memory_install.render_launch_agent(paths, port=args.port)
+        vibe_memory_install.render_runtime_config(args.port, validated["version"])
         for target, agent, _name in hook_targets:
             vibe_memory_hooks.preview(target, agent, runtime)
         snapshots = {target: _snapshot_managed_file(target) for target, _agent, _name in hook_targets}
         snapshots[launch_agent] = _snapshot_managed_file(launch_agent)
+        snapshots[runtime_config_path] = _snapshot_managed_file(runtime_config_path)
         current_before = _snapshot_current(runtime)
     except Exception:
         _json({"status": "failed", "phase": "preflight", "error": "installation preflight failed"})
@@ -195,19 +237,29 @@ def install_command(args: argparse.Namespace) -> int:
 
     data: dict[str, object] | None = None
     hooks: dict[str, dict[str, object]] = {}
+    changed_paths: set[pathlib.Path] = set()
     try:
         installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
         data = vibe_memory_install.prepare_data(paths)
+        runtime_config = vibe_memory_install.install_runtime_config(
+            paths, port=args.port, app_version=installed["version"]
+        )
+        if runtime_config["changed"]:
+            changed_paths.add(runtime_config_path)
         plist_result = vibe_memory_install.install_launch_agent(paths, plist)
+        if plist_result["changed"]:
+            changed_paths.add(launch_agent)
         for target, agent, name in hook_targets:
             hooks[name] = vibe_memory_hooks.repair(target, agent, runtime)
-        _json({"status": "installed", "runtime": installed, "data": data, "launch_agent": plist_result, "hooks": hooks})
+            if hooks[name]["changed"]:
+                changed_paths.add(target)
+        _json({"status": "installed", "runtime": installed, "runtime_config": runtime_config, "data": data, "launch_agent": plist_result, "hooks": hooks})
         return 0
     except Exception:
         rollback_errors = []
-        for target, snapshot in snapshots.items():
+        for target in changed_paths:
             try:
-                _restore_managed_file(target, snapshot)
+                _restore_managed_file(target, snapshots[target])
             except Exception:
                 rollback_errors.append(str(target))
         try:
@@ -251,12 +303,15 @@ def doctor_command(_args: argparse.Namespace) -> int:
 
 
 def open_command(_args: argparse.Namespace) -> int:
-    if not health_ok():
+    paths = vibe_memory_paths.for_home()
+    health = health_status(paths)
+    if not health["ok"]:
         raise LifecycleError("local health endpoint is unavailable")
-    completed = subprocess.run(["/usr/bin/open", REVIEW_URL], check=False)
+    url = str(health["url"])
+    completed = subprocess.run(["/usr/bin/open", url], check=False)
     if completed.returncode:
         raise LifecycleError("open command failed")
-    _json({"status": "opened", "url": REVIEW_URL})
+    _json({"status": "opened", "url": url})
     return 0
 
 
