@@ -5,6 +5,7 @@ import os
 import pathlib
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,29 @@ import vibe_memory_hooks as hooks
 
 
 class ManagedCommandTest(unittest.TestCase):
+    def test_generated_command_executes_in_bin_sh_without_marker_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            runtime = pathlib.Path(value) / 'runtime with "quotes" and \'apostrophe\''
+            script = runtime / "scripts" / "vibe_memory_cli.py"
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8"
+            )
+
+            result = subprocess.run(
+                ["/bin/sh", "-c", hooks.command(runtime, "claude-code", "PostCompact")],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                ["hook", "--agent", "claude-code", "--event", "PostCompact"],
+            )
+
     def test_command_covers_both_clients_and_shell_safe_runtime_paths(self) -> None:
         runtime = '/tmp/Vibe Runtime/with "quotes" and \'apostrophe\''
 
@@ -45,6 +69,8 @@ class MergeDocumentTest(unittest.TestCase):
         command_prefix, command_comment = managed.split(" # ", 1)
         custom_commands = [
             f"printf '%s' '{hooks.MANAGED_SIGNATURE}'",
+            command_prefix,
+            managed + " ",
             f"{command_prefix} extra-token # {command_comment}",
             "/usr/bin/python3 /tmp/not-vibe.py hook --agent codex --event Stop",
             "/usr/bin/python3 /runtime/scripts/vibe_memory_cli.py hook --agent other --event Stop",
@@ -163,6 +189,29 @@ class MergeDocumentTest(unittest.TestCase):
 
 
 class DocumentIOTest(unittest.TestCase):
+    def test_load_rejects_bom_utf16_and_utf32_without_repair_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            payloads = (
+                b"\xef\xbb\xbf" + b'{"hooks": {}}',
+                '{"hooks": {}}'.encode("utf-16"),
+                '{"hooks": {}}'.encode("utf-32"),
+            )
+            for index, original in enumerate(payloads):
+                path = root / f"encoded-{index}.json"
+                path.write_bytes(original)
+                before_mtime = path.stat().st_mtime_ns
+
+                with self.assertRaisesRegex(ValueError, "UTF-8"):
+                    hooks.load_document(path)
+                self.assertEqual(hooks.status(path, "codex", "/runtime")["status"], "malformed")
+                with self.assertRaisesRegex(ValueError, "UTF-8"):
+                    hooks.repair(path, "codex", "/runtime")
+
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(path.stat().st_mtime_ns, before_mtime)
+                self.assertEqual(list(root.glob(f"{path.name}.bak.*")), [])
+
     def test_symlink_configs_are_rejected_without_changing_live_or_broken_targets(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -353,6 +402,56 @@ class DocumentIOTest(unittest.TestCase):
 
 
 class StatusAndRepairTest(unittest.TestCase):
+    def test_repair_rejects_same_byte_external_inode_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            original = b'{"hooks": {}}\n'
+            path.write_bytes(original)
+            original_inode = path.stat().st_ino
+            real_write = hooks.write_with_backup
+
+            def replace_inode(target, document, **kwargs):
+                replacement = pathlib.Path(value) / "external-same-bytes.json"
+                replacement.write_bytes(original)
+                os.replace(replacement, target)
+                return real_write(target, document, **kwargs)
+
+            with mock.patch("vibe_memory_hooks.write_with_backup", side_effect=replace_inode):
+                with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently"):
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertNotEqual(path.stat().st_ino, original_inode)
+            self.assertEqual(list(path.parent.glob("hooks.json.bak.*")), [])
+
+    def test_repair_restores_external_write_to_held_inode_during_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            original = b'{"hooks": {}}\n'
+            external = b'{"external": "final-window", "hooks": {}}\n'
+            path.write_bytes(original)
+            real_replace = os.replace
+            injected = False
+
+            def race_replace(source, destination):
+                nonlocal injected
+                if not injected and pathlib.Path(destination) == path:
+                    path.write_bytes(external)
+                    injected = True
+                return real_replace(source, destination)
+
+            with mock.patch("vibe_memory_hooks.os.replace", side_effect=race_replace):
+                with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently") as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), external)
+            self.assertIsNotNone(raised.exception.backup)
+            self.assertIsNotNone(raised.exception.attempt)
+            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
+            attempt = pathlib.Path(raised.exception.attempt)
+            self.assertIn(hooks.MANAGED_SIGNATURE.encode(), attempt.read_bytes())
+
     def test_repair_compare_and_swap_rejects_noncooperating_external_edit(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "hooks.json"

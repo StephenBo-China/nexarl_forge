@@ -1,4 +1,11 @@
-"""Safely merge Vibe Memory's managed Codex and Claude Code hook entries."""
+"""Safely merge Vibe Memory's managed Codex and Claude Code hook entries.
+
+POSIX does not provide a pathname-level byte compare-and-swap for writers that
+ignore our lock. Repair therefore holds the validated source inode open through
+replacement and recovers writes reproduced on that inode. Identity and content
+checks also avoid blindly replacing a newer pathname, though no userspace
+protocol can eliminate every race with a fully noncooperating writer.
+"""
 
 from __future__ import annotations
 
@@ -23,6 +30,17 @@ _NO_SOURCE_CHECK = object()
 
 class ConcurrentConfigChange(RuntimeError):
     """Raised when a config changes after repair loaded it."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        backup: pathlib.Path | None = None,
+        attempt: pathlib.Path | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.backup = str(backup) if backup is not None else None
+        self.attempt = str(attempt) if attempt is not None else None
 
 
 class ConfigWriteError(OSError):
@@ -67,8 +85,12 @@ def _require_document(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
 def _is_managed_handler(handler: Any) -> bool:
     if not isinstance(handler, dict) or not isinstance(handler.get("command"), str):
         return False
+    marker = f" # {MANAGED_SIGNATURE}"
+    if not handler["command"].endswith(marker):
+        return False
+    command_text = handler["command"][:-len(marker)]
     try:
-        tokens = shlex.split(handler["command"], comments=True, posix=True)
+        tokens = shlex.split(command_text, comments=False, posix=True)
     except ValueError:
         return False
     if len(tokens) != 7:
@@ -169,9 +191,17 @@ def _reject_json_constant(value: str) -> None:
 
 
 def _parse_document_bytes(target: pathlib.Path, raw: bytes) -> dict[str, Any]:
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raise ValueError(
+            f"Invalid UTF-8 hook configuration {target}: byte-order marks are not allowed"
+        )
     try:
-        value = json.loads(raw, parse_constant=_reject_json_constant)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Invalid UTF-8 hook configuration {target}: {exc}") from exc
+    try:
+        value = json.loads(text, parse_constant=_reject_json_constant)
+    except (json.JSONDecodeError, ValueError) as exc:
         detail = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
         raise ValueError(f"Invalid JSON in hook configuration {target}: {detail}") from exc
     if not isinstance(value, dict):
@@ -196,9 +226,13 @@ def _serialized_document(value: Any) -> bytes:
 
 
 def _backup_path(path: pathlib.Path, suffix: int = 0) -> pathlib.Path:
+    return _artifact_path(path, "bak", suffix)
+
+
+def _artifact_path(path: pathlib.Path, label: str, suffix: int = 0) -> pathlib.Path:
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     extra = f"-{suffix}" if suffix else ""
-    return path.with_name(f"{path.name}.bak.{stamp}{extra}")
+    return path.with_name(f"{path.name}.{label}.{stamp}{extra}")
 
 
 def _write_all(descriptor: int, content: bytes) -> None:
@@ -219,15 +253,15 @@ def _fsync_directory(path: pathlib.Path) -> None:
         os.close(descriptor)
 
 
-def _create_backup_exclusive(
-    target: pathlib.Path, content: bytes, mode: int
+def _create_artifact_exclusive(
+    target: pathlib.Path, content: bytes, mode: int, label: str
 ) -> pathlib.Path:
     suffix = 0
     while True:
-        backup = _backup_path(target, suffix)
+        artifact = _artifact_path(target, label, suffix)
         try:
             descriptor = os.open(
-                backup, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode
+                artifact, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode
             )
         except FileExistsError:
             suffix += 1
@@ -238,16 +272,28 @@ def _create_backup_exclusive(
             os.fsync(descriptor)
         except Exception:
             os.close(descriptor)
-            backup.unlink(missing_ok=True)
+            artifact.unlink(missing_ok=True)
             raise
         else:
             os.close(descriptor)
         try:
             _fsync_directory(target.parent)
         except Exception:
-            backup.unlink(missing_ok=True)
+            artifact.unlink(missing_ok=True)
             raise
-        return backup
+        return artifact
+
+
+def _create_backup_exclusive(
+    target: pathlib.Path, content: bytes, mode: int
+) -> pathlib.Path:
+    return _create_artifact_exclusive(target, content, mode, "bak")
+
+
+def _create_attempt_exclusive(
+    target: pathlib.Path, content: bytes, mode: int
+) -> pathlib.Path:
+    return _create_artifact_exclusive(target, content, mode, "attempt")
 
 
 def _ensure_parent(target: pathlib.Path) -> None:
@@ -265,11 +311,76 @@ def _source_bytes(target: pathlib.Path) -> bytes | None:
         return None
 
 
+def _open_source_descriptor(target: pathlib.Path) -> int | None:
+    _reject_symlink(target)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(target, flags)
+    except FileNotFoundError:
+        return None
+
+
+def _descriptor_bytes(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 64 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _path_matches(
+    target: pathlib.Path, identity: tuple[int, int], content: bytes
+) -> bool:
+    _reject_symlink(target)
+    try:
+        before = target.stat()
+        current = target.read_bytes()
+        after = target.stat()
+    except FileNotFoundError:
+        return False
+    return _identity(before) == identity == _identity(after) and current == content
+
+
+def _restore_external_bytes(
+    target: pathlib.Path,
+    external_content: bytes,
+    mode: int,
+    manager_identity: tuple[int, int],
+    manager_content: bytes,
+) -> bool:
+    if not _path_matches(target, manager_identity, manager_content):
+        return False
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.restore.", dir=target.parent
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(external_content)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        if not _path_matches(target, manager_identity, manager_content):
+            return False
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def write_with_backup(
     path: str | pathlib.Path,
     value: Any,
     *,
     expected_source: bytes | None | object = _NO_SOURCE_CHECK,
+    _source_descriptor: int | None = None,
 ) -> dict[str, Any]:
     """Atomically write an object, retaining a permission-preserving backup on change."""
     target = pathlib.Path(path)
@@ -285,34 +396,97 @@ def write_with_backup(
     else:
         existing_mode = stat.S_IMODE(target.stat().st_mode)
 
+    held_descriptor = _source_descriptor
+    owns_descriptor = False
+    if (
+        held_descriptor is None
+        and expected_source is not _NO_SOURCE_CHECK
+        and expected_source is not None
+    ):
+        held_descriptor = _open_source_descriptor(target)
+        owns_descriptor = True
+    if held_descriptor is not None and expected_source is not _NO_SOURCE_CHECK:
+        if _descriptor_bytes(held_descriptor) != expected_source:
+            if owns_descriptor:
+                os.close(held_descriptor)
+            raise ConcurrentConfigChange(
+                f"hook configuration changed concurrently: {target}"
+            )
+        held_metadata = os.fstat(held_descriptor)
+        held_identity = _identity(held_metadata)
+        held_mode = stat.S_IMODE(held_metadata.st_mode)
+    else:
+        held_identity = None
+        held_mode = existing_mode
+
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temporary = pathlib.Path(temporary_name)
     backup: pathlib.Path | None = None
+    attempt: pathlib.Path | None = None
     replaced = False
+    manager_identity: tuple[int, int] | None = None
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fchmod(handle.fileno(), existing_mode)
             os.fsync(handle.fileno())
+            manager_identity = _identity(os.fstat(handle.fileno()))
         current_source = _source_bytes(target)
-        if expected_source is not _NO_SOURCE_CHECK and current_source != expected_source:
-            raise ConcurrentConfigChange(
-                f"hook configuration changed concurrently: {target}"
-            )
+        if expected_source is not _NO_SOURCE_CHECK:
+            source_matches = current_source == expected_source
+            if source_matches and held_identity is not None:
+                source_matches = _path_matches(target, held_identity, expected_source)
+            if not source_matches:
+                raise ConcurrentConfigChange(
+                    f"hook configuration changed concurrently: {target}"
+                )
         if current_source == content:
             temporary.unlink(missing_ok=True)
             return {"changed": False, "path": str(target), "backup": None}
         if current_source is not None:
             current_mode = stat.S_IMODE(target.stat().st_mode)
             backup = _create_backup_exclusive(target, current_source, current_mode)
-        if expected_source is not _NO_SOURCE_CHECK and _source_bytes(target) != expected_source:
-            raise ConcurrentConfigChange(
-                f"hook configuration changed concurrently: {target}"
-            )
+        if expected_source is not _NO_SOURCE_CHECK:
+            source_matches = _source_bytes(target) == expected_source
+            if source_matches and held_identity is not None:
+                source_matches = _path_matches(target, held_identity, expected_source)
+            if not source_matches:
+                raise ConcurrentConfigChange(
+                    f"hook configuration changed concurrently: {target}"
+                )
         os.replace(temporary, target)
         replaced = True
+        if held_descriptor is not None and expected_source is not _NO_SOURCE_CHECK:
+            external_content = _descriptor_bytes(held_descriptor)
+            if external_content != expected_source:
+                attempt = _create_attempt_exclusive(target, content, existing_mode)
+                restored = (
+                    manager_identity is not None
+                    and _restore_external_bytes(
+                        target,
+                        external_content,
+                        held_mode,
+                        manager_identity,
+                        content,
+                    )
+                )
+                outcome = "external bytes restored" if restored else "newer active path preserved"
+                raise ConcurrentConfigChange(
+                    f"hook configuration changed concurrently; {outcome}: {target}",
+                    backup=backup,
+                    attempt=attempt,
+                )
         _fsync_directory(target.parent)
+    except ConcurrentConfigChange:
+        temporary.unlink(missing_ok=True)
+        if not replaced and backup is not None and backup.exists():
+            backup.unlink(missing_ok=True)
+            try:
+                _fsync_directory(target.parent)
+            except OSError:
+                pass
+        raise
     except Exception as exc:
         temporary.unlink(missing_ok=True)
         if replaced:
@@ -329,6 +503,9 @@ def write_with_backup(
             except OSError:
                 pass
         raise
+    finally:
+        if owns_descriptor and held_descriptor is not None:
+            os.close(held_descriptor)
     return {
         "changed": True,
         "path": str(target),
@@ -361,19 +538,33 @@ def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
     lock_path = target.with_name(f".{target.name}.vibe-memory.lock")
     with exclusive_lock(lock_path):
         _reject_symlink(target)
-        source = _source_bytes(target)
-        existed = source is not None
-        current = _parse_document_bytes(target, source) if existed else {"hooks": {}}
-        expected = merge_document(current, agent, runtime)
-        if current == expected:
-            return {
-                "changed": False,
-                "path": str(target),
-                "backup": None,
-                "status": "current",
-            }
-        result = write_with_backup(target, expected, expected_source=source)
-        result["status"] = "created" if result["changed"] and not existed else (
-            "updated" if result["changed"] else "current"
-        )
-        return result
+        source_descriptor = _open_source_descriptor(target)
+        try:
+            source = (
+                _descriptor_bytes(source_descriptor)
+                if source_descriptor is not None
+                else None
+            )
+            existed = source is not None
+            current = _parse_document_bytes(target, source) if existed else {"hooks": {}}
+            expected = merge_document(current, agent, runtime)
+            if current == expected:
+                return {
+                    "changed": False,
+                    "path": str(target),
+                    "backup": None,
+                    "status": "current",
+                }
+            result = write_with_backup(
+                target,
+                expected,
+                expected_source=source,
+                _source_descriptor=source_descriptor,
+            )
+            result["status"] = "created" if result["changed"] and not existed else (
+                "updated" if result["changed"] else "current"
+            )
+            return result
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
