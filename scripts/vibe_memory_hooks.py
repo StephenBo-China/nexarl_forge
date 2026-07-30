@@ -5,6 +5,9 @@ and ``RENAME_EXCL`` for new files. The exchanged-out file is verified before
 the change is accepted, closing the final pathname race against atomic saves.
 Unknown displaced versions are moved to exclusive, fsynced recovery artifacts;
 only an inode whose identity and bytes match the manager attempt is disposable.
+Recovery swaps converge by inode-and-bytes observation order and are bounded;
+an infinite noncooperating writer can make "newest active" impossible, so the
+manager stops with every observed version retained and an explicit conflict.
 Other POSIX systems retain the weaker userspace inode/content CAS fallback:
 it detects and recovers many noncooperating writes, but cannot eliminate every
 race without an equivalent kernel exchange primitive.
@@ -33,6 +36,7 @@ AGENTS = ("codex", "claude-code")
 _NO_SOURCE_CHECK = object()
 RENAME_SWAP = 0x00000002
 RENAME_EXCL = 0x00000004
+DARWIN_RECOVERY_SWAP_LIMIT = 8
 
 
 class ConcurrentConfigChange(RuntimeError):
@@ -50,6 +54,10 @@ class ConcurrentConfigChange(RuntimeError):
         self.backup = str(backup) if backup is not None else None
         self.attempt = str(attempt) if attempt is not None else None
         self.recovery_paths = [str(path) for path in recovery_paths or []]
+
+
+class ContinuousConfigChange(ConcurrentConfigChange):
+    """Raised when noncooperating writers prevent bounded swap convergence."""
 
 
 class ConfigWriteError(OSError):
@@ -483,85 +491,93 @@ def _recover_darwin_source_mismatch(
     content: bytes,
     manager_mode: int,
 ) -> NoReturn:
-    """Bounded recovery that never discards an unidentified exchanged version."""
-    first = _snapshot_path(temporary)
+    """Converge observed external versions without discarding any held version."""
+    seen: set[tuple[tuple[int, int], bytes]] = set()
     recovery_paths: list[pathlib.Path] = []
+    first_artifact: pathlib.Path | None = None
 
-    if manager_identity is None or not _path_matches(target, manager_identity, content):
-        backup = _promote_unknown_or_report(target, temporary)
-        recovery_paths.append(backup)
-        attempt = _preserve_manager_attempt(
-            target, temporary, manager_identity, content, manager_mode
-        )
-        raise ConcurrentConfigChange(
-            f"hook configuration changed concurrently; newer active path preserved: {target}",
-            backup=backup,
-            attempt=attempt,
-            recovery_paths=recovery_paths,
-        )
+    for _ in range(DARWIN_RECOVERY_SWAP_LIMIT):
+        observed = _snapshot_path(temporary)
+        if observed is None:
+            backup = _promote_unknown_or_report(target, temporary)
+            recovery_paths.append(backup)
+            attempt = _preserve_manager_attempt(
+                target, temporary, manager_identity, content, manager_mode
+            )
+            raise ConcurrentConfigChange(
+                f"hook configuration changed concurrently; recovery versions retained: "
+                f"{target}",
+                backup=first_artifact or backup,
+                attempt=attempt,
+                recovery_paths=recovery_paths,
+            )
 
-    _darwin_rename(temporary, target, RENAME_SWAP)
-    if manager_identity is not None and _path_matches(
-        temporary, manager_identity, content
-    ):
-        attempt = _preserve_manager_attempt(
-            target, temporary, manager_identity, content, manager_mode
-        )
-        raise ConcurrentConfigChange(
-            f"hook configuration changed concurrently; external bytes restored: {target}",
-            attempt=attempt,
-            recovery_paths=[attempt] if attempt is not None else [],
-        )
+        identity, observed_content, observed_mode = observed
+        key = identity, observed_content
+        if key in seen:
+            displaced = _promote_unknown_or_report(target, temporary)
+            recovery_paths.append(displaced)
+            attempt = _preserve_manager_attempt(
+                target, temporary, manager_identity, content, manager_mode
+            )
+            if attempt is not None:
+                recovery_paths.append(attempt)
+            raise ConcurrentConfigChange(
+                f"hook configuration changed concurrently; recovery swaps converged: "
+                f"{target}",
+                backup=first_artifact or displaced,
+                attempt=attempt,
+                recovery_paths=recovery_paths,
+            )
 
-    second = _snapshot_path(temporary)
-    if first is None or second is None:
-        backup = _promote_unknown_or_report(target, temporary)
-        recovery_paths.append(backup)
-        attempt = _preserve_manager_attempt(
-            target, temporary, manager_identity, content, manager_mode
-        )
-        raise ConcurrentConfigChange(
-            f"hook configuration changed concurrently; recovery versions retained: {target}",
-            backup=backup,
-            attempt=attempt,
-            recovery_paths=recovery_paths,
-        )
+        seen.add(key)
+        try:
+            artifact = _create_artifact_exclusive(
+                target, observed_content, observed_mode, "conflict"
+            )
+        except Exception:
+            attempt = _preserve_manager_attempt(
+                target, temporary, manager_identity, content, manager_mode
+            )
+            raise ConcurrentConfigChange(
+                f"hook configuration changed concurrently; recovery version retained: "
+                f"{target}",
+                backup=temporary,
+                attempt=attempt,
+                recovery_paths=[*recovery_paths, temporary],
+            )
+        recovery_paths.append(artifact)
+        if first_artifact is None:
+            first_artifact = artifact
 
-    first_identity, first_content, first_mode = first
-    second_identity, second_content, second_mode = second
-    try:
-        first_artifact = _create_artifact_exclusive(
-            target, first_content, first_mode, "conflict"
-        )
-        second_artifact = _create_artifact_exclusive(
-            target, second_content, second_mode, "conflict"
-        )
-    except Exception:
-        backup = temporary
-        attempt = _preserve_manager_attempt(
-            target, temporary, manager_identity, content, manager_mode
-        )
-        raise ConcurrentConfigChange(
-            f"hook configuration changed concurrently; recovery versions retained: {target}",
-            backup=backup,
-            attempt=attempt,
-            recovery_paths=[temporary],
-        )
-    recovery_paths.extend((first_artifact, second_artifact))
-
-    if _path_matches(target, first_identity, first_content) and _path_matches(
-        temporary, second_identity, second_content
-    ):
         _darwin_rename(temporary, target, RENAME_SWAP)
-        displaced = _promote_unknown_or_report(target, temporary)
-        recovery_paths.append(displaced)
+        if manager_identity is not None and _path_matches(
+            temporary, manager_identity, content
+        ):
+            attempt = _preserve_manager_attempt(
+                target, temporary, manager_identity, content, manager_mode
+            )
+            if attempt is not None:
+                recovery_paths.append(attempt)
+            raise ConcurrentConfigChange(
+                f"hook configuration changed concurrently; recovery swaps converged: "
+                f"{target}",
+                backup=first_artifact,
+                attempt=attempt,
+                recovery_paths=recovery_paths,
+            )
 
+    latest = _promote_unknown_or_report(target, temporary)
+    recovery_paths.append(latest)
     attempt = _preserve_manager_attempt(
         target, temporary, manager_identity, content, manager_mode
     )
-    raise ConcurrentConfigChange(
-        f"hook configuration changed concurrently; recovery versions preserved: {target}",
-        backup=first_artifact,
+    if attempt is not None:
+        recovery_paths.append(attempt)
+    raise ContinuousConfigChange(
+        f"hook configuration changed concurrently; continuous concurrent writes prevented "
+        f"recovery convergence after {DARWIN_RECOVERY_SWAP_LIMIT} swaps: {target}",
+        backup=first_artifact or latest,
         attempt=attempt,
         recovery_paths=recovery_paths,
     )

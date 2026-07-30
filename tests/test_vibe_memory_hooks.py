@@ -446,6 +446,100 @@ class DocumentIOTest(unittest.TestCase):
 
 class StatusAndRepairTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_converges_e3_active_and_preserves_e1_e2(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            versions = {
+                1: b'{"external": "E1", "hooks": {}}\n',
+                2: b'{"external": "E2", "hooks": {}}\n',
+                3: b'{"external": "E3", "hooks": {}}\n',
+            }
+            path.write_bytes(versions[1])
+            real_rename = hooks._darwin_rename
+            swap_count = 0
+
+            def race_each_correction(source, destination, flags):
+                nonlocal swap_count
+                if flags == hooks.RENAME_SWAP:
+                    swap_count += 1
+                    if swap_count <= 3:
+                        replacement = root / f"external-{swap_count}.json"
+                        replacement.write_bytes(versions[swap_count])
+                        os.replace(replacement, destination)
+                return real_rename(source, destination, flags)
+
+            with mock.patch(
+                "vibe_memory_hooks._darwin_rename", side_effect=race_each_correction
+            ):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertGreaterEqual(swap_count, 4)
+            self.assertEqual(path.read_bytes(), versions[3])
+            conflict_contents = {
+                artifact.read_bytes() for artifact in root.glob("hooks.json.conflict.*")
+            }
+            self.assertIn(versions[1], conflict_contents)
+            self.assertIn(versions[2], conflict_contents)
+            self.assertIsNotNone(raised.exception.attempt)
+            self.assertIn(
+                hooks.MANAGED_SIGNATURE.encode(),
+                pathlib.Path(raised.exception.attempt).read_bytes(),
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_continuous_writer_stops_at_bound_without_losing_versions(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            initial = b'{"external": "E0", "hooks": {}}\n'
+            path.write_bytes(initial)
+            real_rename = hooks._darwin_rename
+            injected: list[bytes] = []
+            swap_count = 0
+
+            def continuous_writer(source, destination, flags):
+                nonlocal swap_count
+                if flags == hooks.RENAME_SWAP:
+                    swap_count += 1
+                    version = (
+                        initial
+                        if swap_count == 1
+                        else json.dumps({"external": f"E{swap_count}", "hooks": {}}).encode()
+                        + b"\n"
+                    )
+                    replacement = root / f"external-{swap_count}.json"
+                    replacement.write_bytes(version)
+                    os.replace(replacement, destination)
+                    injected.append(version)
+                return real_rename(source, destination, flags)
+
+            with mock.patch(
+                "vibe_memory_hooks._darwin_rename", side_effect=continuous_writer
+            ):
+                with self.assertRaisesRegex(
+                    hooks.ContinuousConfigChange, "continuous concurrent writes"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertEqual(
+                swap_count,
+                hooks.DARWIN_RECOVERY_SWAP_LIMIT + 1,
+            )
+            retained_paths = [
+                path,
+                *root.glob("hooks.json.conflict.*"),
+                *root.glob("hooks.json.attempt.*"),
+            ]
+            retained_contents = {retained.read_bytes() for retained in retained_paths}
+            self.assertTrue(set(injected).issubset(retained_contents))
+            self.assertIn("continuous", str(raised.exception))
+            self.assertGreaterEqual(len(raised.exception.recovery_paths), len(injected))
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
     def test_repair_rollback_race_keeps_e2_active_and_preserves_e1(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -668,7 +762,8 @@ class StatusAndRepairTest(unittest.TestCase):
 
             self.assertTrue(injected)
             self.assertEqual(path.read_bytes(), external)
-            self.assertIsNone(raised.exception.backup)
+            self.assertIsNotNone(raised.exception.backup)
+            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), external)
             self.assertIsNotNone(raised.exception.attempt)
             self.assertIn(
                 hooks.MANAGED_SIGNATURE.encode(),
@@ -810,7 +905,10 @@ class StatusAndRepairTest(unittest.TestCase):
             self.assertTrue(injected)
             self.assertEqual(path.read_bytes(), external)
             if sys.platform == "darwin":
-                self.assertIsNone(raised.exception.backup)
+                self.assertIsNotNone(raised.exception.backup)
+                self.assertEqual(
+                    pathlib.Path(raised.exception.backup).read_bytes(), external
+                )
             else:
                 self.assertIsNotNone(raised.exception.backup)
                 self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
