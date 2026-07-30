@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 import memory_project
@@ -39,6 +40,36 @@ PROJECT_LONG = CODEX_DIR / "codex_long_memory.md"
 PROJECT_QUEUE = CODEX_DIR / "memory_review_queue.json"
 PROJECT_STATE = CODEX_DIR / "memory_review_state.json"
 SOURCE_EVENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+RESERVED_CANDIDATE_METADATA_KEYS = {
+    "approval_rule",
+    "approved_path",
+    "approved_target",
+    "candidate_id",
+    "category",
+    "content_digest",
+    "created",
+    "decided_at",
+    "equivalence",
+    "identity",
+    "memory_id",
+    "policy_version",
+    "quarantine_path",
+    "reason",
+    "risk_flags",
+    "scope",
+    "source_agent",
+    "source_agents",
+    "source_event",
+    "source_path",
+    "status",
+    "target",
+}
+RESERVED_CANDIDATE_METADATA_LINE = re.compile(
+    r"^(?:-\s*)?(?:"
+    + "|".join(re.escape(key) for key in sorted(RESERVED_CANDIDATE_METADATA_KEYS))
+    + r")\s*:",
+    flags=re.IGNORECASE,
+)
 
 PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
 PERSONAL_PROPOSALS = PERSONAL_DIR / "proposals.md"
@@ -338,6 +369,20 @@ def risk_flags(text: str) -> list[str]:
     return sorted(name for name, pattern in SENSITIVE_PATTERNS.items() if pattern.search(text))
 
 
+def validate_candidate_text(title: str, summary: str, source_event: str) -> None:
+    """Reject candidate prose that can escape or spoof trusted Markdown metadata."""
+    if not isinstance(source_event, str) or not SOURCE_EVENT_PATTERN.fullmatch(source_event):
+        raise ValueError("source_event must be a safe metadata identifier")
+    if "```" in title or "```" in summary:
+        raise ValueError("candidate title/summary cannot contain fenced Markdown")
+    for value in (title, summary):
+        if any(
+            RESERVED_CANDIDATE_METADATA_LINE.match(line)
+            for line in re.split(r"[\r\n]", value)
+        ):
+            raise ValueError("candidate title/summary cannot contain reserved metadata lines")
+
+
 def is_noise_personal_candidate(item: dict[str, Any]) -> bool:
     if item.get("scope") != "personal" or item.get("status", "pending") != "pending":
         return False
@@ -390,6 +435,18 @@ def _state_map_unlocked() -> dict[str, Any]:
 def state_map() -> dict[str, Any]:
     with exclusive_lock(state_lock_path()):
         return _state_map_unlocked()
+
+
+def mutate_state(
+    mutation: Callable[[dict[str, Any]], bool],
+) -> tuple[dict[str, Any], bool]:
+    """Apply one state read-modify-write transaction under the shared lock."""
+    with exclusive_lock(state_lock_path()):
+        state = _state_map_unlocked()
+        changed = mutation(state)
+        if changed:
+            write_json(PROJECT_STATE, state)
+        return state, changed
 
 
 def parse_project_candidates() -> list[dict[str, Any]]:
@@ -511,6 +568,7 @@ def create_agent_candidate(
     policy_version: int = 1,
 ) -> dict[str, Any]:
     """Persist a candidate already distilled by the active Codex/Claude model."""
+    validate_candidate_text(title, summary, source_event)
     title = re.sub(r"\s+", " ", title).strip()[:100]
     summary = summary.strip()
     if scope not in {"personal", "project"}:
@@ -523,8 +581,6 @@ def create_agent_candidate(
         raise ValueError("unsupported candidate category")
     if source_agent not in {"codex", "claude-code", "unknown"}:
         raise ValueError("source_agent must be codex, claude-code, or unknown")
-    if not isinstance(source_event, str) or not SOURCE_EVENT_PATTERN.fullmatch(source_event):
-        raise ValueError("source_event must be a safe metadata identifier")
     if (
         not isinstance(policy_version, int)
         or isinstance(policy_version, bool)
@@ -533,8 +589,6 @@ def create_agent_candidate(
         raise ValueError("policy_version must be a positive integer")
     if not title or len(summary) < 12 or len(summary) > 1200:
         raise ValueError("candidate title/summary length is invalid")
-    if "```" in title or "```" in summary:
-        raise ValueError("candidate title/summary cannot contain fenced Markdown")
     if risk_flags(f"{title}\n{summary}"):
         raise ValueError("candidate contains sensitive material")
     markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
@@ -690,6 +744,16 @@ def append_official_memory(path: pathlib.Path, item: dict[str, Any], content: st
     atomic_write_text(path, read_text(path) + entry, mode=mode)
 
 
+def official_contains_content_digest(
+    official_text: str, content: str, content_digest: str
+) -> bool:
+    """Recognize an exact approved body so reset/reapprove stays idempotent."""
+    canonical_content = content.strip()
+    if hashlib.sha256(canonical_content.encode("utf-8")).hexdigest() != content_digest:
+        return False
+    return f"\n\n{canonical_content}\n" in official_text
+
+
 def decision_target_path(target: str) -> pathlib.Path:
     if target == "project_long":
         return PROJECT_LONG
@@ -751,20 +815,24 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
                     previous_mode = stat.S_IMODE(destination.stat().st_mode)
                 except FileNotFoundError:
                     previous_mode = 0o644
-                append_official_memory(destination, item, approved_content)
+                already_official = official_contains_content_digest(
+                    previous_official, approved_content, content_digest
+                )
+                if not already_official:
+                    append_official_memory(destination, item, approved_content)
                 state["items"][candidate_id] = decision
                 try:
                     write_json(PROJECT_STATE, state)
                 except BaseException:
-                    atomic_write_text(destination, previous_official, mode=previous_mode)
+                    if not already_official:
+                        atomic_write_text(destination, previous_official, mode=previous_mode)
                     raise
     build_queue()
     return find_item(candidate_id)
 
 
 def record_decision(candidate_id: str, decision: dict[str, Any]) -> None:
-    with exclusive_lock(state_lock_path()):
-        state = _state_map_unlocked()
+    def update(state: dict[str, Any]) -> bool:
         existing = state["items"].get(candidate_id)
         if existing:
             comparable_existing = {
@@ -775,9 +843,11 @@ def record_decision(candidate_id: str, decision: dict[str, Any]) -> None:
             }
             if comparable_existing != comparable_new:
                 raise ValueError(f"decision conflict for candidate {candidate_id}")
-        else:
-            state["items"][candidate_id] = decision
-            write_json(PROJECT_STATE, state)
+            return False
+        state["items"][candidate_id] = decision
+        return True
+
+    mutate_state(update)
     build_queue()
 
 
@@ -790,11 +860,13 @@ def defer(candidate_id: str) -> None:
 
 
 def reset(candidate_id: str) -> None:
-    with exclusive_lock(state_lock_path()):
-        state = _state_map_unlocked()
+    def update(state: dict[str, Any]) -> bool:
         if candidate_id in state.get("items", {}):
             state["items"].pop(candidate_id)
-            write_json(PROJECT_STATE, state)
+            return True
+        return False
+
+    mutate_state(update)
     build_queue()
 
 
@@ -876,9 +948,11 @@ def should_remind(queue: dict[str, Any], force: bool = False) -> bool:
 
 
 def mark_reminded() -> None:
-    state = state_map()
-    state["last_reminder_at"] = now()
-    write_json(PROJECT_STATE, state)
+    def update(state: dict[str, Any]) -> bool:
+        state["last_reminder_at"] = now()
+        return True
+
+    mutate_state(update)
 
 
 def review_summary(queue: dict[str, Any]) -> str:
