@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import pathlib
 import shlex
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -265,6 +266,7 @@ class VibeMemoryRouterTest(unittest.TestCase):
         command = context.split(marker, 1)[1].splitlines()[0]
         script = ROOT / "scripts" / "memory_review.py"
         expected_parts = [
+            "env",
             f"MEMORY_REVIEW_PROJECT_ROOT={project}",
             "python3",
             str(script),
@@ -280,6 +282,38 @@ class VibeMemoryRouterTest(unittest.TestCase):
         ]
         self.assertEqual(shlex.split(command), expected_parts)
         self.assertEqual(command, " ".join(shlex.quote(part) for part in expected_parts))
+
+    def test_build_context_command_executes_hostile_project_root_with_bin_sh(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            scripts = temp / "fake scripts"
+            scripts.mkdir()
+            fake_router = scripts / "vibe_memory_router.py"
+            fake_script = scripts / "memory_review.py"
+            fake_script.write_text(
+                "import json, os, sys\n"
+                "print(json.dumps({'root': os.environ.get('MEMORY_REVIEW_PROJECT_ROOT'), "
+                "'argv': sys.argv[1:]}))\n",
+                encoding="utf-8",
+            )
+            project = temp / "project with spaces ' $(touch injected) `touch injected2`"
+            with mock.patch("vibe_memory_router.__file__", str(fake_router)):
+                context = build_context(self.event(), project_root=project, pending={})
+            command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
+
+            completed = subprocess.run(
+                ["/bin/sh", "-c", command],
+                cwd=temp,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["root"], str(project))
+            self.assertEqual(payload["argv"][0], "propose")
+            self.assertFalse((temp / "injected").exists())
+            self.assertFalse((temp / "injected2").exists())
 
 
 if __name__ == "__main__":

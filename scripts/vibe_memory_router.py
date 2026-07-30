@@ -115,7 +115,11 @@ def build_context(
             *required,
         ]
         project_section = f"\nRegistered project: `{_markdown_escape(root)}`\n"
-        command_parts.insert(0, f"MEMORY_REVIEW_PROJECT_ROOT={root}")
+        command_parts = [
+            "env",
+            f"MEMORY_REVIEW_PROJECT_ROOT={root}",
+            *command_parts,
+        ]
     required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
     project_categories = ", ".join(PROJECT_CATEGORIES)
