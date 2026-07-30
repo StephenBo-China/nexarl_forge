@@ -96,7 +96,14 @@ def _managed_group(runtime: str | pathlib.Path, agent: str, event: str) -> dict[
 def merge_document(value: Any, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
     """Safely merge exactly one managed handler group into every supported event."""
     _validate_agent_event(agent, EVENTS[0])
-    copied = remove_managed_entries(value)
+    if not isinstance(value, dict):
+        raise ValueError("hook configuration root must be an object")
+    copied = copy.deepcopy(value)
+    if "hooks" not in copied:
+        copied["hooks"] = {}
+    elif not isinstance(copied["hooks"], dict):
+        raise ValueError("hook configuration hooks must be an object")
+    copied = remove_managed_entries(copied)
     _, hook_events = _require_document(copied)
     for event in EVENTS:
         groups = hook_events.get(event)
@@ -208,6 +215,8 @@ def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
     existed = target.exists()
     current = load_document(target) if existed else {"hooks": {}}
     expected = merge_document(current, agent, runtime)
+    if current == expected:
+        return {"changed": False, "path": str(target), "backup": None, "status": "current"}
     result = write_with_backup(target, expected)
     result["status"] = "created" if result["changed"] and not existed else (
         "updated" if result["changed"] else "current"

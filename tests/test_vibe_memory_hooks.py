@@ -40,6 +40,15 @@ class ManagedCommandTest(unittest.TestCase):
 
 
 class MergeDocumentTest(unittest.TestCase):
+    def test_merge_installs_into_object_without_hooks_and_preserves_unknown_fields(self) -> None:
+        source = {"custom": {"keep": True}}
+
+        merged = hooks.merge_document(source, "codex", "/runtime")
+
+        self.assertEqual(source, {"custom": {"keep": True}})
+        self.assertEqual(merged["custom"], source["custom"])
+        self.assertEqual(set(merged["hooks"]), set(hooks.EVENTS))
+
     def test_merge_preserves_custom_groups_and_custom_handler_in_same_group(self) -> None:
         source = {
             "custom": {"keep": True},
@@ -182,6 +191,45 @@ class DocumentIOTest(unittest.TestCase):
 
 
 class StatusAndRepairTest(unittest.TestCase):
+    def test_missing_hooks_object_is_drifted_without_mutation_then_repaired(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            for index, document in enumerate(({}, {"custom": {"keep": True}})):
+                path = root / f"hooks-{index}.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                before = path.read_bytes()
+                before_mtime = path.stat().st_mtime_ns
+
+                self.assertEqual(hooks.status(path, "codex", "/runtime")["status"], "drifted")
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(path.stat().st_mtime_ns, before_mtime)
+
+                repaired = hooks.repair(path, "codex", "/runtime")
+                self.assertTrue(repaired["changed"])
+                self.assertEqual(repaired["status"], "updated")
+                self.assertEqual(hooks.status(path, "codex", "/runtime")["status"], "current")
+                merged = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(merged.get("custom"), document.get("custom"))
+                self.assertEqual(set(merged["hooks"]), set(hooks.EVENTS))
+
+    def test_repair_does_not_rewrite_structurally_current_document_with_different_formatting(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            current = hooks.merge_document({"hooks": {}}, "codex", "/runtime")
+            path.write_text(
+                json.dumps(current, separators=(",", ":"), sort_keys=True), encoding="utf-8"
+            )
+            before = path.read_bytes()
+            before_mtime = path.stat().st_mtime_ns
+
+            result = hooks.repair(path, "codex", "/runtime")
+
+            self.assertFalse(result["changed"])
+            self.assertEqual(result["status"], "current")
+            self.assertIsNone(result["backup"])
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(path.stat().st_mtime_ns, before_mtime)
+
     def test_status_and_repair_report_missing_current_drifted_and_malformed_without_unwanted_writes(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "nested" / "hooks.json"
