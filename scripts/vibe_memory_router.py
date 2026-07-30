@@ -10,15 +10,13 @@ import os
 import pathlib
 import shlex
 import stat
-import subprocess
-import sys
 import time
 import uuid
 from typing import Any, Mapping
 
 import memory_project
+import memory_review_queue
 import vibe_memory_paths
-from loop_superpowers import atomic_write_text
 from ui_design_store import atomic_write_json
 from vibe_memory_events import NormalizedEvent, normalize_event
 
@@ -42,9 +40,10 @@ IDEMPOTENCY_FILENAME = "hook_events.json"
 PACKET_NAMES = ("codex_context_packet.md", "shared_memory_context_packet.md")
 PACKET_LOCK_NAME = ".vibe-memory-packets.lock"
 PACKET_JOURNAL_NAME = ".vibe-memory-packets-journal.json"
+QUEUE_LOCK_NAME = "memory_review_queue.json.lock"
 PROTECTED_CODEX_NAMES = (
     "memory_review_queue.json",
-    "memory_review_queue.json.lock",
+    QUEUE_LOCK_NAME,
     "memory_review_state.json",
     "memory_review_state.json.lock",
     *PACKET_NAMES,
@@ -335,58 +334,106 @@ def _idempotency_path() -> pathlib.Path:
     return runtime.install_root / "state" / IDEMPOTENCY_FILENAME
 
 
-def _safe_codex_dir(project_root: pathlib.Path) -> pathlib.Path:
+def _directory_open_flags() -> int:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _validate_name(name: str) -> None:
+    if not name or pathlib.PurePath(name).name != name or name in {".", ".."}:
+        raise ValueError("unsafe project memory filename")
+
+
+def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
+    _validate_name(name)
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+@contextlib.contextmanager
+def _open_codex_dir(project_root: pathlib.Path):
     root = pathlib.Path(project_root).resolve()
-    codex = root / "codex"
-    if codex.is_symlink():
-        raise ValueError("unsafe project memory directory")
-    codex.mkdir(parents=False, exist_ok=True)
-    if not codex.is_dir() or codex.resolve() != codex:
-        raise ValueError("unsafe project memory directory")
-    for name in PROTECTED_CODEX_NAMES:
-        if (codex / name).is_symlink():
-            raise ValueError("unsafe project memory path")
-    return codex
+    root_fd = os.open(root, _directory_open_flags())
+    codex_fd = -1
+    try:
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise ValueError("unsafe registered project root")
+        try:
+            os.mkdir("codex", mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            codex_fd = os.open("codex", _directory_open_flags(), dir_fd=root_fd)
+        except OSError as error:
+            raise ValueError("unsafe project memory directory") from error
+        opened = os.fstat(codex_fd)
+        linked = _stat_at(root_fd, "codex")
+        if (
+            linked is None
+            or not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(linked.st_mode)
+            or (opened.st_dev, opened.st_ino) != (linked.st_dev, linked.st_ino)
+        ):
+            raise ValueError("unsafe project memory directory")
+        for name in PROTECTED_CODEX_NAMES:
+            target = _stat_at(codex_fd, name)
+            if target is not None and stat.S_ISLNK(target.st_mode):
+                raise ValueError("unsafe project memory path")
+        yield codex_fd
+    finally:
+        if codex_fd >= 0:
+            os.close(codex_fd)
+        os.close(root_fd)
 
 
 def _refresh_review_queue(project_root: pathlib.Path) -> Mapping[str, int]:
     """Refresh and return counts for exactly one registered project."""
-    codex = _safe_codex_dir(project_root)
-    script = pathlib.Path(__file__).resolve().parent / "memory_review_queue.py"
-    environment = os.environ.copy()
-    environment["MEMORY_REVIEW_PROJECT_ROOT"] = str(project_root)
-    subprocess.run(
-        [sys.executable, str(script), "refresh"],
-        cwd=project_root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        timeout=8,
-        check=True,
-    )
-    _safe_codex_dir(project_root)
-    queue_path = codex / "memory_review_queue.json"
+    project_root = pathlib.Path(project_root).resolve()
+    personal_source = pathlib.Path.home() / ".codex" / "personal_memory" / "proposals.md"
     try:
-        queue_text = _read_packet(queue_path)
-        if queue_text is None:
-            raise ValueError("missing queue")
-        queue = json.loads(queue_text)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid memory review queue {queue_path}: {error}") from error
-    if not isinstance(queue, dict) or not isinstance(queue.get("counts"), dict):
-        raise ValueError(f"invalid memory review queue {queue_path}: missing counts")
-    return queue["counts"]
+        personal_text = personal_source.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        personal_text = ""
+    with _open_codex_dir(project_root) as codex_fd, _advisory_lock_at(
+        codex_fd, QUEUE_LOCK_NAME
+    ):
+        project_text = _read_at(codex_fd, "memory_proposals.md") or ""
+        state_text = _read_at(codex_fd, "memory_review_state.json")
+        default_state: dict[str, Any] = {"items": {}, "last_reminder_at": ""}
+        try:
+            state = json.loads(state_text) if state_text is not None else default_state
+        except json.JSONDecodeError:
+            state = default_state
+        if not isinstance(state, dict):
+            state = default_state
+        state.setdefault("items", {})
+        state.setdefault("last_reminder_at", "")
+        if state_text is None:
+            _atomic_write_json_at(codex_fd, "memory_review_state.json", state)
+        queue = memory_review_queue.build_queue_from_documents(
+            project_text,
+            personal_text,
+            state,
+            project_source_path=project_root / "codex" / "memory_proposals.md",
+            personal_source_path=personal_source,
+        )
+        _atomic_write_json_at(codex_fd, "memory_review_queue.json", queue)
+        return queue["counts"]
 
 
 @contextlib.contextmanager
-def _project_packet_lock(codex: pathlib.Path):
-    lock_path = codex / PACKET_LOCK_NAME
-    if lock_path.is_symlink():
-        raise ValueError("unsafe packet lock")
+def _advisory_lock_at(directory_fd: int, name: str):
+    _validate_name(name)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    descriptor = os.open(lock_path, flags, 0o600)
+    descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
     try:
         os.fchmod(descriptor, 0o600)
         if not stat.S_ISREG(os.fstat(descriptor).st_mode):
@@ -397,29 +444,76 @@ def _project_packet_lock(codex: pathlib.Path):
         os.close(descriptor)
 
 
-def _fsync_directory(path: pathlib.Path) -> None:
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
-    descriptor = os.open(path, flags)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+def _fsync_directory(directory_fd: int) -> None:
+    os.fsync(directory_fd)
 
 
-def _atomic_write_packet(path: pathlib.Path, content: str) -> None:
-    if path.is_symlink():
+def _atomic_write_at(
+    directory_fd: int,
+    name: str,
+    content: str,
+    mode: int = 0o644,
+) -> None:
+    _validate_name(name)
+    target = _stat_at(directory_fd, name)
+    if target is not None and stat.S_ISLNK(target.st_mode):
         raise ValueError("unsafe packet path")
-    atomic_write_text(path, content)
+    temporary_name = f".{name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(
+        temporary_name,
+        flags,
+        mode,
+        dir_fd=directory_fd,
+    )
+    temporary_exists = True
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, mode="w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        target = _stat_at(directory_fd, name)
+        if target is not None and stat.S_ISLNK(target.st_mode):
+            raise ValueError("unsafe packet path")
+        os.replace(
+            temporary_name,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temporary_exists = False
+        _fsync_directory(directory_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temporary_exists:
+            try:
+                os.unlink(temporary_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
 
 
-def _read_packet(path: pathlib.Path) -> str | None:
+def _atomic_write_json_at(
+    directory_fd: int,
+    name: str,
+    payload: object,
+    mode: int = 0o600,
+) -> None:
+    content = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    _atomic_write_at(directory_fd, name, content, mode)
+
+
+def _read_at(directory_fd: int, name: str) -> str | None:
+    _validate_name(name)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags)
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -437,30 +531,28 @@ def _read_packet(path: pathlib.Path) -> str | None:
             os.close(descriptor)
 
 
-def _restore_packet(path: pathlib.Path, content: object) -> None:
-    if path.is_symlink():
-        raise ValueError("unsafe packet path")
+def _restore_at(directory_fd: int, name: str, content: object) -> None:
     if content is None:
-        path.unlink(missing_ok=True)
+        _unlink_at(directory_fd, name)
     elif isinstance(content, str):
-        _atomic_write_packet(path, content)
+        _atomic_write_at(directory_fd, name, content)
     else:
         raise ValueError("invalid packet rollback journal")
 
 
-def _remove_journal(journal: pathlib.Path) -> None:
-    journal.unlink(missing_ok=True)
-    _fsync_directory(journal.parent)
-
-
-def _recover_packet_transaction(codex: pathlib.Path) -> None:
-    journal = codex / PACKET_JOURNAL_NAME
-    if not journal.exists():
+def _unlink_at(directory_fd: int, name: str) -> None:
+    target = _stat_at(directory_fd, name)
+    if target is None:
         return
-    if journal.is_symlink():
-        raise ValueError("unsafe packet journal")
+    if stat.S_ISLNK(target.st_mode):
+        raise ValueError("unsafe packet path")
+    os.unlink(name, dir_fd=directory_fd)
+    _fsync_directory(directory_fd)
+
+
+def _recover_packet_transaction(directory_fd: int) -> None:
     try:
-        journal_text = _read_packet(journal)
+        journal_text = _read_at(directory_fd, PACKET_JOURNAL_NAME)
         if journal_text is None:
             return
         value = json.loads(journal_text)
@@ -472,32 +564,30 @@ def _recover_packet_transaction(codex: pathlib.Path) -> None:
     if value.get("version") != 1 or not isinstance(content, str):
         raise ValueError("invalid packet transaction journal")
     for name in PACKET_NAMES:
-        _atomic_write_packet(codex / name, content)
-    _remove_journal(journal)
+        _atomic_write_at(directory_fd, name, content)
+    _unlink_at(directory_fd, PACKET_JOURNAL_NAME)
 
 
 def _write_context_packets(project_root: pathlib.Path, content: str) -> None:
-    codex = _safe_codex_dir(project_root)
-    with _project_packet_lock(codex):
-        codex = _safe_codex_dir(project_root)
-        _recover_packet_transaction(codex)
-        targets = tuple(codex / name for name in PACKET_NAMES)
-        previous = [_read_packet(path) for path in targets]
-        journal = codex / PACKET_JOURNAL_NAME
-        atomic_write_json(
-            journal,
+    with _open_codex_dir(project_root) as codex_fd, _advisory_lock_at(
+        codex_fd, PACKET_LOCK_NAME
+    ):
+        _recover_packet_transaction(codex_fd)
+        previous = [_read_at(codex_fd, name) for name in PACKET_NAMES]
+        _atomic_write_json_at(
+            codex_fd,
+            PACKET_JOURNAL_NAME,
             {"version": 1, "new": content, "previous": previous},
         )
-        _fsync_directory(codex)
         try:
-            for path in targets:
-                _atomic_write_packet(path, content)
-            _remove_journal(journal)
+            for name in PACKET_NAMES:
+                _atomic_write_at(codex_fd, name, content)
+            _unlink_at(codex_fd, PACKET_JOURNAL_NAME)
         except BaseException:
             try:
-                for path, old_content in zip(targets, previous):
-                    _restore_packet(path, old_content)
-                _remove_journal(journal)
+                for name, old_content in zip(PACKET_NAMES, previous):
+                    _restore_at(codex_fd, name, old_content)
+                _unlink_at(codex_fd, PACKET_JOURNAL_NAME)
             except BaseException:
                 pass
             raise

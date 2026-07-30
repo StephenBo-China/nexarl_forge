@@ -452,12 +452,16 @@ def mutate_state(
         return state, changed
 
 
-def parse_project_candidates() -> list[dict[str, Any]]:
-    text = read_text(PROJECT_PROPOSALS)
+def parse_project_candidates(
+    text: str | None = None,
+    source_path: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
+    source_path = PROJECT_PROPOSALS if source_path is None else source_path
+    text = read_text(source_path) if text is None else text
     items: list[dict[str, Any]] = []
     for heading, body in split_heading_sections(text):
         candidate_id = metadata_value(body, "candidate_id") or stable_id(
-            "P", PROJECT_PROPOSALS, heading, body
+            "P", source_path, heading, body
         )
         created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
         source_event = metadata_value(body, "source_event")
@@ -482,7 +486,7 @@ def parse_project_candidates() -> list[dict[str, Any]]:
                 "identity": identity,
                 "equivalence": equivalence,
                 "category": category,
-                "source_path": str(PROJECT_PROPOSALS),
+                "source_path": str(source_path),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
                 "summary": short_summary(content),
@@ -493,8 +497,12 @@ def parse_project_candidates() -> list[dict[str, Any]]:
     return items
 
 
-def parse_personal_candidates() -> list[dict[str, Any]]:
-    text = read_text(PERSONAL_PROPOSALS)
+def parse_personal_candidates(
+    text: str | None = None,
+    source_path: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
+    source_path = PERSONAL_PROPOSALS if source_path is None else source_path
+    text = read_text(source_path) if text is None else text
     items: list[dict[str, Any]] = []
     for heading, body in split_heading_sections(text):
         memory_id = metadata_value(body, "memory_id")
@@ -528,7 +536,7 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
                 "identity": identity,
                 "equivalence": equivalence,
                 "category": category,
-                "source_path": str(PERSONAL_PROPOSALS),
+                "source_path": str(source_path),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
                 "summary": short_summary(content),
@@ -539,22 +547,48 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
     return items
 
 
+def build_queue_from_documents(
+    project_text: str,
+    personal_text: str,
+    state: dict[str, Any],
+    *,
+    project_source_path: pathlib.Path,
+    personal_source_path: pathlib.Path,
+) -> dict[str, Any]:
+    """Build queue data from caller-pinned documents without writing files."""
+    items = parse_project_candidates(
+        project_text, project_source_path
+    ) + parse_personal_candidates(personal_text, personal_source_path)
+    return _build_queue_from_items(items, state)
+
+
+def _build_queue_from_items(
+    items: list[dict[str, Any]], state: dict[str, Any]
+) -> dict[str, Any]:
+    decisions = state.get("items", {})
+    if not isinstance(decisions, dict):
+        decisions = {}
+    for item in items:
+        decision = decisions.get(item["id"], {})
+        if not isinstance(decision, dict):
+            decision = {}
+        item["status"] = decision.get("status", "pending")
+        item["decision"] = decision
+    return {
+        "generated_at": now(),
+        "review_url": REVIEW_URL,
+        "items": items,
+        "counts": count_items(items),
+    }
+
+
 def build_queue() -> dict[str, Any]:
     queue_lock = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
     with exclusive_lock(queue_lock):
-        state = state_map()
-        decisions = state.get("items", {})
-        items = parse_project_candidates() + parse_personal_candidates()
-        for item in items:
-            decision = decisions.get(item["id"], {})
-            item["status"] = decision.get("status", "pending")
-            item["decision"] = decision
-        queue = {
-            "generated_at": now(),
-            "review_url": REVIEW_URL,
-            "items": items,
-            "counts": count_items(items),
-        }
+        queue = _build_queue_from_items(
+            parse_project_candidates() + parse_personal_candidates(),
+            state_map(),
+        )
         write_json(PROJECT_QUEUE, queue)
         return queue
 

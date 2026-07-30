@@ -337,22 +337,24 @@ class VibeMemoryRouterTest(unittest.TestCase):
             second = codex / "shared_memory_context_packet.md"
             first.write_text("old\n", encoding="utf-8")
             second.write_text("old\n", encoding="utf-8")
-            original_write = vibe_memory_router._atomic_write_packet
+            original_write = vibe_memory_router._atomic_write_at
             failed = False
 
-            def fail_second_once(path: pathlib.Path, content: str) -> None:
+            def fail_second_once(
+                directory_fd: int, name: str, content: str, mode: int = 0o644
+            ) -> None:
                 nonlocal failed
                 if (
-                    path.name == "shared_memory_context_packet.md"
+                    name == "shared_memory_context_packet.md"
                     and content == "new\n"
                     and not failed
                 ):
                     failed = True
                     raise OSError("injected second write failure")
-                original_write(path, content)
+                original_write(directory_fd, name, content, mode)
 
             with mock.patch(
-                "vibe_memory_router._atomic_write_packet", side_effect=fail_second_once
+                "vibe_memory_router._atomic_write_at", side_effect=fail_second_once
             ):
                 with self.assertRaisesRegex(OSError, "second write failure"):
                     vibe_memory_router._write_context_packets(project, "new\n")
@@ -370,17 +372,19 @@ class VibeMemoryRouterTest(unittest.TestCase):
             second = codex / "shared_memory_context_packet.md"
             first.write_text("old\n", encoding="utf-8")
             second.write_text("old\n", encoding="utf-8")
-            original_write = vibe_memory_router._atomic_write_packet
+            original_write = vibe_memory_router._atomic_write_at
 
-            def interrupt_and_break_rollback(path: pathlib.Path, content: str) -> None:
-                if path.name == "shared_memory_context_packet.md" and content == "new\n":
+            def interrupt_and_break_rollback(
+                directory_fd: int, name: str, content: str, mode: int = 0o644
+            ) -> None:
+                if name == "shared_memory_context_packet.md" and content == "new\n":
                     raise OSError("injected crash before second write")
                 if content == "old\n":
                     raise OSError("injected crash during rollback")
-                original_write(path, content)
+                original_write(directory_fd, name, content, mode)
 
             with mock.patch(
-                "vibe_memory_router._atomic_write_packet",
+                "vibe_memory_router._atomic_write_at",
                 side_effect=interrupt_and_break_rollback,
             ):
                 with self.assertRaises(OSError):
@@ -399,16 +403,18 @@ class VibeMemoryRouterTest(unittest.TestCase):
             project = pathlib.Path(value)
             (project / "codex").mkdir()
             first_written = threading.Event()
-            original_write = vibe_memory_router._atomic_write_packet
+            original_write = vibe_memory_router._atomic_write_at
 
-            def slow_first_writer(path: pathlib.Path, content: str) -> None:
-                original_write(path, content)
-                if path.name == "codex_context_packet.md" and content == "first\n":
+            def slow_first_writer(
+                directory_fd: int, name: str, content: str, mode: int = 0o644
+            ) -> None:
+                original_write(directory_fd, name, content, mode)
+                if name == "codex_context_packet.md" and content == "first\n":
                     first_written.set()
                     time.sleep(0.15)
 
             with mock.patch(
-                "vibe_memory_router._atomic_write_packet", side_effect=slow_first_writer
+                "vibe_memory_router._atomic_write_at", side_effect=slow_first_writer
             ):
                 first_thread = threading.Thread(
                     target=vibe_memory_router._write_context_packets,
@@ -439,15 +445,92 @@ class VibeMemoryRouterTest(unittest.TestCase):
             root = pathlib.Path(value)
             outside = root / "outside.txt"
             outside.write_text("sentinel\n", encoding="utf-8")
-            packet = root / "packet.md"
-            packet.symlink_to(outside)
-
-            with self.assertRaisesRegex(ValueError, "unsafe packet path"):
-                vibe_memory_router._read_packet(packet)
-            with self.assertRaisesRegex(ValueError, "unsafe packet path"):
-                vibe_memory_router._atomic_write_packet(packet, "replacement\n")
+            (root / "packet.md").symlink_to(outside)
+            directory_fd = os.open(root, vibe_memory_router._directory_open_flags())
+            try:
+                with self.assertRaisesRegex(ValueError, "unsafe packet path"):
+                    vibe_memory_router._read_at(directory_fd, "packet.md")
+                with self.assertRaisesRegex(ValueError, "unsafe packet path"):
+                    vibe_memory_router._atomic_write_at(
+                        directory_fd, "packet.md", "replacement\n"
+                    )
+            finally:
+                os.close(directory_fd)
 
             self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
+
+    def test_packet_transaction_parent_swap_cannot_escape_open_codex_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            outside = project / "outside"
+            outside.mkdir()
+            held = project / "codex-held"
+            original_write = vibe_memory_router._atomic_write_at
+            swapped = False
+
+            def swap_parent_then_write(
+                directory_fd: int, name: str, content: str, mode: int = 0o644
+            ) -> None:
+                nonlocal swapped
+                if not swapped:
+                    codex.rename(held)
+                    codex.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                original_write(directory_fd, name, content, mode)
+
+            with mock.patch(
+                "vibe_memory_router._atomic_write_at",
+                side_effect=swap_parent_then_write,
+            ):
+                vibe_memory_router._write_context_packets(project, "safe\n")
+
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertEqual(
+                (held / "codex_context_packet.md").read_text(encoding="utf-8"),
+                "safe\n",
+            )
+            self.assertEqual(
+                (held / "shared_memory_context_packet.md").read_text(encoding="utf-8"),
+                "safe\n",
+            )
+
+    def test_queue_refresh_parent_swap_cannot_escape_open_codex_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            outside = project / "outside"
+            outside.mkdir()
+            held = project / "codex-held"
+            original_write = vibe_memory_router._atomic_write_json_at
+            swapped = False
+
+            def swap_parent_then_write(
+                directory_fd: int, name: str, payload: object, mode: int = 0o600
+            ) -> None:
+                nonlocal swapped
+                if not swapped:
+                    codex.rename(held)
+                    codex.symlink_to(outside, target_is_directory=True)
+                    swapped = True
+                original_write(directory_fd, name, payload, mode)
+
+            with mock.patch(
+                "vibe_memory_router._atomic_write_json_at",
+                side_effect=swap_parent_then_write,
+            ), mock.patch(
+                "vibe_memory_router.pathlib.Path.home", return_value=project / "home"
+            ):
+                counts = vibe_memory_router._refresh_review_queue(project)
+
+            self.assertEqual(counts["pending"], 0)
+            self.assertEqual(list(outside.iterdir()), [])
+            self.assertTrue((held / "memory_review_state.json").exists())
+            self.assertTrue((held / "memory_review_queue.json").exists())
+            self.assertTrue((held / "memory_review_queue.json.lock").exists())
+            self.assertFalse((held / ".vibe-memory-packets.lock").exists())
 
     def test_build_context_for_unregistered_cwd_is_personal_only(self) -> None:
         event = self.event(cwd=pathlib.Path("/tmp/not-registered"))
