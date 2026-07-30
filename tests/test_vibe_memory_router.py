@@ -174,6 +174,15 @@ class VibeMemoryRouterTest(unittest.TestCase):
                 with self.subTest(event=event):
                     self.assertTrue(store.claim(event))
 
+    def test_idempotency_store_does_not_collide_on_pipe_delimited_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = IdempotencyStore(pathlib.Path(value) / "events.json")
+            first = self.event(session_id="session|event", event="stop")
+            second = self.event(session_id="session", event="event|stop")
+
+            self.assertTrue(store.claim(first))
+            self.assertTrue(store.claim(second))
+
     def test_idempotency_store_preserves_corrupt_or_nonobject_data(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "events.json"

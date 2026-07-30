@@ -24,6 +24,7 @@ import urllib.request
 from typing import Any
 
 import memory_project
+from ui_design_store import exclusive_lock
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROJECT_ROOT = pathlib.Path(
@@ -343,37 +344,45 @@ def create_agent_candidate(
     if risk_flags(summary):
         raise ValueError("candidate contains sensitive material")
     needle = normalize_memory(summary)
-    sources = [read_text(PERSONAL_PROPOSALS), read_text(PERSONAL_LONG), read_text(PERSONAL_SHORT)]
-    if scope == "project":
-        sources = [read_text(PROJECT_PROPOSALS), read_text(PROJECT_LONG)]
-    if needle and any(needle in normalize_memory(text) for text in sources):
-        return {"created": False, "reason": "duplicate"}
-
-    created = now()
     markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
-    if scope == "personal":
-        existing = read_text(PERSONAL_PROPOSALS)
-        stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-        candidate_id = f"M-{stamp}"
-        suffix = 2
-        while candidate_id in existing:
-            candidate_id = f"M-{stamp}-{suffix}"
-            suffix += 1
-        with PERSONAL_PROPOSALS.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n### {candidate_id}\n\n")
-            handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
-            handle.write(f"created: {created}\nsource_event: {source_event}\n")
-            handle.write(f"source_agent: {source_agent}\npolicy_version: {policy_version}\n")
-            handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
-            handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
-    else:
-        candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
-        with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n### {created} - {title}\n\n")
-            handle.write(f"{markdown}\n\n")
-            handle.write(f"- source_event: `{source_event}`\n")
-            handle.write(f"- source_agent: `{source_agent}`\n")
-            handle.write(f"- policy_version: `{policy_version}`\n")
+    proposals = PERSONAL_PROPOSALS if scope == "personal" else PROJECT_PROPOSALS
+    proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
+    with exclusive_lock(proposal_lock):
+        if scope == "personal":
+            sources = [
+                read_text(PERSONAL_PROPOSALS),
+                read_text(PERSONAL_LONG),
+                read_text(PERSONAL_SHORT),
+            ]
+        else:
+            sources = [read_text(PROJECT_PROPOSALS), read_text(PROJECT_LONG)]
+        if needle and any(needle in normalize_memory(text) for text in sources):
+            return {"created": False, "reason": "duplicate"}
+
+        created = now()
+        if scope == "personal":
+            existing = sources[0]
+            stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+            candidate_id = f"M-{stamp}"
+            suffix = 2
+            while candidate_id in existing:
+                candidate_id = f"M-{stamp}-{suffix}"
+                suffix += 1
+            with PERSONAL_PROPOSALS.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n### {candidate_id}\n\n")
+                handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
+                handle.write(f"created: {created}\nsource_event: {source_event}\n")
+                handle.write(f"source_agent: {source_agent}\npolicy_version: {policy_version}\n")
+                handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
+                handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
+        else:
+            candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
+            with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
+                handle.write(f"\n### {created} - {title}\n\n")
+                handle.write(f"{markdown}\n\n")
+                handle.write(f"- source_event: `{source_event}`\n")
+                handle.write(f"- source_agent: `{source_agent}`\n")
+                handle.write(f"- policy_version: `{policy_version}`\n")
     build_queue()
     return {"created": True, "id": candidate_id, "scope": scope, "target": target, "content": markdown}
 

@@ -38,14 +38,16 @@ class IdempotencyStore:
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
 
     def claim(self, event: NormalizedEvent) -> bool:
-        key_material = "|".join(
-            (
+        key_material = json.dumps(
+            [
                 event.agent,
                 event.session_id,
                 event.event,
                 str(event.cwd),
                 event.payload_digest,
-            )
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
         key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
         with exclusive_lock(self.lock_path):

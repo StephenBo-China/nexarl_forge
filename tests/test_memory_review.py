@@ -7,6 +7,7 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -269,6 +270,76 @@ class MemoryReviewQualityTest(unittest.TestCase):
                         source_agent=source_agent,
                         policy_version=policy_version,
                     )
+
+    def test_concurrent_agent_candidates_are_deduplicated_under_one_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue", "read_text",
+                )
+            }
+            proposals = temp / "personal_proposals.md"
+            proposals.write_text("# Proposals\n", encoding="utf-8")
+            proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
+            read_barrier = threading.Barrier(2)
+            start_barrier = threading.Barrier(3)
+            results: list[dict] = []
+            errors: list[BaseException] = []
+
+            def synchronized_read(path: pathlib.Path) -> str:
+                if path == proposals and not proposal_lock.exists():
+                    snapshot = originals["read_text"](path)
+                    read_barrier.wait(timeout=3)
+                    return snapshot
+                return originals["read_text"](path)
+
+            def create(source_agent: str) -> None:
+                try:
+                    start_barrier.wait(timeout=3)
+                    results.append(
+                        review.create_agent_candidate(
+                            "personal", "long", "work_style", "并发候选",
+                            "用户希望跨项目候选在并发代理调用时仍然只生成一条。",
+                            source_agent=source_agent,
+                        )
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            try:
+                review.PERSONAL_PROPOSALS = proposals
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = lambda: {}
+                review.read_text = synchronized_read
+                threads = [
+                    threading.Thread(target=create, args=(agent,))
+                    for agent in ("codex", "claude-code")
+                ]
+                for thread in threads:
+                    thread.start()
+                start_barrier.wait(timeout=3)
+                for thread in threads:
+                    thread.join(timeout=5)
+                alive = [thread.name for thread in threads if thread.is_alive()]
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertEqual(alive, [])
+            self.assertEqual(errors, [])
+            self.assertEqual(sorted(result["created"] for result in results), [False, True])
+            text = proposals.read_text(encoding="utf-8")
+            self.assertEqual(text.count("并发代理调用时仍然只生成一条"), 1)
 
     def test_propose_cli_accepts_and_forwards_candidate_provenance(self) -> None:
         argv = [
