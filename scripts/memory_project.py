@@ -282,6 +282,8 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
 
 def register_project(root: str | pathlib.Path, make_current: bool = True) -> dict[str, Any]:
     project_root = normalize_project_root(root)
+    if not project_root.is_dir():
+        raise ValueError(f"project root must be an existing directory: {project_root}")
     data = registry()
     entry = project_entry(project_root)
     projects = [p for p in data.get("projects", []) if p.get("root") != str(project_root)]
