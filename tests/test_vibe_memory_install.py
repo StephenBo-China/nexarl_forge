@@ -5,6 +5,7 @@ import concurrent.futures
 import os
 import pathlib
 import plistlib
+import shutil
 import stat
 import sys
 import tempfile
@@ -129,7 +130,7 @@ class RuntimeInstallTest(unittest.TestCase):
 
             self.assertEqual(result, {"version": "1.0.0-alpha.1+001"})
 
-    def test_failed_copy_cleans_temporary_release_and_preserves_current(self) -> None:
+    def test_failed_copy_preserves_private_temporary_release_and_current(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
             source = self.make_source(root)
@@ -148,7 +149,10 @@ class RuntimeInstallTest(unittest.TestCase):
 
             self.assertEqual((paths.install_root / "current").resolve(), old_release.resolve())
             self.assertFalse((paths.install_root / "releases/1.0.0").exists())
-            self.assertEqual(list((paths.install_root / "releases").glob(".1.0.0.tmp-*")), [])
+            preserved = list((paths.install_root / "releases").glob(".1.0.0.tmp-*"))
+            self.assertEqual(len(preserved), 1)
+            self.assertEqual(stat.S_IMODE(preserved[0].stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE((preserved[0] / "partial").stat().st_mode), 0o600)
 
     def test_incomplete_copy_is_rejected_before_release_rename(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -206,6 +210,157 @@ class RuntimeInstallTest(unittest.TestCase):
                 (paths.install_root / "releases/1.0.0").resolve(),
             )
 
+    def test_destination_race_preserves_unknown_empty_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            unknown_identity: list[tuple[int, int]] = []
+
+            def race_destination(temporary: pathlib.Path, destination: pathlib.Path) -> None:
+                destination_path = pathlib.Path(os.fspath(destination))
+                destination_path.mkdir()
+                metadata = destination_path.stat()
+                unknown_identity.append((metadata.st_dev, metadata.st_ino))
+                raise FileExistsError("destination race")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                create=True,
+                side_effect=race_destination,
+            ):
+                with self.assertRaises(FileExistsError):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            destination = paths.install_root / "releases/1.0.0"
+            metadata = destination.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino), unknown_identity[0])
+            self.assertEqual(list(destination.iterdir()), [])
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+
+    def test_destination_race_accepts_identical_complete_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            injected: list[str] = []
+
+            def race_destination(temporary: pathlib.Path, destination: pathlib.Path) -> None:
+                if destination.name == "current":
+                    os.rename(temporary, destination)
+                    return
+                injected.append(destination.name)
+                shutil.copytree(temporary, destination)
+                raise FileExistsError("destination race")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                create=True,
+                side_effect=race_destination,
+            ):
+                result = vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(result, {"version": "1.0.0"})
+            self.assertEqual(injected, ["1.0.0"])
+            self.assertEqual(
+                (paths.install_root / "current").resolve(),
+                (paths.install_root / "releases/1.0.0").resolve(),
+            )
+
+    def test_current_race_preserves_unknown_regular_file(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            unknown = b"unknown current\n"
+
+            def race_current(temporary: pathlib.Path, destination: pathlib.Path) -> None:
+                if destination.name != "current":
+                    os.rename(temporary, destination)
+                    return
+                pathlib.Path(os.fspath(destination)).write_bytes(unknown)
+                raise FileExistsError("current race")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                create=True,
+                side_effect=race_current,
+            ):
+                with self.assertRaises(FileExistsError):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual((paths.install_root / "current").read_bytes(), unknown)
+            self.assertTrue((paths.install_root / "releases/1.0.0").is_dir())
+            preserved = list(paths.install_root.glob(".current.tmp-*"))
+            self.assertEqual(len(preserved), 1)
+            self.assertTrue(preserved[0].is_symlink())
+            self.assertEqual(os.readlink(preserved[0]), "releases/1.0.0")
+
+    def test_current_race_accepts_identical_managed_winner(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            injected: list[str] = []
+
+            def race_current(temporary: pathlib.Path, destination: pathlib.Path) -> None:
+                if destination.name != "current":
+                    os.rename(temporary, destination)
+                    return
+                injected.append(destination.name)
+                os.symlink("releases/1.0.0", destination)
+                raise FileExistsError("current race")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                create=True,
+                side_effect=race_current,
+            ):
+                result = vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(result, {"version": "1.0.0"})
+            self.assertEqual(injected, ["current"])
+            self.assertEqual(os.readlink(paths.install_root / "current"), "releases/1.0.0")
+
+    def test_existing_different_managed_current_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            old_release = paths.install_root / "releases/0.9.0"
+            old_release.mkdir(parents=True)
+            current = paths.install_root / "current"
+            os.symlink("releases/0.9.0", current)
+
+            with self.assertRaises(FileExistsError):
+                vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(os.readlink(current), "releases/0.9.0")
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin rename flags only")
+    def test_darwin_exclusive_rename_never_clobbers_existing_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            destination_identity = destination.stat().st_ino
+
+            with self.assertRaises(FileExistsError):
+                vibe_memory_install._darwin_rename(
+                    source,
+                    destination,
+                    vibe_memory_install.RENAME_EXCL,
+                )
+
+            self.assertTrue(source.is_dir())
+            self.assertEqual(destination.stat().st_ino, destination_identity)
+
     def test_rejects_symlinks_in_source_tree(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -251,6 +406,171 @@ class RuntimeInstallTest(unittest.TestCase):
                 with self.assertRaises((OSError, ValueError)):
                     vibe_memory_install.install_runtime(source, paths)
                 self.assertEqual(list(outside.iterdir()), [])
+
+    def test_rejects_unsafe_components_high_in_install_ancestor_chain(self) -> None:
+        scenarios = ("live-symlink", "broken-symlink", "regular-file")
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                source = self.make_source(root)
+                base = root / "managed-base"
+                attack_component = base / "outer"
+                home = attack_component / "inner/home"
+                paths = vibe_memory_paths.for_home(home)
+                base.mkdir()
+                outside = root / "outside"
+                outside.mkdir()
+                if scenario == "live-symlink":
+                    os.symlink(outside, attack_component)
+                elif scenario == "broken-symlink":
+                    os.symlink(root / "missing-target", attack_component)
+                else:
+                    attack_component.write_text("unknown ancestor\n", encoding="utf-8")
+
+                with self.assertRaises((OSError, ValueError)):
+                    vibe_memory_install.install_runtime(source, paths)
+
+                self.assertEqual(list(outside.iterdir()), [])
+                if scenario == "regular-file":
+                    self.assertEqual(
+                        attack_component.read_text(encoding="utf-8"),
+                        "unknown ancestor\n",
+                    )
+
+    def test_rejects_unlisted_root_owned_symlink_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            outside = root / "outside"
+            outside.mkdir()
+            alias = root / "unlisted-root-alias"
+            os.symlink(outside, alias)
+            paths = vibe_memory_paths.for_home(alias / "home")
+            real_lstat = os.lstat
+
+            def report_alias_as_root(path: pathlib.Path | str) -> os.stat_result:
+                metadata = real_lstat(path)
+                if pathlib.Path(path) != alias:
+                    return metadata
+                fields = list(metadata)
+                fields[4] = 0
+                return os.stat_result(fields)
+
+            with mock.patch.object(vibe_memory_install.os, "lstat", side_effect=report_alias_as_root):
+                with self.assertRaises(ValueError):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_ancestor_inserted_after_validation_cannot_redirect_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            base = root / "managed-base"
+            base.mkdir()
+            missing = base / "inserted"
+            paths = vibe_memory_paths.for_home(missing / "home")
+            outside = root / "outside"
+            outside.mkdir()
+            real_validate = vibe_memory_install._validate_install_ancestor_chain
+
+            def validate_then_race(path: pathlib.Path) -> None:
+                real_validate(path)
+                os.symlink(outside, missing)
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_validate_install_ancestor_chain",
+                side_effect=validate_then_race,
+            ):
+                with self.assertRaises((OSError, ValueError)):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_non_darwin_install_fails_closed_even_for_identical_release(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(source, paths)
+
+            with mock.patch.object(vibe_memory_install.sys, "platform", "linux"):
+                with self.assertRaises(NotImplementedError):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(os.readlink(paths.install_root / "current"), "releases/1.0.0")
+
+    def test_identical_destination_winner_permissions_are_made_private(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+
+            def permissive_winner(temporary: pathlib.Path, destination: pathlib.Path) -> None:
+                if destination.name == "current":
+                    os.rename(temporary, destination)
+                    return
+                shutil.copytree(temporary, destination)
+                destination_path = pathlib.Path(os.fspath(destination))
+                for item in [destination_path, *destination_path.rglob("*")]:
+                    item.chmod(0o777 if item.is_dir() else 0o666)
+                raise FileExistsError("destination race")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                side_effect=permissive_winner,
+            ):
+                vibe_memory_install.install_runtime(source, paths)
+
+            release = paths.install_root / "releases/1.0.0"
+            for item in [release, *release.rglob("*")]:
+                expected = 0o700 if item.is_dir() else 0o600
+                self.assertEqual(stat.S_IMODE(item.stat().st_mode), expected, item)
+
+    def test_verified_destination_swapped_before_chmod_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            destination = paths.install_root / "releases/1.0.0"
+            preserved = paths.install_root / "releases/verified-winner"
+            unknown = b"unknown replacement\n"
+            real_make_private_fd = vibe_memory_install._make_private_fd
+            injected: list[bool] = []
+
+            def identical_winner(temporary: pathlib.Path, target: pathlib.Path) -> None:
+                if target.name == "current":
+                    os.rename(temporary, target)
+                    return
+                shutil.copytree(temporary, target)
+                raise FileExistsError("destination race")
+
+            def swap_after_destination_open(directory_fd: int) -> None:
+                if destination.exists() and not injected:
+                    os.rename(destination, preserved)
+                    destination.mkdir(mode=0o755)
+                    (destination / "unknown").write_bytes(unknown)
+                    injected.append(True)
+                real_make_private_fd(directory_fd)
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_atomic_rename_exclusive",
+                side_effect=identical_winner,
+            ), mock.patch.object(
+                vibe_memory_install,
+                "_make_private_fd",
+                side_effect=swap_after_destination_open,
+            ):
+                with self.assertRaises(FileExistsError):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(injected, [True])
+            self.assertEqual((destination / "unknown").read_bytes(), unknown)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o755)
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
 
     def test_render_launch_agent_uses_template_contract_and_valid_plist(self) -> None:
         with tempfile.TemporaryDirectory(prefix="Vibe & Memory ") as value:
