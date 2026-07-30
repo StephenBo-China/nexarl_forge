@@ -1,0 +1,7 @@
+{
+  "app_version": "1.0.0",
+  "data_schema_version": 1,
+  "hook_protocol_version": 1,
+  "minimum_python": "3.10",
+  "platform": "macOS"
+}

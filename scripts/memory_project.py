@@ -16,17 +16,19 @@ from typing import Any
 import loop_superpowers
 import ui_design_preferences
 import ui_design_store
+import vibe_memory_paths
 
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
+RUNTIME_PATHS = vibe_memory_paths.for_home()
 REGISTRY_PATH = pathlib.Path(
     os.environ.get(
         "MEMORY_REVIEW_PROJECT_REGISTRY",
-        str(pathlib.Path.home() / ".codex" / "memory_review" / "projects.json"),
+        str(RUNTIME_PATHS.project_registry),
     )
 ).expanduser()
-CODEX_LOOP_DIR = pathlib.Path.home() / ".codex" / "loop_engineering"
-CLAUDE_LOOP_DIR = pathlib.Path.home() / ".claude" / "loop_engineering"
+CODEX_LOOP_DIR = RUNTIME_PATHS.personal_memory.parent / "loop_engineering"
+CLAUDE_LOOP_DIR = RUNTIME_PATHS.personal_memory.parents[1] / ".claude" / "loop_engineering"
 DEFAULT_STAGING_HOST = "root@8.210.155.175"
 DEFAULT_BASE_PORT = 8081
 UI_DESIGN_GATE_HOOK_TEMPLATE = (
@@ -450,8 +452,8 @@ If `.loop/config.json` exists, also load:
 - `codex/codex_long_memory.md`
 - `codex/codex_context_packet.md`
 - `codex/shared_memory_context_packet.md`
-- `/Users/stephenbo/.codex/personal_memory/long.md`
-- `/Users/stephenbo/.codex/personal_memory/short.md`
+- `{RUNTIME_PATHS.personal_memory / "long.md"}`
+- `{RUNTIME_PATHS.personal_memory / "short.md"}`
 
 Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
@@ -488,8 +490,8 @@ repository and the same approval-gated personal memory files.
   dirty canonical paths. Verify remote main, canonical main, and deployment
   commit equality before reporting final completion.
 - When `.loop/config.json` exists, also read:
-  - `/Users/stephenbo/.codex/loop_engineering`
-  - `/Users/stephenbo/.claude/loop_engineering`
+  - `{CODEX_LOOP_DIR}`
+  - `{CLAUDE_LOOP_DIR}`
 
 ## Write Policy
 
@@ -498,7 +500,7 @@ repository and the same approval-gated personal memory files.
   `codex/memory_proposals.md` first.
 - Personal long and short memory require explicit approval of exact content.
 - Personal candidates may be written only to
-  `/Users/stephenbo/.codex/personal_memory/proposals.md`, and only when they
+  `{RUNTIME_PATHS.personal_memory / "proposals.md"}`, and only when they
   are distilled cross-project habits, preferences, thinking style, workflow
   preferences, or user-profile facts.
 
@@ -648,8 +650,8 @@ def loop_context() -> str:
 - finish validation gate: {{gate}}; run configured validation before success claims.
 - Subagents and parallel agents require explicit user authorization and isolated
   Loop-safe worktrees.
-- Read `/Users/stephenbo/.codex/loop_engineering` and
-  `/Users/stephenbo/.claude/loop_engineering` before substantial Loop work.
+- Read `{CODEX_LOOP_DIR}` and
+  `{CLAUDE_LOOP_DIR}` before substantial Loop work.
 """
 
     return f"""
@@ -676,8 +678,8 @@ Repository: `{{ROOT}}`
 - `codex/codex_long_memory.md`
 - `codex/codex_short_memory.md` (read selectively)
 - `codex/memory_proposals.md`
-- `/Users/stephenbo/.codex/personal_memory/long.md`
-- `/Users/stephenbo/.codex/personal_memory/short.md`
+- `{RUNTIME_PATHS.personal_memory / "long.md"}`
+- `{RUNTIME_PATHS.personal_memory / "short.md"}`
 
 ## Pending Memory Review
 
@@ -1108,8 +1110,8 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
         "worktree": {
             "enabled": True,
             "trigger_phrase": "开 worktree",
-            "root": "/Users/stephenbo/Noema/Projects/worktrees",
-            "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "root": str(RUNTIME_PATHS.worktree_root),
+            "default_root": str(RUNTIME_PATHS.worktree_root),
             "finish_validation_commands": [loop_superpowers.COMPLETION_COMMAND],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
