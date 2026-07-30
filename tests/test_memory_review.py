@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -13,6 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
+import memory_review as review_cli
 import memory_review_queue as review
 import loop_superpowers
 import ui_design_preferences as preferences
@@ -163,10 +166,17 @@ class MemoryReviewQualityTest(unittest.TestCase):
         )
         self.assertFalse(review.is_noise_personal_candidate(durable))
 
-    def test_generated_project_hook_summarizes_short_memory(self) -> None:
+    def test_generated_project_hook_records_only_event_metadata(self) -> None:
         hook = memory_project.hook_script(pathlib.Path("/tmp/project"), "codex")
-        self.assertIn('entry += "- summary: " + compact', hook)
-        self.assertNotIn('prompt[:3000]', hook)
+        self.assertNotIn("def find_prompt", hook)
+        self.assertNotIn("find_prompt(", hook)
+        self.assertNotIn("raw_stdin", hook)
+        self.assertNotIn("- summary:", hook)
+        self.assertNotIn("compact =", hook)
+        self.assertIn('f"- source_agent: {SOURCE}', hook)
+        self.assertIn('f"- event: {event}', hook)
+        self.assertIn('f"- cwd: `{os.getcwd()}`', hook)
+        self.assertIn("session_id", hook)
         self.assertNotIn("append_project_candidate", hook)
         self.assertIn("conversation model reviews memory candidates", hook)
 
@@ -186,10 +196,10 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 name: getattr(review, name)
                 for name in (
                     "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
-                    "PROJECT_PROPOSALS", "PROJECT_LONG", "CODEX_DIR",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR",
                 )
             }
-            original_build = review.build_queue
             try:
                 review.PERSONAL_PROPOSALS = temp / "personal_proposals.md"
                 review.PERSONAL_PROPOSALS.write_text("# Proposals\n", encoding="utf-8")
@@ -197,25 +207,90 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PERSONAL_SHORT = temp / "personal_short.md"
                 review.PROJECT_PROPOSALS = temp / "project_proposals.md"
                 review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
-                review.build_queue = lambda: {}
                 first = review.create_agent_candidate(
                     "personal", "long", "collaboration_preference", "修改前确认计划",
                     "用户希望修改代码前先确认修改计划和不确定事项。",
+                    source_agent="codex",
+                    policy_version=2,
                 )
                 second = review.create_agent_candidate(
                     "personal", "long", "collaboration_preference", "重复标题",
                     "用户希望修改代码前先确认修改计划和不确定事项。",
+                    source_agent="claude-code",
+                    policy_version=3,
                 )
+                personal_item = review.parse_personal_candidates()[0]
+                project = review.create_agent_candidate(
+                    "project", "long", "project_architecture", "共享路由器",
+                    "项目使用共享路由器规范化本地代理事件并生成审核上下文。",
+                    source_agent="claude-code",
+                    policy_version=4,
+                )
+                project_item = review.parse_project_candidates()[0]
+                approved = review.approve(project_item["id"])
             finally:
-                review.build_queue = original_build
                 for name, value in originals.items():
                     setattr(review, name, value)
             self.assertTrue(first["created"])
             self.assertFalse(second["created"])
+            self.assertTrue(project["created"])
+            self.assertEqual(personal_item["source_agent"], "codex")
+            self.assertEqual(personal_item["policy_version"], 2)
+            self.assertEqual(project_item["source_agent"], "claude-code")
+            self.assertEqual(project_item["policy_version"], 4)
+            self.assertEqual(approved["decision"]["source_agent"], "claude-code")
+            self.assertEqual(approved["decision"]["policy_version"], 4)
             text = (temp / "personal_proposals.md").read_text(encoding="utf-8")
             self.assertIn("status: pending", text)
+            self.assertIn("source_agent: codex", text)
+            self.assertIn("policy_version: 2", text)
             self.assertIn("**标题：修改前确认计划**", text)
+            approved_text = (temp / "project_long.md").read_text(encoding="utf-8")
+            self.assertIn("共享路由器", approved_text)
+            self.assertIn("项目架构", approved_text)
+            self.assertNotIn("source_agent", approved_text)
+            self.assertNotIn("policy_version", approved_text)
+
+    def test_agent_candidate_validates_provenance(self) -> None:
+        for source_agent, policy_version, message in (
+            ("other", 1, "source_agent"),
+            ("codex", 0, "policy_version"),
+            ("codex", True, "policy_version"),
+            ("codex", "1", "policy_version"),
+        ):
+            with self.subTest(source_agent=source_agent, policy_version=policy_version):
+                with self.assertRaisesRegex(ValueError, message):
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "清晰标题",
+                        "用户希望跨项目保留清晰且可审核的工作方式说明。",
+                        source_agent=source_agent,
+                        policy_version=policy_version,
+                    )
+
+    def test_propose_cli_accepts_and_forwards_candidate_provenance(self) -> None:
+        argv = [
+            "memory_review.py", "propose", "--scope", "personal", "--target", "long",
+            "--category", "work_style", "--title", "清晰标题",
+            "--summary", "用户希望跨项目保留清晰且可审核的工作方式说明。",
+            "--source-agent", "claude-code", "--policy-version", "3",
+        ]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(
+            review_cli.review,
+            "create_agent_candidate",
+            return_value={"created": True, "id": "M-test"},
+        ) as create, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(review_cli.main(), 0)
+
+        create.assert_called_once_with(
+            "personal", "long", "work_style", "清晰标题",
+            "用户希望跨项目保留清晰且可审核的工作方式说明。",
+            "agent_summary",
+            source_agent="claude-code",
+            policy_version=3,
+        )
 
     def test_upgrade_memory_hooks_preserves_backup(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
@@ -224,7 +299,9 @@ class MemoryReviewQualityTest(unittest.TestCase):
             old_hook.parent.mkdir(parents=True)
             old_hook.write_text("old managed hook\n", encoding="utf-8")
             result = memory_project.upgrade_memory_hooks(project)
-            self.assertIn("- summary: ", old_hook.read_text(encoding="utf-8"))
+            installed = old_hook.read_text(encoding="utf-8")
+            self.assertIn("- source_agent: ", installed)
+            self.assertNotIn("- summary: ", installed)
             backups = list(old_hook.parent.glob("shared_memory_hook.py.bak.*"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_text(encoding="utf-8"), "old managed hook\n")

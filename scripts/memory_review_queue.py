@@ -127,8 +127,31 @@ def split_heading_sections(text: str) -> list[tuple[str, str]]:
 
 
 def metadata_value(body: str, key: str) -> str:
-    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", body, flags=re.MULTILINE)
-    return match.group(1).strip() if match else ""
+    match = re.search(rf"^(?:-\s*)?{re.escape(key)}:\s*(.+)$", body, flags=re.MULTILINE)
+    return match.group(1).strip().strip("`") if match else ""
+
+
+def candidate_provenance(body: str) -> tuple[str, int]:
+    source_agent = metadata_value(body, "source_agent") or "unknown"
+    if source_agent not in {"codex", "claude-code", "unknown"}:
+        source_agent = "unknown"
+    raw_policy_version = metadata_value(body, "policy_version") or "1"
+    try:
+        policy_version = int(raw_policy_version)
+    except ValueError:
+        policy_version = 1
+    if policy_version <= 0:
+        policy_version = 1
+    return source_agent, policy_version
+
+
+def without_candidate_metadata(body: str) -> str:
+    return re.sub(
+        r"^(?:-\s*)?(?:source_event|source_agent|policy_version):\s*.+$",
+        "",
+        body,
+        flags=re.MULTILINE,
+    ).strip()
 
 
 def first_fenced_text(body: str) -> str:
@@ -202,7 +225,9 @@ def parse_project_candidates() -> list[dict[str, Any]]:
     for heading, body in split_heading_sections(text):
         candidate_id = stable_id("P", PROJECT_PROPOSALS, heading, body)
         created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
-        content = body.strip()
+        source_event = metadata_value(body, "source_event")
+        source_agent, policy_version = candidate_provenance(body)
+        content = without_candidate_metadata(body)
         checkpoint = is_project_checkpoint(heading, content)
         items.append(
             {
@@ -212,6 +237,9 @@ def parse_project_candidates() -> list[dict[str, Any]]:
                 "review_kind": "checkpoint" if checkpoint else "memory",
                 "actionable": not checkpoint,
                 "source": "project_proposals",
+                "source_event": source_event,
+                "source_agent": source_agent,
+                "policy_version": policy_version,
                 "source_path": str(PROJECT_PROPOSALS),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
@@ -238,6 +266,7 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
         target = metadata_value(body, "target") or "unsure"
         created = metadata_value(body, "created") or heading.removeprefix("### ").strip()
         source_event = metadata_value(body, "source_event")
+        source_agent, policy_version = candidate_provenance(body)
         content = first_fenced_text(body)
         items.append(
             {
@@ -248,6 +277,8 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
                 "actionable": True,
                 "source": "personal_proposals",
                 "source_event": source_event,
+                "source_agent": source_agent,
+                "policy_version": policy_version,
                 "source_path": str(PERSONAL_PROPOSALS),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
@@ -284,6 +315,9 @@ def create_agent_candidate(
     title: str,
     summary: str,
     source_event: str = "agent_summary",
+    *,
+    source_agent: str = "unknown",
+    policy_version: int = 1,
 ) -> dict[str, Any]:
     """Persist a candidate already distilled by the active Codex/Claude model."""
     title = re.sub(r"\s+", " ", title).strip()[:100]
@@ -296,6 +330,14 @@ def create_agent_candidate(
         raise ValueError("project candidates must target long memory")
     if category not in AGENT_CATEGORIES[scope]:
         raise ValueError("unsupported candidate category")
+    if source_agent not in {"codex", "claude-code", "unknown"}:
+        raise ValueError("source_agent must be codex, claude-code, or unknown")
+    if (
+        not isinstance(policy_version, int)
+        or isinstance(policy_version, bool)
+        or policy_version <= 0
+    ):
+        raise ValueError("policy_version must be a positive integer")
     if not title or len(summary) < 12 or len(summary) > 1200:
         raise ValueError("candidate title/summary length is invalid")
     if risk_flags(summary):
@@ -321,14 +363,17 @@ def create_agent_candidate(
             handle.write(f"\n### {candidate_id}\n\n")
             handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
             handle.write(f"created: {created}\nsource_event: {source_event}\n")
+            handle.write(f"source_agent: {source_agent}\npolicy_version: {policy_version}\n")
             handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
             handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
     else:
         candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
         with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
             handle.write(f"\n### {created} - {title}\n\n")
-            handle.write(f"**分类：{category}**\n\n{summary}\n\n")
+            handle.write(f"{markdown}\n\n")
             handle.write(f"- source_event: `{source_event}`\n")
+            handle.write(f"- source_agent: `{source_agent}`\n")
+            handle.write(f"- policy_version: `{policy_version}`\n")
     build_queue()
     return {"created": True, "id": candidate_id, "scope": scope, "target": target, "content": markdown}
 
@@ -425,6 +470,8 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
             "approved_path": str(destination),
             "decided_at": now(),
             "risk_flags": item.get("risk_flags", []),
+            "source_agent": item.get("source_agent", "unknown"),
+            "policy_version": item.get("policy_version", 1),
         },
     )
     return find_item(candidate_id)

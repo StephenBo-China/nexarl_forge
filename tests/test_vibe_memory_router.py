@@ -5,16 +5,30 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
-from vibe_memory_router import resolve_registered_project
+from vibe_memory_events import NormalizedEvent
+from vibe_memory_router import IdempotencyStore, build_context, resolve_registered_project
 
 
 class VibeMemoryRouterTest(unittest.TestCase):
+    def event(self, **changes: object) -> NormalizedEvent:
+        values: dict[str, object] = {
+            "agent": "codex",
+            "event": "user_prompt_submit",
+            "cwd": pathlib.Path("/tmp/workspace"),
+            "session_id": "session-1",
+            "timestamp": "2026-07-30T12:00:00+08:00",
+            "payload_digest": "a" * 64,
+        }
+        values.update(changes)
+        return NormalizedEvent(**values)  # type: ignore[arg-type]
+
     def test_resolve_registered_project_prefers_deepest_matching_root(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = pathlib.Path(value)
@@ -125,6 +139,106 @@ class VibeMemoryRouterTest(unittest.TestCase):
                         )
             finally:
                 memory_project.REGISTRY_PATH = original_registry
+
+    def test_idempotency_store_claims_duplicate_event_once(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = IdempotencyStore(pathlib.Path(value) / "events.json")
+            event = self.event()
+
+            self.assertTrue(store.claim(event))
+            self.assertFalse(store.claim(event))
+
+    def test_idempotency_store_reclaims_expired_event(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = IdempotencyStore(pathlib.Path(value) / "events.json", ttl_seconds=30)
+            event = self.event()
+
+            with mock.patch("vibe_memory_router.time.time", side_effect=[100.0, 131.0]):
+                self.assertTrue(store.claim(event))
+                self.assertTrue(store.claim(event))
+
+    def test_idempotency_store_distinguishes_each_key_field(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = IdempotencyStore(pathlib.Path(value) / "events.json")
+            base = self.event()
+            variants = [
+                self.event(agent="claude-code"),
+                self.event(session_id="session-2"),
+                self.event(event="stop"),
+                self.event(cwd=pathlib.Path("/tmp/other")),
+                self.event(payload_digest="b" * 64),
+            ]
+
+            self.assertTrue(store.claim(base))
+            for event in variants:
+                with self.subTest(event=event):
+                    self.assertTrue(store.claim(event))
+
+    def test_idempotency_store_preserves_corrupt_or_nonobject_data(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "events.json"
+            for original in ("not json\n", "[]\n"):
+                with self.subTest(original=original):
+                    path.write_text(original, encoding="utf-8")
+                    store = IdempotencyStore(path)
+
+                    with self.assertRaisesRegex(ValueError, "idempotency store"):
+                        store.claim(self.event())
+
+                    self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_build_context_for_unregistered_cwd_is_personal_only(self) -> None:
+        event = self.event(cwd=pathlib.Path("/tmp/not-registered"))
+
+        context = build_context(
+            event,
+            project_root=None,
+            pending={"pending": 4, "personal_pending": 4, "project_pending": 0},
+        )
+
+        personal = pathlib.Path.home() / ".codex" / "personal_memory"
+        for name in ("long.md", "short.md", "proposals.md"):
+            self.assertIn(str(personal / name), context)
+        self.assertNotIn("README.md", context)
+        self.assertNotIn("codex/codex_long_memory.md", context)
+        self.assertNotIn("Repository:", context)
+        self.assertNotIn(str(event.cwd), context)
+
+    def test_build_context_for_registered_project_includes_shared_policy(self) -> None:
+        project = pathlib.Path("/tmp/registered-project")
+        event = self.event(agent="claude-code", cwd=project / "src")
+
+        context = build_context(
+            event,
+            project_root=project,
+            pending={"pending": 5, "personal_pending": 2, "project_pending": 3},
+        )
+
+        for relative in (
+            "README.md",
+            "codex/codex_long_memory.md",
+            "codex/codex_short_memory.md",
+            "codex/memory_proposals.md",
+            "codex/codex_context_packet.md",
+        ):
+            self.assertIn(str(project / relative), context)
+        self.assertIn("source agent: claude-code", context)
+        self.assertIn("pending total: 5", context)
+        self.assertIn("personal candidates: 2", context)
+        self.assertIn("project candidates: 3", context)
+        self.assertIn("development_habit", context)
+        self.assertIn("workflow_preference", context)
+        self.assertIn("project_architecture", context)
+        self.assertIn("project_workflow", context)
+        self.assertIn("at most two", context.lower())
+        self.assertIn("raw prompts", context.lower())
+        self.assertIn("secrets", context.lower())
+        self.assertIn("paths", context.lower())
+        self.assertIn("one-off", context.lower())
+        self.assertIn("explicit approval of the exact candidate content", context.lower())
+        self.assertIn("memory_review.py propose", context)
+        self.assertIn("--source-agent claude-code", context)
+        self.assertIn("--policy-version 1", context)
 
 
 if __name__ == "__main__":

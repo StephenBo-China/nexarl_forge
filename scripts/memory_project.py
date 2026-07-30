@@ -526,7 +526,7 @@ For this project, pass:
 
 
 def hook_script(root: pathlib.Path, source: str) -> str:
-    source_label = "claude_code" if source == "claude" else "codex"
+    source_label = "claude-code" if source == "claude" else "codex"
     return f'''#!/usr/bin/env python3
 """Shared memory hook installed by vibe_coding_manage_platform."""
 
@@ -566,25 +566,7 @@ def read_stdin_json() -> Any:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return {{"raw_stdin": raw[:4000]}}
-
-
-def find_prompt(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\\n".join(filter(None, [find_prompt(item) for item in value])).strip()
-    if isinstance(value, dict):
-        for key in ["prompt", "user_prompt", "userPrompt", "input", "message", "text", "content"]:
-            if key in value:
-                found = find_prompt(value[key])
-                if found:
-                    return found
-        for item in value.values():
-            found = find_prompt(item)
-            if found:
-                return found
-    return ""
+        return None
 
 
 def ensure_files() -> None:
@@ -706,15 +688,19 @@ Repository: `{{ROOT}}`
 
 
 def append_short(event: str, payload: Any) -> None:
-    prompt = find_prompt(payload)
-    entry = f"\\n### {{now()}} - {{SOURCE}}:{{event}}\\n\\n- cwd: `{{os.getcwd()}}`\\n"
-    if prompt:
-        compact = " ".join(prompt.split())
-        if len(compact) > 280:
-            compact = compact[:277].rstrip() + "..."
-        entry += "- summary: " + compact + "\\n"
-    else:
-        entry += "- no user prompt payload was available to this hook.\\n"
+    session_id = None
+    if isinstance(payload, dict):
+        value = payload.get("session_id", payload.get("sessionId"))
+        if isinstance(value, str) and value:
+            session_id = value
+    entry = (
+        f"\\n### {{now()}} - {{SOURCE}}:{{event}}\\n\\n"
+        f"- source_agent: {{SOURCE}}\\n"
+        f"- event: {{event}}\\n"
+        f"- cwd: `{{os.getcwd()}}`\\n"
+    )
+    if session_id is not None:
+        entry += f"- session_id: {{session_id}}\\n"
     with SHORT_MEMORY.open("a", encoding="utf-8") as handle:
         handle.write(entry)
 
