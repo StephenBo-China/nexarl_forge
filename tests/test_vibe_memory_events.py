@@ -7,7 +7,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -97,6 +97,16 @@ class NormalizeEventTest(unittest.TestCase):
 
         self.assertNotIn("SECRET-SHOULD-NOT-LEAK", str(error.exception))
 
+    def test_timestamp_assertion_rejects_utc_timestamp_in_non_utc_local_timezone(self) -> None:
+        local_offset = datetime.now().astimezone().utcoffset()
+        if local_offset == timezone.utc.utcoffset(None):
+            self.skipTest("local timezone is UTC")
+
+        utc_timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+        with self.assertRaisesRegex(AssertionError, "local UTC offset"):
+            self._assert_timestamp_is_local_and_second_precision(utc_timestamp)
+
     @staticmethod
     def _fixture(name: str) -> dict[str, object]:
         return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -109,6 +119,11 @@ class NormalizeEventTest(unittest.TestCase):
     def _assert_timestamp_is_local_and_second_precision(self, value: str) -> None:
         timestamp = datetime.fromisoformat(value)
         self.assertIsNotNone(timestamp.tzinfo)
+        self.assertEqual(
+            timestamp.utcoffset(),
+            datetime.now().astimezone().utcoffset(),
+            "local UTC offset",
+        )
         self.assertEqual(timestamp.microsecond, 0)
 
 
