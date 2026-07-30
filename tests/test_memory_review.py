@@ -523,6 +523,69 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(project.read_bytes(), original_project)
             self.assertEqual(personal.read_bytes(), original_personal)
 
+    def test_agent_candidate_rejects_candidate_heading_lines_in_both_scopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            personal = temp / "personal_proposals.md"
+            project = temp / "project_proposals.md"
+            original_personal = b"# Personal Proposals\n"
+            original_project = b"# Project Proposals\n"
+            personal.write_bytes(original_personal)
+            project.write_bytes(original_project)
+            paths = {
+                "PERSONAL_PROPOSALS": personal,
+                "PERSONAL_LONG": temp / "personal_long.md",
+                "PERSONAL_SHORT": temp / "personal_short.md",
+                "PROJECT_PROPOSALS": project,
+                "PROJECT_LONG": temp / "project_long.md",
+                "PROJECT_QUEUE": temp / "queue.json",
+                "PROJECT_STATE": temp / "state.json",
+                "CODEX_DIR": temp / "codex",
+            }
+            with mock.patch.multiple(review, **paths):
+                with self.assertRaisesRegex(ValueError, "heading"):
+                    review.create_agent_candidate(
+                        "project", "long", "project_workflow", "项目标题安全",
+                        "项目要求候选摘要不能注入新候选。\n  ### ghost project candidate",
+                        source_agent="codex",
+                    )
+                self.assertEqual(review.parse_project_candidates(), [])
+                with self.assertRaisesRegex(ValueError, "heading"):
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "个人标题安全",
+                        "用户希望围栏内的候选正文保持安全。\n### ghost personal candidate",
+                        source_agent="claude-code",
+                    )
+                self.assertEqual(review.parse_personal_candidates(), [])
+
+            self.assertEqual(project.read_bytes(), original_project)
+            self.assertEqual(personal.read_bytes(), original_personal)
+
+    def test_agent_candidate_allows_inline_heading_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            paths = {
+                "PERSONAL_PROPOSALS": temp / "personal_proposals.md",
+                "PERSONAL_LONG": temp / "personal_long.md",
+                "PERSONAL_SHORT": temp / "personal_short.md",
+                "PROJECT_PROPOSALS": temp / "project_proposals.md",
+                "PROJECT_LONG": temp / "project_long.md",
+                "PROJECT_QUEUE": temp / "queue.json",
+                "PROJECT_STATE": temp / "state.json",
+                "CODEX_DIR": temp / "codex",
+            }
+            paths["PROJECT_PROPOSALS"].write_text("# Project Proposals\n", encoding="utf-8")
+            with mock.patch.multiple(review, **paths):
+                result = review.create_agent_candidate(
+                    "project", "long", "project_workflow", "保留行内标记",
+                    "项目说明中允许包含 inline ### 普通文本而不创建额外候选。",
+                    source_agent="codex",
+                )
+                items = review.parse_project_candidates()
+
+            self.assertTrue(result["created"])
+            self.assertEqual(len(items), 1)
+
     def test_concurrent_agent_candidates_are_deduplicated_under_one_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
             temp = pathlib.Path(temp_value)

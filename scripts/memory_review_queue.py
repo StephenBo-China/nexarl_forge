@@ -70,6 +70,7 @@ RESERVED_CANDIDATE_METADATA_LINE = re.compile(
     + r")\s*:",
     flags=re.IGNORECASE,
 )
+CANDIDATE_HEADING_LINE = re.compile(r"^\s*###(?:\s|$)", flags=re.MULTILINE)
 
 PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
 PERSONAL_PROPOSALS = PERSONAL_DIR / "proposals.md"
@@ -376,6 +377,8 @@ def validate_candidate_text(title: str, summary: str, source_event: str) -> None
     if "```" in title or "```" in summary:
         raise ValueError("candidate title/summary cannot contain fenced Markdown")
     for value in (title, summary):
+        if CANDIDATE_HEADING_LINE.search(value):
+            raise ValueError("candidate title/summary cannot contain candidate heading lines")
         if any(
             RESERVED_CANDIDATE_METADATA_LINE.match(line)
             for line in re.split(r"[\r\n]", value)
