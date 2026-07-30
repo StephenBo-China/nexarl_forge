@@ -53,6 +53,7 @@ class _AnchoredPath:
         self.entry_name = entry_name
         self.display_path = display_path
         self.directory_fd = directory_fd
+        self.creation_ledger: dict[str, tuple[int, int, int]] = {}
 
     @property
     def name(self) -> str:
@@ -386,10 +387,21 @@ def _atomic_rename_exclusive(
     _darwin_rename(source, destination, RENAME_EXCL)
 
 
-def _write_file_at(content: bytes, parent_fd: int, name: str) -> None:
+def _write_file_at(
+    content: bytes,
+    parent_fd: int,
+    name: str,
+    creation_ledger: dict[str, tuple[int, int, int]] | None = None,
+    relative: pathlib.Path | None = None,
+) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
     try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise FileExistsError(f"created release file is unsafe: {relative or name}")
+        if creation_ledger is not None and relative is not None:
+            creation_ledger[str(relative)] = _temporary_identity(opened)
         with os.fdopen(descriptor, "wb", closefd=False) as target:
             target.write(content)
             target.flush()
@@ -423,18 +435,42 @@ def _copy_release_content(
                     relative = pathlib.Path(raw_relative)
                     parent_fd = directory_fds[relative.parent]
                     os.mkdir(relative.name, 0o700, dir_fd=parent_fd)
-                    directory_fds[relative] = os.open(
+                    descriptor = os.open(
                         relative.name,
                         _DIRECTORY_OPEN_FLAGS,
                         dir_fd=parent_fd,
                     )
+                    try:
+                        opened = os.fstat(descriptor)
+                        active = os.stat(
+                            relative.name,
+                            dir_fd=parent_fd,
+                            follow_symlinks=False,
+                        )
+                    except Exception:
+                        os.close(descriptor)
+                        raise
+                    if (
+                        not stat.S_ISDIR(opened.st_mode)
+                        or _temporary_identity(opened) != _temporary_identity(active)
+                    ):
+                        os.close(descriptor)
+                        raise FileExistsError(f"created release directory changed: {relative}")
+                    temporary_release.creation_ledger[str(relative)] = _temporary_identity(opened)
+                    directory_fds[relative] = descriptor
                 for raw_relative, (entry_type, content) in source_snapshot.items():
                     if entry_type != "file":
                         continue
                     if content is None:
                         raise ValueError(f"source snapshot file has no content: {raw_relative}")
                     relative = pathlib.Path(raw_relative)
-                    _write_file_at(content, directory_fds[relative.parent], relative.name)
+                    _write_file_at(
+                        content,
+                        directory_fds[relative.parent],
+                        relative.name,
+                        temporary_release.creation_ledger,
+                        relative,
+                    )
             finally:
                 for relative, descriptor in reversed(list(directory_fds.items())):
                     if relative != pathlib.Path():
@@ -544,6 +580,9 @@ def _release_entries_from_pinned_fds(
     pinned: list[tuple[int, int, str, tuple[int, int, int], bool]],
     prefix: pathlib.Path = pathlib.Path(),
 ) -> dict[str, tuple[str, bytes | None]]:
+    root_metadata = os.fstat(directory_fd)
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_IMODE(root_metadata.st_mode) != 0o700:
+        raise FileExistsError(f"release directory permissions changed: {prefix or '.'}")
     children = {
         name: (descriptor, expected_identity, is_directory)
         for descriptor, parent_fd, name, expected_identity, is_directory in pinned
@@ -560,6 +599,15 @@ def _release_entries_from_pinned_fds(
             raise FileExistsError(f"release entry changed after verification: {relative}") from error
         if _temporary_identity(active) != expected_identity:
             raise FileExistsError(f"release entry changed after verification: {relative}")
+        opened = os.fstat(descriptor)
+        expected_mode = 0o700 if is_directory else 0o600
+        expected_type = stat.S_ISDIR if is_directory else stat.S_ISREG
+        if (
+            _temporary_identity(opened) != expected_identity
+            or not expected_type(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != expected_mode
+        ):
+            raise FileExistsError(f"release entry permissions changed: {relative}")
         if is_directory:
             entries[str(relative)] = ("directory", None)
             entries.update(_release_entries_from_pinned_fds(descriptor, pinned, relative))
@@ -602,52 +650,108 @@ def _temporary_identity(metadata: os.stat_result) -> tuple[int, int, int]:
     return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
 
 
-def _delete_tree_contents_fd(directory_fd: int) -> None:
-    for name in os.listdir(directory_fd):
+def _delete_tree_contents_fd(
+    directory_fd: int,
+    creation_ledger: dict[str, tuple[int, int, int]],
+    prefix: pathlib.Path = pathlib.Path(),
+) -> None:
+    children = {
+        relative.name: (relative, identity)
+        for raw_relative, identity in creation_ledger.items()
+        for relative in (pathlib.Path(raw_relative),)
+        if relative.parent == prefix
+    }
+    for name, (relative, expected_identity) in children.items():
         try:
             before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except OSError as error:
             raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict while inspecting {name}"
+                f"temporary cleanup conflict while inspecting {relative}"
             ) from error
-        if stat.S_ISDIR(before.st_mode):
+        if _temporary_identity(before) != expected_identity:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict while inspecting {relative}"
+            )
+        if stat.S_ISDIR(expected_identity[2]):
             try:
                 child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
             except OSError as error:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict while opening {name}"
+                    f"temporary cleanup conflict while opening {relative}"
                 ) from error
             try:
-                if _temporary_identity(os.fstat(child_fd)) != _temporary_identity(before):
+                if _temporary_identity(os.fstat(child_fd)) != expected_identity:
                     raise TemporaryCleanupConflict(
-                        f"temporary cleanup conflict while opening {name}"
+                        f"temporary cleanup conflict while opening {relative}"
                     )
-                _delete_tree_contents_fd(child_fd)
+                _delete_tree_contents_fd(child_fd, creation_ledger, relative)
             finally:
                 os.close(child_fd)
             try:
                 active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before removing {name}"
+                    f"temporary cleanup conflict before removing {relative}"
                 ) from error
-            if _temporary_identity(active) != _temporary_identity(before):
+            if _temporary_identity(active) != expected_identity:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before removing {name}"
+                    f"temporary cleanup conflict before removing {relative}"
                 )
-            os.rmdir(name, dir_fd=directory_fd)
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before removing {relative}"
+                ) from error
         else:
             try:
                 active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before unlinking {name}"
+                    f"temporary cleanup conflict before unlinking {relative}"
                 ) from error
-            if _temporary_identity(active) != _temporary_identity(before):
+            if _temporary_identity(active) != expected_identity:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before unlinking {name}"
+                    f"temporary cleanup conflict before unlinking {relative}"
                 )
             os.unlink(name, dir_fd=directory_fd)
+
+
+def _temporary_tree_inventory_fd(
+    directory_fd: int,
+    prefix: pathlib.Path = pathlib.Path(),
+) -> dict[str, tuple[int, int, int]]:
+    inventory: dict[str, tuple[int, int, int]] = {}
+    try:
+        names = os.listdir(directory_fd)
+    except OSError as error:
+        raise TemporaryCleanupConflict("temporary cleanup conflict while listing contents") from error
+    for name in names:
+        relative = prefix / name
+        try:
+            before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict while inspecting {relative}"
+            ) from error
+        identity = _temporary_identity(before)
+        inventory[str(relative)] = identity
+        if stat.S_ISDIR(before.st_mode):
+            try:
+                child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict while opening {relative}"
+                ) from error
+            try:
+                if _temporary_identity(os.fstat(child_fd)) != identity:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict while opening {relative}"
+                    )
+                inventory.update(_temporary_tree_inventory_fd(child_fd, relative))
+            finally:
+                os.close(child_fd)
+    return inventory
 
 
 def _restore_cleanup_claim(parent_fd: int, quarantine_name: str, temporary_name: str) -> None:
@@ -669,6 +773,8 @@ def _cleanup_owned_temporary(
     parent_fd: int,
     temporary_name: str,
     created_identity: tuple[int, int, int],
+    creation_ledger: dict[str, tuple[int, int, int]],
+    directory_fd: int,
 ) -> None:
     while True:
         quarantine_name = f".cleanup-{uuid.uuid4().hex}"
@@ -702,30 +808,29 @@ def _cleanup_owned_temporary(
 
     if stat.S_ISDIR(claimed.st_mode):
         try:
-            directory_fd = os.open(quarantine_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
-        except OSError as error:
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict while opening {quarantine_name}"
-            ) from error
-        try:
             if _temporary_identity(os.fstat(directory_fd)) != created_identity:
                 raise TemporaryCleanupConflict(
                     f"temporary cleanup conflict while opening {quarantine_name}"
                 )
-            _delete_tree_contents_fd(directory_fd)
-        finally:
-            os.close(directory_fd)
-        try:
+            if _temporary_tree_inventory_fd(directory_fd) != creation_ledger:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; unknown contents preserved as {temporary_name}"
+                )
+            _delete_tree_contents_fd(directory_fd, creation_ledger)
             active = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
-        except OSError as error:
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict before removing {quarantine_name}"
-            ) from error
-        if _temporary_identity(active) != created_identity:
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict before removing {quarantine_name}"
-            )
-        os.rmdir(quarantine_name, dir_fd=parent_fd)
+            if _temporary_identity(active) != created_identity:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before removing {quarantine_name}"
+                )
+            try:
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+            except OSError as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict before removing {quarantine_name}"
+                ) from error
+        except Exception:
+            _restore_cleanup_claim(parent_fd, quarantine_name, temporary_name)
+            raise
     else:
         try:
             active = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
@@ -790,32 +895,30 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
             temporary_name,
             releases / temporary_name,
         )
-        try:
-            temporary_fd = os.open(temporary_name, _DIRECTORY_OPEN_FLAGS, dir_fd=releases_fd)
-        except Exception as error:
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict; {temporary_name} could not be opened safely"
-            ) from error
-        try:
-            opened_temporary = os.fstat(temporary_fd)
-        except Exception as error:
-            os.close(temporary_fd)
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict; {temporary_name} ownership could not be established"
-            ) from error
-        temporary_identity = _temporary_identity(opened_temporary)
-        if (
-            not stat.S_ISDIR(opened_temporary.st_mode)
-            or stat.S_IMODE(opened_temporary.st_mode) != 0o700
-            or os.listdir(temporary_fd)
-        ):
-            os.close(temporary_fd)
-            raise TemporaryCleanupConflict(
-                f"temporary cleanup conflict; {temporary_name} is not the created empty directory"
-            )
-        temporary_release.directory_fd = temporary_fd
+        temporary_fd: int | None = None
+        temporary_identity: tuple[int, int, int] | None = None
         published = False
         try:
+            temporary_fd = os.open(temporary_name, _DIRECTORY_OPEN_FLAGS, dir_fd=releases_fd)
+            try:
+                opened_temporary = os.fstat(temporary_fd)
+            except Exception as error:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} ownership could not be established"
+                ) from error
+            if (
+                not stat.S_ISDIR(opened_temporary.st_mode)
+                or stat.S_IMODE(opened_temporary.st_mode) != 0o700
+            ):
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} is not the created empty directory"
+                )
+            temporary_identity = _temporary_identity(opened_temporary)
+            if os.listdir(temporary_fd):
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} is not the created empty directory"
+                )
+            temporary_release.directory_fd = temporary_fd
             _copy_release_content(expected_entries, temporary_release)
             try:
                 _verify_and_make_private_fd(temporary_fd, expected_entries)
@@ -858,10 +961,27 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
                 raise TemporaryCleanupConflict(
                     f"temporary cleanup conflict; {temporary_name} changed before publication"
                 )
+        except TemporaryCleanupConflict:
+            raise
+        except Exception as error:
+            if temporary_fd is None:
+                raise TemporaryCleanupConflict(
+                    f"temporary cleanup conflict; {temporary_name} could not be opened safely"
+                ) from error
+            raise
         finally:
-            os.close(temporary_fd)
-            if not published:
-                _cleanup_owned_temporary(releases_fd, temporary_name, temporary_identity)
+            if temporary_fd is not None:
+                try:
+                    if not published and temporary_identity is not None:
+                        _cleanup_owned_temporary(
+                            releases_fd,
+                            temporary_name,
+                            temporary_identity,
+                            temporary_release.creation_ledger,
+                            temporary_fd,
+                        )
+                finally:
+                    os.close(temporary_fd)
 
         _activate_release(install_root, install_fd, version)
         return {"version": version}

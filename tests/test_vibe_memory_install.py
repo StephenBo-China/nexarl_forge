@@ -153,6 +153,39 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertFalse((paths.install_root / "releases/1.0.0").exists())
             self.assertEqual(list((paths.install_root / "releases").glob(".1.0.0.tmp-*")), [])
 
+    def test_partial_copy_failure_cleans_exact_created_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_write_file_at = vibe_memory_install._write_file_at
+            created: list[str] = []
+
+            def fail_after_second_created_file(*args: object, **kwargs: object) -> None:
+                real_write_file_at(*args, **kwargs)
+                relative = kwargs.get("relative")
+                if relative is None and len(args) >= 5:
+                    relative = args[4]
+                created.append(str(relative))
+                if len(created) == 2:
+                    raise OSError("simulated partial copy failure")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_write_file_at",
+                side_effect=fail_after_second_created_file,
+            ):
+                with self.assertRaisesRegex(OSError, "simulated partial copy failure"):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            self.assertEqual(len(created), 2)
+            self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+            self.assertEqual(
+                list((paths.install_root / "releases").glob(".1.0.0.tmp-*")),
+                [],
+            )
+
     def test_incomplete_copy_is_rejected_before_release_rename(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -165,11 +198,15 @@ class RuntimeInstallTest(unittest.TestCase):
                 (temporary_release / "README.md").unlink()
 
             with mock.patch.object(vibe_memory_install, "_copy_release_content", side_effect=incomplete_copy):
-                with self.assertRaises(ValueError):
+                with self.assertRaises(vibe_memory_install.TemporaryCleanupConflict):
                     vibe_memory_install.install_runtime(source, paths)
 
             self.assertFalse((paths.install_root / "releases/1.0.0").exists())
             self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+            temporary = list((paths.install_root / "releases").glob(".1.0.0.tmp-*"))
+            self.assertEqual(len(temporary), 1)
+            self.assertFalse((temporary[0] / "README.md").exists())
+            self.assertTrue((temporary[0] / "release.json").is_file())
 
     def test_same_release_is_idempotent_but_modified_release_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -1053,6 +1090,90 @@ class RuntimeInstallTest(unittest.TestCase):
                     "_pin_release_entries_fd",
                     side_effect=pin_then_mark,
                 ):
+                    expected_error = (
+                        vibe_memory_install.TemporaryCleanupConflict
+                        if kind == "extra-entry"
+                        else ValueError
+                    )
+                    with self.assertRaises(expected_error):
+                        vibe_memory_install.install_runtime(source, paths)
+
+                self.assertEqual(injected, [True])
+                self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+                self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+                temporary = list(
+                    (paths.install_root / "releases").glob(".1.0.0.tmp-*")
+                )
+                if kind == "extra-entry":
+                    self.assertEqual(len(temporary), 1)
+                    self.assertEqual(
+                        (temporary[0] / "extra").read_bytes(),
+                        b"UNKNOWN EXTRA\n",
+                    )
+                else:
+                    self.assertEqual(temporary, [])
+
+    def test_existing_release_mode_drift_after_chmod_fails_final_verification(self) -> None:
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                source = self.make_source(root)
+                paths = self.make_paths(root)
+                vibe_memory_install.install_runtime(source, paths)
+                (paths.install_root / "current").unlink()
+                release = paths.install_root / "releases/1.0.0"
+                target = release / "README.md" if kind == "file" else release / "scripts"
+                drift_mode = 0o666 if kind == "file" else 0o777
+                injected: list[bool] = []
+                real_final_verification = vibe_memory_install._release_entries_from_pinned_fds
+
+                def drift_mode_before_final_verification(*args: object, **kwargs: object) -> object:
+                    if not injected:
+                        target.chmod(drift_mode)
+                        injected.append(True)
+                    return real_final_verification(*args, **kwargs)
+
+                with mock.patch.object(
+                    vibe_memory_install,
+                    "_release_entries_from_pinned_fds",
+                    side_effect=drift_mode_before_final_verification,
+                ):
+                    with self.assertRaises(FileExistsError):
+                        vibe_memory_install.install_runtime(source, paths)
+
+                self.assertEqual(injected, [True])
+                self.assertEqual(stat.S_IMODE(target.stat().st_mode), drift_mode)
+                self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+
+    def test_temporary_release_mode_drift_after_chmod_is_not_published(self) -> None:
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                source = self.make_source(root)
+                paths = self.make_paths(root)
+                drift_mode = 0o666 if kind == "file" else 0o777
+                injected: list[bool] = []
+                real_final_verification = vibe_memory_install._release_entries_from_pinned_fds
+
+                def drift_mode_before_final_verification(*args: object, **kwargs: object) -> object:
+                    temporary = list(
+                        (paths.install_root / "releases").glob(".1.0.0.tmp-*")
+                    )
+                    if temporary and not injected:
+                        target = (
+                            temporary[0] / "README.md"
+                            if kind == "file"
+                            else temporary[0] / "scripts"
+                        )
+                        target.chmod(drift_mode)
+                        injected.append(True)
+                    return real_final_verification(*args, **kwargs)
+
+                with mock.patch.object(
+                    vibe_memory_install,
+                    "_release_entries_from_pinned_fds",
+                    side_effect=drift_mode_before_final_verification,
+                ):
                     with self.assertRaises(ValueError):
                         vibe_memory_install.install_runtime(source, paths)
 
@@ -1063,6 +1184,156 @@ class RuntimeInstallTest(unittest.TestCase):
                     list((paths.install_root / "releases").glob(".1.0.0.tmp-*")),
                     [],
                 )
+
+    def test_temporary_initial_listdir_failure_closes_fd_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_open = vibe_memory_install.os.open
+            real_listdir = vibe_memory_install.os.listdir
+            baseline = len(os.listdir("/dev/fd"))
+
+            for _ in range(8):
+                temporary_fds: set[int] = set()
+                injected: list[bool] = []
+
+                def record_temporary_open(
+                    path: pathlib.Path | str,
+                    flags: int,
+                    *args: object,
+                    **kwargs: object,
+                ) -> int:
+                    descriptor = real_open(path, flags, *args, **kwargs)
+                    if isinstance(path, str) and path.startswith(".1.0.0.tmp-"):
+                        temporary_fds.add(descriptor)
+                    return descriptor
+
+                def fail_initial_listdir(path: pathlib.Path | str | int) -> list[str]:
+                    if isinstance(path, int) and path in temporary_fds and not injected:
+                        injected.append(True)
+                        raise OSError("injected temporary listdir failure")
+                    return real_listdir(path)
+
+                with mock.patch.object(
+                    vibe_memory_install.os,
+                    "open",
+                    side_effect=record_temporary_open,
+                ), mock.patch.object(
+                    vibe_memory_install.os,
+                    "listdir",
+                    side_effect=fail_initial_listdir,
+                ):
+                    with self.assertRaisesRegex(OSError, "injected temporary listdir failure"):
+                        vibe_memory_install.install_runtime(source, paths)
+
+                self.assertEqual(injected, [True])
+                self.assertEqual(
+                    list((paths.install_root / "releases").glob(".1.0.0.tmp-*")),
+                    [],
+                )
+
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
+    def test_cleanup_preserves_owned_temp_when_unknown_child_was_inserted(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_copy = vibe_memory_install._copy_release_content
+            unknown_bytes = b"UNKNOWN CHILD\n"
+            unknown_identity: list[tuple[int, int]] = []
+            temporary_path: list[pathlib.Path] = []
+
+            def insert_unknown_then_fail(
+                source_snapshot: object,
+                temporary_release: pathlib.Path,
+            ) -> None:
+                real_copy(source_snapshot, temporary_release)
+                temporary = pathlib.Path(os.fspath(temporary_release))
+                unknown = temporary / "unknown-child"
+                unknown.write_bytes(unknown_bytes)
+                metadata = unknown.stat()
+                unknown_identity.append((metadata.st_dev, metadata.st_ino))
+                temporary_path.append(temporary)
+                raise OSError("simulated copy failure after unknown insertion")
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_copy_release_content",
+                side_effect=insert_unknown_then_fail,
+            ):
+                with self.assertRaisesRegex(
+                    vibe_memory_install.TemporaryCleanupConflict,
+                    "temporary cleanup conflict",
+                ):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            unknown = temporary_path[0] / "unknown-child"
+            metadata = unknown.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino), unknown_identity[0])
+            self.assertEqual(unknown.read_bytes(), unknown_bytes)
+            self.assertTrue(temporary_path[0].is_dir())
+            self.assertTrue((temporary_path[0] / "README.md").is_file())
+            self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+
+    def test_cleanup_never_deletes_unknown_child_inserted_after_inventory_check(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_copy = vibe_memory_install._copy_release_content
+            real_delete = vibe_memory_install._delete_tree_contents_fd
+            unknown_bytes = b"UNKNOWN LATE CHILD\n"
+            unknown_identity: list[tuple[int, int]] = []
+            temporary_path: list[pathlib.Path] = []
+
+            def copy_then_fail(source_snapshot: object, temporary_release: pathlib.Path) -> None:
+                real_copy(source_snapshot, temporary_release)
+                temporary_path.append(pathlib.Path(os.fspath(temporary_release)))
+                raise OSError("simulated copy failure before late insertion")
+
+            def insert_unknown_at_delete(
+                directory_fd: int,
+                creation_ledger: dict[str, tuple[int, int, int]],
+                prefix: pathlib.Path = pathlib.Path(),
+            ) -> None:
+                if not unknown_identity:
+                    descriptor = os.open(
+                        "unknown-late",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    try:
+                        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                            handle.write(unknown_bytes)
+                        metadata = os.fstat(descriptor)
+                        unknown_identity.append((metadata.st_dev, metadata.st_ino))
+                    finally:
+                        os.close(descriptor)
+                real_delete(directory_fd, creation_ledger, prefix)
+
+            with mock.patch.object(
+                vibe_memory_install,
+                "_copy_release_content",
+                side_effect=copy_then_fail,
+            ), mock.patch.object(
+                vibe_memory_install,
+                "_delete_tree_contents_fd",
+                side_effect=insert_unknown_at_delete,
+            ):
+                with self.assertRaises(vibe_memory_install.TemporaryCleanupConflict):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            unknown = temporary_path[0] / "unknown-late"
+            metadata = unknown.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino), unknown_identity[0])
+            self.assertEqual(unknown.read_bytes(), unknown_bytes)
+            self.assertTrue(temporary_path[0].is_dir())
+            self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
 
     def test_descriptor_validation_failures_do_not_leak_install_fds(self) -> None:
         with tempfile.TemporaryDirectory() as value:
