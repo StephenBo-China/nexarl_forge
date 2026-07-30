@@ -51,7 +51,7 @@ class ManagedCommandTest(unittest.TestCase):
                 executable, *arguments = shlex.split(value.split(" # ", 1)[0])
                 self.assertEqual(executable, "/usr/bin/python3")
                 self.assertEqual(arguments, [
-                    str(pathlib.Path(runtime).resolve() / "scripts" / "vibe_memory_cli.py"),
+                    str(pathlib.Path(os.path.abspath(runtime)) / "scripts" / "vibe_memory_cli.py"),
                     "hook", "--agent", agent,
                     "--event", event,
                 ])
@@ -75,6 +75,23 @@ class ManagedCommandTest(unittest.TestCase):
             pathlib.Path(script),
             pathlib.Path.cwd().resolve() / "scripts" / "vibe_memory_cli.py",
         )
+
+    def test_command_keeps_current_symlink_lexically_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            install_root = pathlib.Path(value) / "Vibe Memory"
+            release = install_root / "releases/1.0.0"
+            release.mkdir(parents=True)
+            current = install_root / "current"
+            current.symlink_to("releases/1.0.0")
+
+            generated = hooks.command(current, "codex", "Stop")
+            script = shlex.split(generated.split(" # ", 1)[0])[1]
+
+            self.assertEqual(
+                script,
+                str(current / "scripts/vibe_memory_cli.py"),
+            )
+            self.assertNotIn("releases/1.0.0", script)
 
 
 class MergeDocumentTest(unittest.TestCase):

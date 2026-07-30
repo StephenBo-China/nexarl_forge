@@ -90,6 +90,44 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertIn("install failed", stderr)
         self.assertNotIn("degraded", stderr)
 
+    def test_real_install_keeps_codex_and_claude_hooks_on_current_symlink(self) -> None:
+        code, output, stderr = self.invoke([
+            "install", "--source-root", str(ROOT), "--with-claude-hooks"
+        ])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "installed")
+        stable = str(
+            self.paths.install_root / "current/scripts/vibe_memory_cli.py"
+        )
+        for config_path in (
+            self.home / ".codex/hooks.json",
+            self.home / ".claude/settings.json",
+        ):
+            document = json.loads(config_path.read_text(encoding="utf-8"))
+            commands = [
+                handler["command"]
+                for groups in document["hooks"].values()
+                for group in groups
+                for handler in group["hooks"]
+            ]
+            self.assertTrue(commands)
+            self.assertTrue(all(stable in command for command in commands))
+            self.assertTrue(all("releases/1.0.0" not in command for command in commands))
+        before = {
+            path: path.read_bytes()
+            for path in (
+                self.home / ".codex/hooks.json",
+                self.home / ".claude/settings.json",
+            )
+        }
+        code, repeated, stderr = self.invoke([
+            "install", "--source-root", str(ROOT), "--with-claude-hooks"
+        ])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(repeated["hooks"]["codex"]["status"], "current")
+        self.assertEqual(repeated["hooks"]["claude"]["status"], "current")
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
     def test_open_only_invokes_usr_bin_open_after_loopback_health(self) -> None:
         with mock.patch("vibe_memory_cli.health_ok", return_value=True), mock.patch(
             "vibe_memory_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)

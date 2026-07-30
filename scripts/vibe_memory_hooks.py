@@ -91,7 +91,7 @@ def command(runtime: str | pathlib.Path, agent: str, event: str) -> str:
     """Return a shell-safe managed hook command for one supported event."""
     _validate_agent_event(agent, event)
     runtime_path = (
-        pathlib.Path(runtime).expanduser().resolve(strict=False)
+        pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(runtime))))
         / "scripts"
         / "vibe_memory_cli.py"
     )
