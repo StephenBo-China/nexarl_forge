@@ -446,16 +446,193 @@ class DocumentIOTest(unittest.TestCase):
 
 class StatusAndRepairTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_rollback_race_keeps_e2_active_and_preserves_e1(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            e1 = b'{"external": "E1", "hooks": {}}\n'
+            e2 = b'{"external": "E2", "hooks": {}}\n'
+            path.write_bytes(e1)
+            path.chmod(0o640)
+            real_rename = hooks._darwin_rename
+            swap_count = 0
+
+            def race_rollback(source, destination, flags):
+                nonlocal swap_count
+                if flags == hooks.RENAME_SWAP:
+                    swap_count += 1
+                    replacement = root / f"external-{swap_count}.json"
+                    if swap_count == 1:
+                        replacement.write_bytes(e1)
+                        replacement.chmod(0o640)
+                        os.replace(replacement, destination)
+                    elif swap_count == 2:
+                        replacement.write_bytes(e2)
+                        replacement.chmod(0o600)
+                        os.replace(replacement, destination)
+                return real_rename(source, destination, flags)
+
+            with mock.patch("vibe_memory_hooks._darwin_rename", side_effect=race_rollback):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertGreaterEqual(swap_count, 3)
+            self.assertEqual(path.read_bytes(), e2)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertIsNotNone(raised.exception.backup)
+            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), e1)
+            self.assertEqual(
+                stat.S_IMODE(pathlib.Path(raised.exception.backup).stat().st_mode),
+                0o640,
+            )
+            self.assertIsNotNone(raised.exception.attempt)
+            self.assertIn(
+                hooks.MANAGED_SIGNATURE.encode(),
+                pathlib.Path(raised.exception.attempt).read_bytes(),
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_post_swap_active_change_preserves_original_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            original = b'{"external": "original", "hooks": {}}\n'
+            newer = b'{"external": "newer", "hooks": {}}\n'
+            path.write_bytes(original)
+            path.chmod(0o640)
+            real_rename = hooks._darwin_rename
+            injected = False
+
+            def race_after_swap(source, destination, flags):
+                nonlocal injected
+                result = real_rename(source, destination, flags)
+                if not injected and flags == hooks.RENAME_SWAP:
+                    replacement = root / "newer.json"
+                    replacement.write_bytes(newer)
+                    replacement.chmod(0o600)
+                    os.replace(replacement, destination)
+                    injected = True
+                return result
+
+            with mock.patch("vibe_memory_hooks._darwin_rename", side_effect=race_after_swap):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), newer)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertIsNotNone(raised.exception.backup)
+            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
+            self.assertEqual(
+                stat.S_IMODE(pathlib.Path(raised.exception.backup).stat().st_mode),
+                0o640,
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_recovery_artifact_failure_reports_unknown_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            original = b'{"external": "original", "hooks": {}}\n'
+            newer = b'{"external": "newer", "hooks": {}}\n'
+            path.write_bytes(original)
+            real_rename = hooks._darwin_rename
+            injected = False
+
+            def race_after_swap(source, destination, flags):
+                nonlocal injected
+                result = real_rename(source, destination, flags)
+                if not injected and flags == hooks.RENAME_SWAP:
+                    replacement = root / "newer.json"
+                    replacement.write_bytes(newer)
+                    os.replace(replacement, destination)
+                    injected = True
+                return result
+
+            with mock.patch(
+                "vibe_memory_hooks._darwin_rename", side_effect=race_after_swap
+            ), mock.patch(
+                "vibe_memory_hooks._promote_recovery_path",
+                side_effect=OSError("artifact fsync failed"),
+                create=True,
+            ):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), newer)
+            self.assertIsNotNone(raised.exception.backup)
+            recovery_path = pathlib.Path(raised.exception.backup)
+            self.assertTrue(recovery_path.exists())
+            self.assertEqual(recovery_path.read_bytes(), original)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_recovery_fsync_failure_reports_promoted_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            original = b'{"external": "original", "hooks": {}}\n'
+            newer = b'{"external": "newer", "hooks": {}}\n'
+            path.write_bytes(original)
+            original_identity = (path.stat().st_dev, path.stat().st_ino)
+            real_rename = hooks._darwin_rename
+            real_fsync = os.fsync
+            injected = False
+
+            def race_after_swap(source, destination, flags):
+                nonlocal injected
+                result = real_rename(source, destination, flags)
+                if not injected and flags == hooks.RENAME_SWAP:
+                    replacement = root / "newer.json"
+                    replacement.write_bytes(newer)
+                    os.replace(replacement, destination)
+                    injected = True
+                return result
+
+            def fail_original_fsync(descriptor):
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == original_identity:
+                    raise OSError("artifact fsync failed")
+                return real_fsync(descriptor)
+
+            with mock.patch(
+                "vibe_memory_hooks._darwin_rename", side_effect=race_after_swap
+            ), mock.patch("vibe_memory_hooks.os.fsync", side_effect=fail_original_fsync):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), newer)
+            self.assertIsNotNone(raised.exception.backup)
+            recovery_path = pathlib.Path(raised.exception.backup)
+            self.assertTrue(recovery_path.exists())
+            self.assertEqual(recovery_path.read_bytes(), original)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
     def test_repair_backup_failure_swaps_original_back(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
             path = root / "hooks.json"
             original = b'{"hooks": {}}\n'
             path.write_bytes(original)
+            real_promote = hooks._promote_recovery_path
+
+            def fail_backup(target, source, label="conflict"):
+                if label == "bak":
+                    raise OSError("backup failed")
+                return real_promote(target, source, label)
 
             with mock.patch(
-                "vibe_memory_hooks._create_backup_exclusive",
-                side_effect=OSError("backup failed"),
+                "vibe_memory_hooks._promote_recovery_path",
+                side_effect=fail_backup,
             ):
                 with self.assertRaises(OSError):
                     hooks.repair(path, "codex", "/runtime")
@@ -666,21 +843,26 @@ class StatusAndRepairTest(unittest.TestCase):
             path = pathlib.Path(value) / "hooks.json"
             path.write_text('{"hooks": {}}\n', encoding="utf-8")
             external = b'{"external": "during-backup", "hooks": {}}\n'
-            real_backup = hooks._create_backup_exclusive
+            original = path.read_bytes()
+            real_promote = hooks._promote_recovery_path
 
-            def race_backup(target, content, mode):
-                backup = real_backup(target, content, mode)
-                pathlib.Path(target).write_bytes(external)
-                return backup
+            def race_backup(target, source, label="conflict"):
+                artifact = real_promote(target, source, label)
+                if label == "bak":
+                    pathlib.Path(target).write_bytes(external)
+                return artifact
 
             with mock.patch(
-                "vibe_memory_hooks._create_backup_exclusive", side_effect=race_backup
+                "vibe_memory_hooks._promote_recovery_path", side_effect=race_backup
             ):
-                with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently"):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
                     hooks.repair(path, "codex", "/runtime")
 
             self.assertEqual(path.read_bytes(), external)
-            self.assertEqual(list(path.parent.glob("hooks.json.bak.*")), [])
+            self.assertIsNotNone(raised.exception.backup)
+            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
 
     def test_missing_hooks_object_is_drifted_without_mutation_then_repaired(self) -> None:
         with tempfile.TemporaryDirectory() as value:

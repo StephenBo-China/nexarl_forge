@@ -3,6 +3,8 @@
 On Darwin, repair uses ``renamex_np`` with ``RENAME_SWAP`` for existing files
 and ``RENAME_EXCL`` for new files. The exchanged-out file is verified before
 the change is accepted, closing the final pathname race against atomic saves.
+Unknown displaced versions are moved to exclusive, fsynced recovery artifacts;
+only an inode whose identity and bytes match the manager attempt is disposable.
 Other POSIX systems retain the weaker userspace inode/content CAS fallback:
 it detects and recovers many noncooperating writes, but cannot eliminate every
 race without an equivalent kernel exchange primitive.
@@ -42,10 +44,12 @@ class ConcurrentConfigChange(RuntimeError):
         *,
         backup: pathlib.Path | None = None,
         attempt: pathlib.Path | None = None,
+        recovery_paths: list[pathlib.Path] | None = None,
     ) -> None:
         super().__init__(message)
         self.backup = str(backup) if backup is not None else None
         self.attempt = str(attempt) if attempt is not None else None
+        self.recovery_paths = [str(path) for path in recovery_paths or []]
 
 
 class ConfigWriteError(OSError):
@@ -54,6 +58,14 @@ class ConfigWriteError(OSError):
     def __init__(self, message: str, backup: pathlib.Path | None) -> None:
         super().__init__(message)
         self.backup = str(backup) if backup is not None else None
+
+
+class RecoveryArtifactError(OSError):
+    """Raised when a recovery path exists but its durability sync failed."""
+
+    def __init__(self, path: pathlib.Path, cause: BaseException) -> None:
+        super().__init__(f"recovery artifact sync failed: {path}: {cause}")
+        self.path = path
 
 
 class ConfigSymlinkError(ValueError):
@@ -289,6 +301,33 @@ def _darwin_rename(
         )
 
 
+def _promote_recovery_path(
+    target: pathlib.Path,
+    source: pathlib.Path,
+    label: str = "conflict",
+) -> pathlib.Path:
+    """Atomically give a held version an exclusive durable artifact name."""
+    suffix = 0
+    while True:
+        artifact = _artifact_path(target, label, suffix)
+        try:
+            _darwin_rename(source, artifact, RENAME_EXCL)
+        except FileExistsError:
+            suffix += 1
+            continue
+        break
+    try:
+        descriptor = os.open(artifact, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(target.parent)
+    except Exception as exc:
+        raise RecoveryArtifactError(artifact, exc) from exc
+    return artifact
+
+
 def _create_artifact_exclusive(
     target: pathlib.Path, content: bytes, mode: int, label: str
 ) -> pathlib.Path:
@@ -381,6 +420,151 @@ def _path_matches(
     except FileNotFoundError:
         return False
     return _identity(before) == identity == _identity(after) and current == content
+
+
+def _snapshot_path(
+    target: pathlib.Path,
+) -> tuple[tuple[int, int], bytes, int] | None:
+    descriptor = _open_source_descriptor(target)
+    if descriptor is None:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        identity = _identity(metadata)
+        content = _descriptor_bytes(descriptor)
+        mode = stat.S_IMODE(metadata.st_mode)
+        if not _path_matches(target, identity, content):
+            return None
+        return identity, content, mode
+    finally:
+        os.close(descriptor)
+
+
+def _preserve_manager_attempt(
+    target: pathlib.Path,
+    temporary: pathlib.Path,
+    manager_identity: tuple[int, int] | None,
+    content: bytes,
+    mode: int,
+) -> pathlib.Path | None:
+    if (
+        manager_identity is not None
+        and temporary.exists()
+        and _path_matches(temporary, manager_identity, content)
+    ):
+        try:
+            return _promote_recovery_path(target, temporary, "attempt")
+        except RecoveryArtifactError as exc:
+            return exc.path
+        except Exception:
+            return temporary
+    try:
+        return _create_attempt_exclusive(target, content, mode)
+    except Exception:
+        return None
+
+
+def _promote_unknown_or_report(
+    target: pathlib.Path,
+    temporary: pathlib.Path,
+) -> pathlib.Path:
+    try:
+        return _promote_recovery_path(target, temporary, "conflict")
+    except RecoveryArtifactError as exc:
+        return exc.path
+    except Exception:
+        return temporary
+
+
+def _recover_darwin_source_mismatch(
+    target: pathlib.Path,
+    temporary: pathlib.Path,
+    manager_identity: tuple[int, int] | None,
+    content: bytes,
+    manager_mode: int,
+) -> NoReturn:
+    """Bounded recovery that never discards an unidentified exchanged version."""
+    first = _snapshot_path(temporary)
+    recovery_paths: list[pathlib.Path] = []
+
+    if manager_identity is None or not _path_matches(target, manager_identity, content):
+        backup = _promote_unknown_or_report(target, temporary)
+        recovery_paths.append(backup)
+        attempt = _preserve_manager_attempt(
+            target, temporary, manager_identity, content, manager_mode
+        )
+        raise ConcurrentConfigChange(
+            f"hook configuration changed concurrently; newer active path preserved: {target}",
+            backup=backup,
+            attempt=attempt,
+            recovery_paths=recovery_paths,
+        )
+
+    _darwin_rename(temporary, target, RENAME_SWAP)
+    if manager_identity is not None and _path_matches(
+        temporary, manager_identity, content
+    ):
+        attempt = _preserve_manager_attempt(
+            target, temporary, manager_identity, content, manager_mode
+        )
+        raise ConcurrentConfigChange(
+            f"hook configuration changed concurrently; external bytes restored: {target}",
+            attempt=attempt,
+            recovery_paths=[attempt] if attempt is not None else [],
+        )
+
+    second = _snapshot_path(temporary)
+    if first is None or second is None:
+        backup = _promote_unknown_or_report(target, temporary)
+        recovery_paths.append(backup)
+        attempt = _preserve_manager_attempt(
+            target, temporary, manager_identity, content, manager_mode
+        )
+        raise ConcurrentConfigChange(
+            f"hook configuration changed concurrently; recovery versions retained: {target}",
+            backup=backup,
+            attempt=attempt,
+            recovery_paths=recovery_paths,
+        )
+
+    first_identity, first_content, first_mode = first
+    second_identity, second_content, second_mode = second
+    try:
+        first_artifact = _create_artifact_exclusive(
+            target, first_content, first_mode, "conflict"
+        )
+        second_artifact = _create_artifact_exclusive(
+            target, second_content, second_mode, "conflict"
+        )
+    except Exception:
+        backup = temporary
+        attempt = _preserve_manager_attempt(
+            target, temporary, manager_identity, content, manager_mode
+        )
+        raise ConcurrentConfigChange(
+            f"hook configuration changed concurrently; recovery versions retained: {target}",
+            backup=backup,
+            attempt=attempt,
+            recovery_paths=[temporary],
+        )
+    recovery_paths.extend((first_artifact, second_artifact))
+
+    if _path_matches(target, first_identity, first_content) and _path_matches(
+        temporary, second_identity, second_content
+    ):
+        _darwin_rename(temporary, target, RENAME_SWAP)
+        displaced = _promote_unknown_or_report(target, temporary)
+        recovery_paths.append(displaced)
+
+    attempt = _preserve_manager_attempt(
+        target, temporary, manager_identity, content, manager_mode
+    )
+    raise ConcurrentConfigChange(
+        f"hook configuration changed concurrently; recovery versions preserved: {target}",
+        backup=first_artifact,
+        attempt=attempt,
+        recovery_paths=recovery_paths,
+    )
 
 
 def _restore_external_bytes(
@@ -537,70 +721,64 @@ def write_with_backup(
                     return False
 
             if not exchanged_source_matches():
-                _darwin_rename(temporary, target, RENAME_SWAP)
-                replaced = False
-                _raise_preserved_conflict(
+                _recover_darwin_source_mismatch(
                     target,
                     temporary,
+                    manager_identity,
                     content,
                     existing_mode,
-                    None,
-                    "external bytes restored",
                 )
             if manager_identity is None or not _path_matches(
                 target, manager_identity, content
             ):
                 replaced = False
-                _raise_preserved_conflict(
-                    target,
-                    temporary,
-                    content,
-                    existing_mode,
-                    None,
-                    "newer active path preserved",
-                    temporary_is_attempt=False,
+                backup = _promote_unknown_or_report(target, temporary)
+                attempt = _preserve_manager_attempt(
+                    target, temporary, manager_identity, content, existing_mode
+                )
+                raise ConcurrentConfigChange(
+                    f"hook configuration changed concurrently; newer active path preserved: "
+                    f"{target}",
+                    backup=backup,
+                    attempt=attempt,
+                    recovery_paths=[backup],
                 )
 
-            backup_mode = stat.S_IMODE(temporary.stat().st_mode)
             try:
-                backup = _create_backup_exclusive(target, expected_source, backup_mode)
+                backup = _promote_recovery_path(target, temporary, "bak")
             except Exception:
-                if manager_identity is not None and _path_matches(
+                if temporary.exists() and manager_identity is not None and _path_matches(
                     target, manager_identity, content
                 ):
                     _darwin_rename(temporary, target, RENAME_SWAP)
                 replaced = False
                 raise
-            if not exchanged_source_matches():
-                _darwin_rename(temporary, target, RENAME_SWAP)
-                replaced = False
-                backup.unlink(missing_ok=True)
-                backup = None
-                _raise_preserved_conflict(
+            if held_descriptor is not None and (
+                _descriptor_bytes(held_descriptor) != expected_source
+                or held_identity is None
+                or not _path_matches(backup, held_identity, expected_source)
+            ):
+                _recover_darwin_source_mismatch(
                     target,
-                    temporary,
+                    backup,
+                    manager_identity,
                     content,
                     existing_mode,
-                    None,
-                    "external bytes restored",
                 )
             if manager_identity is None or not _path_matches(
                 target, manager_identity, content
             ):
                 replaced = False
-                backup.unlink(missing_ok=True)
-                backup = None
-                _raise_preserved_conflict(
-                    target,
-                    temporary,
-                    content,
-                    existing_mode,
-                    None,
-                    "newer active path preserved",
-                    temporary_is_attempt=False,
+                attempt = _preserve_manager_attempt(
+                    target, temporary, manager_identity, content, existing_mode
                 )
-            temporary.unlink()
-            _fsync_directory(target.parent)
+                raise ConcurrentConfigChange(
+                    f"hook configuration changed concurrently; newer active path preserved: "
+                    f"{target}",
+                    backup=backup,
+                    attempt=attempt,
+                    recovery_paths=[backup],
+                )
             return {
                 "changed": True,
                 "path": str(target),
@@ -641,6 +819,31 @@ def write_with_backup(
                 )
         _fsync_directory(target.parent)
     except ConcurrentConfigChange as conflict:
+        if sys.platform == "darwin" and expected_source is not _NO_SOURCE_CHECK:
+            if temporary.exists():
+                if manager_identity is not None and _path_matches(
+                    temporary, manager_identity, content
+                ):
+                    preserved = _preserve_manager_attempt(
+                        target,
+                        temporary,
+                        manager_identity,
+                        content,
+                        existing_mode,
+                    )
+                    if conflict.attempt is None and preserved is not None:
+                        conflict.attempt = str(preserved)
+                else:
+                    preserved = _promote_unknown_or_report(target, temporary)
+                    if conflict.backup in (None, str(temporary)):
+                        conflict.backup = str(preserved)
+                    conflict.recovery_paths = [
+                        str(preserved) if path == str(temporary) else path
+                        for path in conflict.recovery_paths
+                    ]
+                    if str(preserved) not in conflict.recovery_paths:
+                        conflict.recovery_paths.append(str(preserved))
+            raise
         if conflict.attempt != str(temporary):
             temporary.unlink(missing_ok=True)
         if not replaced and backup is not None and backup.exists():
@@ -651,6 +854,28 @@ def write_with_backup(
                 pass
         raise
     except Exception as exc:
+        if sys.platform == "darwin" and expected_source is not _NO_SOURCE_CHECK:
+            if temporary.exists():
+                if manager_identity is not None and _path_matches(
+                    temporary, manager_identity, content
+                ):
+                    attempt = _preserve_manager_attempt(
+                        target,
+                        temporary,
+                        manager_identity,
+                        content,
+                        existing_mode,
+                    )
+                else:
+                    backup = _promote_unknown_or_report(target, temporary)
+            if replaced:
+                backup_description = str(backup) if backup is not None else "unavailable"
+                raise ConfigWriteError(
+                    f"hook configuration was replaced but durability sync failed; backup: "
+                    f"{backup_description}",
+                    backup,
+                ) from exc
+            raise
         temporary.unlink(missing_ok=True)
         if replaced:
             backup_description = str(backup) if backup is not None else "unavailable"
