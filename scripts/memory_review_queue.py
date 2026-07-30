@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -24,7 +25,8 @@ import urllib.request
 from typing import Any
 
 import memory_project
-from ui_design_store import exclusive_lock
+from loop_superpowers import atomic_write_text
+from ui_design_store import atomic_write_json, exclusive_lock
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROJECT_ROOT = pathlib.Path(
@@ -95,11 +97,7 @@ def read_text(path: pathlib.Path) -> str:
 
 
 def write_json(path: pathlib.Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, value)
 
 
 def read_json(path: pathlib.Path, default: Any) -> Any:
@@ -132,10 +130,16 @@ def metadata_value(body: str, key: str) -> str:
     return match.group(1).strip().strip("`") if match else ""
 
 
-def candidate_provenance(body: str) -> tuple[str, int]:
+def candidate_provenance(body: str) -> tuple[str, list[str], int]:
     source_agent = metadata_value(body, "source_agent") or "unknown"
     if source_agent not in {"codex", "claude-code", "unknown"}:
         source_agent = "unknown"
+    source_agents = {
+        value.strip()
+        for value in metadata_value(body, "source_agents").split(",")
+        if value.strip() in {"codex", "claude-code", "unknown"}
+    }
+    source_agents.add(source_agent)
     raw_policy_version = metadata_value(body, "policy_version") or "1"
     try:
         policy_version = int(raw_policy_version)
@@ -143,16 +147,65 @@ def candidate_provenance(body: str) -> tuple[str, int]:
         policy_version = 1
     if policy_version <= 0:
         policy_version = 1
-    return source_agent, policy_version
+    return source_agent, sorted(source_agents), policy_version
 
 
 def without_candidate_metadata(body: str) -> str:
     return re.sub(
-        r"^(?:-\s*)?(?:source_event|source_agent|policy_version):\s*.+$",
+        r"^(?:-\s*)?(?:candidate_id|source_event|source_agent|source_agents|policy_version|identity|category):\s*.+$",
         "",
         body,
         flags=re.MULTILINE,
     ).strip()
+
+
+def write_proposals_atomically(path: pathlib.Path, content: str) -> None:
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    atomic_write_text(path, content, mode=mode)
+
+
+def merge_candidate_source_agent(
+    text: str, identity: str, source_agent: str
+) -> tuple[str, str, list[str]] | None:
+    headings = list(re.finditer(r"^### .+$", text, flags=re.MULTILINE))
+    for index, heading_match in enumerate(headings):
+        body_start = heading_match.end()
+        body_end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        body = text[body_start:body_end]
+        if metadata_value(body, "identity") != identity:
+            continue
+        _, source_agents, _ = candidate_provenance(body)
+        merged_agents = sorted({*source_agents, source_agent})
+        if merged_agents != source_agents:
+            prefix = "- " if re.search(r"^- source_agent:", body, flags=re.MULTILINE) else ""
+            value = ",".join(merged_agents)
+            rendered = f"{prefix}source_agents: " + (f"`{value}`" if prefix else value)
+            if re.search(r"^(?:-\s*)?source_agents:\s*.+$", body, flags=re.MULTILINE):
+                body = re.sub(
+                    r"^(?:-\s*)?source_agents:\s*.+$",
+                    rendered,
+                    body,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+            else:
+                source_line = re.search(
+                    r"^(?:-\s*)?source_agent:\s*.+$", body, flags=re.MULTILINE
+                )
+                if source_line is None:
+                    raise ValueError("candidate provenance is missing source_agent")
+                body = body[: source_line.end()] + "\n" + rendered + body[source_line.end() :]
+        candidate_id = metadata_value(body, "memory_id") or metadata_value(body, "candidate_id")
+        if not candidate_id:
+            candidate_id = stable_id(
+                "P", PROJECT_PROPOSALS, heading_match.group(0).strip(), body.strip()
+            )
+        updated = text[:body_start] + body + text[body_end:]
+        return updated, candidate_id, merged_agents
+    return None
 
 
 def first_fenced_text(body: str) -> str:
@@ -169,6 +222,17 @@ def short_summary(text: str, max_len: int = 140) -> str:
 
 def normalize_memory(text: str) -> str:
     return re.sub(r"\W+", "", text.lower())
+
+
+def candidate_identity(
+    scope: str, target: str, category: str, title: str, summary: str
+) -> str:
+    value = json.dumps(
+        [scope, target, category, normalize_memory(title), normalize_memory(summary)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def risk_flags(text: str) -> list[str]:
@@ -224,10 +288,14 @@ def parse_project_candidates() -> list[dict[str, Any]]:
     text = read_text(PROJECT_PROPOSALS)
     items: list[dict[str, Any]] = []
     for heading, body in split_heading_sections(text):
-        candidate_id = stable_id("P", PROJECT_PROPOSALS, heading, body)
+        candidate_id = metadata_value(body, "candidate_id") or stable_id(
+            "P", PROJECT_PROPOSALS, heading, body
+        )
         created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
         source_event = metadata_value(body, "source_event")
-        source_agent, policy_version = candidate_provenance(body)
+        source_agent, source_agents, policy_version = candidate_provenance(body)
+        identity = metadata_value(body, "identity")
+        category = metadata_value(body, "category")
         content = without_candidate_metadata(body)
         checkpoint = is_project_checkpoint(heading, content)
         items.append(
@@ -240,7 +308,10 @@ def parse_project_candidates() -> list[dict[str, Any]]:
                 "source": "project_proposals",
                 "source_event": source_event,
                 "source_agent": source_agent,
+                "source_agents": source_agents,
                 "policy_version": policy_version,
+                "identity": identity,
+                "category": category,
                 "source_path": str(PROJECT_PROPOSALS),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
@@ -267,7 +338,9 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
         target = metadata_value(body, "target") or "unsure"
         created = metadata_value(body, "created") or heading.removeprefix("### ").strip()
         source_event = metadata_value(body, "source_event")
-        source_agent, policy_version = candidate_provenance(body)
+        source_agent, source_agents, policy_version = candidate_provenance(body)
+        identity = metadata_value(body, "identity")
+        category = metadata_value(body, "category")
         content = first_fenced_text(body)
         items.append(
             {
@@ -279,7 +352,10 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
                 "source": "personal_proposals",
                 "source_event": source_event,
                 "source_agent": source_agent,
+                "source_agents": source_agents,
                 "policy_version": policy_version,
+                "identity": identity,
+                "category": category,
                 "source_path": str(PERSONAL_PROPOSALS),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
@@ -292,21 +368,23 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
 
 
 def build_queue() -> dict[str, Any]:
-    state = state_map()
-    decisions = state.get("items", {})
-    items = parse_project_candidates() + parse_personal_candidates()
-    for item in items:
-        decision = decisions.get(item["id"], {})
-        item["status"] = decision.get("status", "pending")
-        item["decision"] = decision
-    queue = {
-        "generated_at": now(),
-        "review_url": REVIEW_URL,
-        "items": items,
-        "counts": count_items(items),
-    }
-    write_json(PROJECT_QUEUE, queue)
-    return queue
+    queue_lock = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
+    with exclusive_lock(queue_lock):
+        state = state_map()
+        decisions = state.get("items", {})
+        items = parse_project_candidates() + parse_personal_candidates()
+        for item in items:
+            decision = decisions.get(item["id"], {})
+            item["status"] = decision.get("status", "pending")
+            item["decision"] = decision
+        queue = {
+            "generated_at": now(),
+            "review_url": REVIEW_URL,
+            "items": items,
+            "counts": count_items(items),
+        }
+        write_json(PROJECT_QUEUE, queue)
+        return queue
 
 
 def create_agent_candidate(
@@ -341,50 +419,90 @@ def create_agent_candidate(
         raise ValueError("policy_version must be a positive integer")
     if not title or len(summary) < 12 or len(summary) > 1200:
         raise ValueError("candidate title/summary length is invalid")
-    if risk_flags(summary):
+    if risk_flags(f"{title}\n{summary}"):
         raise ValueError("candidate contains sensitive material")
-    needle = normalize_memory(summary)
     markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
+    identity = candidate_identity(scope, target, category, title, summary)
     proposals = PERSONAL_PROPOSALS if scope == "personal" else PROJECT_PROPOSALS
     proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
+    result: dict[str, Any]
     with exclusive_lock(proposal_lock):
-        if scope == "personal":
-            sources = [
-                read_text(PERSONAL_PROPOSALS),
-                read_text(PERSONAL_LONG),
-                read_text(PERSONAL_SHORT),
-            ]
+        existing = read_text(proposals)
+        merged = merge_candidate_source_agent(existing, identity, source_agent)
+        if merged is not None:
+            updated, candidate_id, source_agents = merged
+            if updated != existing:
+                write_proposals_atomically(proposals, updated)
+            result = {
+                "created": False,
+                "reason": "duplicate",
+                "id": candidate_id,
+                "source_agents": source_agents,
+            }
         else:
-            sources = [read_text(PROJECT_PROPOSALS), read_text(PROJECT_LONG)]
-        if needle and any(needle in normalize_memory(text) for text in sources):
-            return {"created": False, "reason": "duplicate"}
-
-        created = now()
-        if scope == "personal":
-            existing = sources[0]
-            stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-            candidate_id = f"M-{stamp}"
-            suffix = 2
-            while candidate_id in existing:
-                candidate_id = f"M-{stamp}-{suffix}"
-                suffix += 1
-            with PERSONAL_PROPOSALS.open("a", encoding="utf-8") as handle:
-                handle.write(f"\n### {candidate_id}\n\n")
-                handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
-                handle.write(f"created: {created}\nsource_event: {source_event}\n")
-                handle.write(f"source_agent: {source_agent}\npolicy_version: {policy_version}\n")
-                handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
-                handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
-        else:
-            candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
-            with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
-                handle.write(f"\n### {created} - {title}\n\n")
-                handle.write(f"{markdown}\n\n")
-                handle.write(f"- source_event: `{source_event}`\n")
-                handle.write(f"- source_agent: `{source_agent}`\n")
-                handle.write(f"- policy_version: `{policy_version}`\n")
+            if scope == "personal":
+                approved_path = PERSONAL_LONG if target == "long" else PERSONAL_SHORT
+            else:
+                approved_path = PROJECT_LONG
+            approved = read_text(approved_path)
+            if normalize_memory(markdown) in normalize_memory(approved):
+                result = {"created": False, "reason": "duplicate"}
+            else:
+                created = now()
+                source_agents = sorted({source_agent})
+                rendered_agents = ",".join(source_agents)
+                if scope == "personal":
+                    stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+                    candidate_id = f"M-{stamp}"
+                    suffix = 2
+                    while candidate_id in existing:
+                        candidate_id = f"M-{stamp}-{suffix}"
+                        suffix += 1
+                    body = (
+                        f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n"
+                        f"created: {created}\nsource_event: {source_event}\n"
+                        f"source_agent: {source_agent}\nsource_agents: {rendered_agents}\n"
+                        f"policy_version: {policy_version}\nidentity: {identity}\n"
+                        f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n"
+                        "approval_rule: Promote only after explicit user approval of this exact content."
+                    )
+                    section = f"\n### {candidate_id}\n\n{body}\n"
+                else:
+                    heading = f"### {created} - {title}"
+                    body_without_id = (
+                        f"{markdown}\n\n"
+                        f"- source_event: `{source_event}`\n"
+                        f"- source_agent: `{source_agent}`\n"
+                        f"- source_agents: `{rendered_agents}`\n"
+                        f"- policy_version: `{policy_version}`\n"
+                        f"- identity: `{identity}`\n"
+                        f"- category: `{category}`"
+                    )
+                    candidate_id = stable_id(
+                        "P", PROJECT_PROPOSALS, heading, body_without_id
+                    )
+                    body = (
+                        f"{markdown}\n\n"
+                        f"- candidate_id: `{candidate_id}`\n"
+                        f"- source_event: `{source_event}`\n"
+                        f"- source_agent: `{source_agent}`\n"
+                        f"- source_agents: `{rendered_agents}`\n"
+                        f"- policy_version: `{policy_version}`\n"
+                        f"- identity: `{identity}`\n"
+                        f"- category: `{category}`"
+                    )
+                    section = f"\n{heading}\n\n{body}\n"
+                write_proposals_atomically(proposals, existing + section)
+                result = {
+                    "created": True,
+                    "id": candidate_id,
+                    "scope": scope,
+                    "target": target,
+                    "content": markdown,
+                    "source_agents": source_agents,
+                }
     build_queue()
-    return {"created": True, "id": candidate_id, "scope": scope, "target": target, "content": markdown}
+    return result
 
 
 def count_items(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -469,6 +587,8 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
     approved_content = (content if content is not None else item.get("content", "")).strip()
     if not approved_content:
         raise ValueError("Cannot approve empty memory content")
+    if risk_flags(f"{item.get('title', '')}\n{approved_content}"):
+        raise ValueError("Cannot approve candidate containing sensitive material")
     destination = decision_target_path(target)
     append_official_memory(destination, item, approved_content)
     record_decision(
@@ -480,6 +600,7 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
             "decided_at": now(),
             "risk_flags": item.get("risk_flags", []),
             "source_agent": item.get("source_agent", "unknown"),
+            "source_agents": item.get("source_agents", [item.get("source_agent", "unknown")]),
             "policy_version": item.get("policy_version", 1),
         },
     )

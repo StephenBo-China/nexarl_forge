@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import stat
 import sys
 import tempfile
 import threading
@@ -218,12 +219,13 @@ class MemoryReviewQualityTest(unittest.TestCase):
                     policy_version=2,
                 )
                 second = review.create_agent_candidate(
-                    "personal", "long", "collaboration_preference", "重复标题",
+                    "personal", "long", "collaboration_preference", " 修改前确认计划 ",
                     "用户希望修改代码前先确认修改计划和不确定事项。",
                     source_agent="claude-code",
                     policy_version=3,
                 )
                 personal_item = review.parse_personal_candidates()[0]
+                approved_personal = review.approve(first["id"])
                 project = review.create_agent_candidate(
                     "project", "long", "project_architecture", "共享路由器",
                     "项目使用共享路由器规范化本地代理事件并生成审核上下文。",
@@ -231,22 +233,31 @@ class MemoryReviewQualityTest(unittest.TestCase):
                     policy_version=4,
                 )
                 project_item = review.parse_project_candidates()[0]
-                approved = review.approve(project_item["id"])
+                approved = review.approve(project["id"])
             finally:
                 for name, value in originals.items():
                     setattr(review, name, value)
             self.assertTrue(first["created"])
             self.assertFalse(second["created"])
             self.assertTrue(project["created"])
+            self.assertEqual(first["id"], personal_item["id"])
+            self.assertEqual(project["id"], project_item["id"])
             self.assertEqual(personal_item["source_agent"], "codex")
+            self.assertEqual(personal_item["source_agents"], ["claude-code", "codex"])
             self.assertEqual(personal_item["policy_version"], 2)
             self.assertEqual(project_item["source_agent"], "claude-code")
             self.assertEqual(project_item["policy_version"], 4)
             self.assertEqual(approved["decision"]["source_agent"], "claude-code")
+            self.assertEqual(approved["decision"]["source_agents"], ["claude-code"])
             self.assertEqual(approved["decision"]["policy_version"], 4)
+            self.assertEqual(
+                approved_personal["decision"]["source_agents"],
+                ["claude-code", "codex"],
+            )
             text = (temp / "personal_proposals.md").read_text(encoding="utf-8")
             self.assertIn("status: pending", text)
             self.assertIn("source_agent: codex", text)
+            self.assertIn("source_agents: claude-code,codex", text)
             self.assertIn("policy_version: 2", text)
             self.assertIn("**标题：修改前确认计划**", text)
             approved_text = (temp / "project_long.md").read_text(encoding="utf-8")
@@ -254,6 +265,140 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertIn("项目架构", approved_text)
             self.assertNotIn("source_agent", approved_text)
             self.assertNotIn("policy_version", approved_text)
+
+    def test_candidate_identity_includes_scope_target_category_title_and_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue",
+                )
+            }
+            try:
+                review.PERSONAL_PROPOSALS = temp / "personal_proposals.md"
+                review.PERSONAL_PROPOSALS.write_text("# Proposals\n", encoding="utf-8")
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_PROPOSALS.write_text("# Project Proposals\n", encoding="utf-8")
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = lambda: {}
+                summary = "用户希望相同摘要在身份字段不同时仍可形成独立候选。"
+                results = [
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "标题一", summary
+                    ),
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "标题二", summary
+                    ),
+                    review.create_agent_candidate(
+                        "personal", "short", "work_style", "标题一", summary
+                    ),
+                    review.create_agent_candidate(
+                        "personal", "long", "thinking_style", "标题一", summary
+                    ),
+                    review.create_agent_candidate(
+                        "project", "long", "project_workflow", "标题一", summary
+                    ),
+                ]
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertTrue(all(result["created"] for result in results))
+
+    def test_sensitive_candidate_title_is_rejected_before_write_or_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR",
+                )
+            }
+            try:
+                review.PERSONAL_PROPOSALS = temp / "personal_proposals.md"
+                review.PERSONAL_PROPOSALS.write_text("# Proposals\n", encoding="utf-8")
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                with self.assertRaisesRegex(ValueError, "sensitive"):
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "api_key=do-not-store",
+                        "用户希望跨项目保留清晰且可审核的工作方式说明。",
+                    )
+                review.PROJECT_PROPOSALS.write_text(
+                    "### 2026-07-30 - api_key=do-not-approve\n\n"
+                    "**分类：项目工作流**\n\n这是一条长度足够但标题敏感的候选说明。\n",
+                    encoding="utf-8",
+                )
+                sensitive_id = review.parse_project_candidates()[0]["id"]
+                with self.assertRaisesRegex(ValueError, "sensitive"):
+                    review.approve(sensitive_id)
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertEqual(
+                (temp / "personal_proposals.md").read_text(encoding="utf-8"),
+                "# Proposals\n",
+            )
+            self.assertFalse((temp / "personal_long.md").exists())
+            self.assertFalse((temp / "project_long.md").exists())
+
+    def test_proposal_atomic_replace_failure_preserves_bytes_and_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            proposals = temp / "personal_proposals.md"
+            original_bytes = b"# Proposals\n\noriginal\n"
+            proposals.write_bytes(original_bytes)
+            proposals.chmod(0o600)
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue",
+                )
+            }
+            try:
+                review.PERSONAL_PROPOSALS = proposals
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = lambda: {}
+                with mock.patch(
+                    "memory_review_queue.atomic_write_text",
+                    create=True,
+                    side_effect=OSError("replace failed"),
+                ):
+                    with self.assertRaisesRegex(OSError, "replace failed"):
+                        review.create_agent_candidate(
+                            "personal", "long", "work_style", "原子写入",
+                            "用户希望候选提案写入失败时完整保留原始文件内容。",
+                        )
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertEqual(proposals.read_bytes(), original_bytes)
+            self.assertEqual(stat.S_IMODE(proposals.stat().st_mode), 0o600)
 
     def test_agent_candidate_validates_provenance(self) -> None:
         for source_agent, policy_version, message in (
@@ -340,6 +485,112 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(sorted(result["created"] for result in results), [False, True])
             text = proposals.read_text(encoding="utf-8")
             self.assertEqual(text.count("并发代理调用时仍然只生成一条"), 1)
+
+    def test_concurrent_scopes_rebuild_one_atomic_queue_without_lost_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue", "write_json",
+                    "parse_project_candidates",
+                )
+            }
+            personal_parsed_project = threading.Event()
+            project_reached_build = threading.Event()
+            project_queue_written = threading.Event()
+            errors: list[BaseException] = []
+            queue_path = temp / "queue.json"
+            queue_lock = queue_path.with_suffix(queue_path.suffix + ".lock")
+
+            def synchronized_parse_project() -> list[dict]:
+                items = originals["parse_project_candidates"]()
+                if threading.current_thread().name == "personal-create":
+                    personal_parsed_project.set()
+                    if not project_reached_build.wait(timeout=3):
+                        raise TimeoutError("project did not reach queue build")
+                return items
+
+            def synchronized_build_queue() -> dict:
+                if threading.current_thread().name == "project-create":
+                    project_reached_build.set()
+                return originals["build_queue"]()
+
+            def ordered_write_json(path: pathlib.Path, value: object) -> None:
+                if path == queue_path:
+                    if (
+                        threading.current_thread().name == "personal-create"
+                        and not queue_lock.exists()
+                        and not project_queue_written.wait(timeout=3)
+                    ):
+                        raise TimeoutError("project queue write did not finish")
+                    originals["write_json"](path, value)
+                    if threading.current_thread().name == "project-create":
+                        project_queue_written.set()
+                    return
+                originals["write_json"](path, value)
+
+            def create_personal() -> None:
+                try:
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "个人候选",
+                        "用户希望并发构建审核队列时保留个人候选记录。",
+                        source_agent="codex",
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            def create_project() -> None:
+                try:
+                    review.create_agent_candidate(
+                        "project", "long", "project_workflow", "项目候选",
+                        "项目要求并发构建审核队列时保留项目候选记录。",
+                        source_agent="claude-code",
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            try:
+                review.PERSONAL_PROPOSALS = temp / "personal_proposals.md"
+                review.PERSONAL_PROPOSALS.write_text("# Proposals\n", encoding="utf-8")
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_PROPOSALS.write_text("# Project Proposals\n", encoding="utf-8")
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = queue_path
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = synchronized_build_queue
+                review.write_json = ordered_write_json
+                review.parse_project_candidates = synchronized_parse_project
+                personal_thread = threading.Thread(
+                    name="personal-create", target=create_personal
+                )
+                project_thread = threading.Thread(
+                    name="project-create", target=create_project
+                )
+                personal_thread.start()
+                self.assertTrue(personal_parsed_project.wait(timeout=3))
+                project_thread.start()
+                personal_thread.join(timeout=5)
+                project_thread.join(timeout=5)
+                alive = [
+                    thread.name
+                    for thread in (personal_thread, project_thread)
+                    if thread.is_alive()
+                ]
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertEqual(alive, [])
+            self.assertEqual(errors, [])
+            queue = json.loads(queue_path.read_text(encoding="utf-8"))
+            self.assertEqual({item["scope"] for item in queue["items"]}, {"personal", "project"})
+            self.assertEqual(queue["counts"]["pending"], 2)
 
     def test_propose_cli_accepts_and_forwards_candidate_provenance(self) -> None:
         argv = [

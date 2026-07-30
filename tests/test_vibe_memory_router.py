@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import shlex
 import sys
 import tempfile
 import unittest
@@ -248,6 +249,37 @@ class VibeMemoryRouterTest(unittest.TestCase):
         self.assertIn("memory_review.py propose", context)
         self.assertIn("--source-agent claude-code", context)
         self.assertIn("--policy-version 1", context)
+
+    def test_build_context_quotes_hostile_paths_and_escapes_markdown(self) -> None:
+        project = pathlib.Path("/tmp/project with spaces ' $(touch nope) `tick`")
+        event = self.event(event="prompt `tick` $(touch nope)")
+
+        context = build_context(event, project_root=project, pending={})
+
+        escaped_project = str(project).replace("\\", "\\\\").replace("`", "\\`")
+        escaped_event = event.event.replace("\\", "\\\\").replace("`", "\\`")
+        self.assertIn(f"Registered project: `{escaped_project}`", context)
+        self.assertIn(f"- event: {escaped_event}", context)
+        marker = "Candidate CLI:\n\n    "
+        self.assertIn(marker, context)
+        command = context.split(marker, 1)[1].splitlines()[0]
+        script = ROOT / "scripts" / "memory_review.py"
+        expected_parts = [
+            f"MEMORY_REVIEW_PROJECT_ROOT={project}",
+            "python3",
+            str(script),
+            "propose",
+            "--scope", "personal",
+            "--target", "long",
+            "--category", "CATEGORY",
+            "--title", "TITLE",
+            "--summary", "SUMMARY",
+            "--source-event", "agent_summary",
+            "--source-agent", "codex",
+            "--policy-version", "1",
+        ]
+        self.assertEqual(shlex.split(command), expected_parts)
+        self.assertEqual(command, " ".join(shlex.quote(part) for part in expected_parts))
 
 
 if __name__ == "__main__":

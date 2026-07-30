@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
+import shlex
 import time
 from typing import Mapping
 
@@ -27,6 +28,16 @@ PROJECT_CATEGORIES = (
     "technical_constraint",
     "project_workflow",
 )
+
+
+def _markdown_escape(value: object) -> str:
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("`", "\\`")
+        .replace("\r", " ")
+        .replace("\n", " ")
+    )
 
 
 class IdempotencyStore:
@@ -92,7 +103,7 @@ def build_context(
         personal_root / "proposals.md",
     ]
     project_section = ""
-    cli_prefix = "python3"
+    command_parts = ["python3"]
     if project_root is not None:
         root = pathlib.Path(project_root)
         required = [
@@ -103,15 +114,38 @@ def build_context(
             root / "codex" / "codex_context_packet.md",
             *required,
         ]
-        project_section = f"\nRegistered project: `{root}`\n"
-        cli_prefix = f"MEMORY_REVIEW_PROJECT_ROOT={root} python3"
-    required_lines = "\n".join(f"- `{path}`" for path in required)
+        project_section = f"\nRegistered project: `{_markdown_escape(root)}`\n"
+        command_parts.insert(0, f"MEMORY_REVIEW_PROJECT_ROOT={root}")
+    required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
     project_categories = ", ".join(PROJECT_CATEGORIES)
+    command_parts.extend(
+        [
+            str(pathlib.Path(__file__).resolve().parent / "memory_review.py"),
+            "propose",
+            "--scope",
+            "personal",
+            "--target",
+            "long",
+            "--category",
+            "CATEGORY",
+            "--title",
+            "TITLE",
+            "--summary",
+            "SUMMARY",
+            "--source-event",
+            "agent_summary",
+            "--source-agent",
+            event.agent,
+            "--policy-version",
+            "1",
+        ]
+    )
+    command = " ".join(shlex.quote(part) for part in command_parts)
     return f"""# Shared Memory Context
 
-- source agent: {event.agent}
-- event: {event.event}
+- source agent: {_markdown_escape(event.agent)}
+- event: {_markdown_escape(event.event)}
 - pending total: {pending.get("pending", 0)}
 - personal candidates: {pending.get("personal_pending", 0)}
 - project candidates: {pending.get("project_pending", 0)}
@@ -135,7 +169,8 @@ def build_context(
   or call another model.
 
 Candidate CLI:
-`{cli_prefix} {pathlib.Path(__file__).resolve().parent / "memory_review.py"} propose --scope personal --target long --category CATEGORY --title TITLE --summary SUMMARY --source-event agent_summary --source-agent {event.agent} --policy-version 1`
+
+    {command}
 """
 
 
