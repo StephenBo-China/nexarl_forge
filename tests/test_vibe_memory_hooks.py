@@ -40,6 +40,43 @@ class ManagedCommandTest(unittest.TestCase):
 
 
 class MergeDocumentTest(unittest.TestCase):
+    def test_ownership_requires_exact_managed_command_tokens(self) -> None:
+        managed = hooks.command("/old runtime", "codex", "Stop")
+        command_prefix, command_comment = managed.split(" # ", 1)
+        custom_commands = [
+            f"printf '%s' '{hooks.MANAGED_SIGNATURE}'",
+            f"{command_prefix} extra-token # {command_comment}",
+            "/usr/bin/python3 /tmp/not-vibe.py hook --agent codex --event Stop",
+            "/usr/bin/python3 /runtime/scripts/vibe_memory_cli.py hook --agent other --event Stop",
+            "/usr/bin/python3 /runtime/scripts/vibe_memory_cli.py hook --agent codex --event Other",
+        ]
+        source = {
+            "hooks": {
+                "Stop": [{
+                    "hooks": [
+                        {"command": command_value} for command_value in [managed, *custom_commands]
+                    ]
+                }]
+            }
+        }
+
+        cleaned = hooks.remove_managed_entries(source)
+
+        self.assertEqual(
+            [item["command"] for item in cleaned["hooks"]["Stop"][0]["hooks"]],
+            custom_commands,
+        )
+
+    def test_empty_custom_group_survives_remove_and_merge(self) -> None:
+        custom_group = {"matcher": "custom", "note": "keep", "hooks": []}
+        source = {"hooks": {"Stop": [custom_group]}}
+
+        cleaned = hooks.remove_managed_entries(source)
+        merged = hooks.merge_document(source, "codex", "/runtime")
+
+        self.assertEqual(cleaned["hooks"]["Stop"], [custom_group])
+        self.assertEqual(merged["hooks"]["Stop"][0], custom_group)
+
     def test_merge_installs_into_object_without_hooks_and_preserves_unknown_fields(self) -> None:
         source = {"custom": {"keep": True}}
 
@@ -58,7 +95,7 @@ class MergeDocumentTest(unittest.TestCase):
                     "note": "vibe-memory hook --agent is just explanatory text",
                     "hooks": [
                         {"type": "command", "command": "custom-start"},
-                        {"type": "command", "command": "old # vibe-memory hook --agent"},
+                        {"type": "command", "command": hooks.command("/old", "codex", "SessionStart")},
                     ],
                 }],
                 "OtherEvent": [{"hooks": [{"command": "other-command"}]}],
@@ -105,9 +142,9 @@ class MergeDocumentTest(unittest.TestCase):
                 "Stop": [
                     {"matcher": "all", "hooks": [
                         {"command": "custom-stop"},
-                        {"command": "old # vibe-memory hook --agent"},
+                        {"command": hooks.command("/old", "codex", "Stop")},
                     ]},
-                    {"hooks": [{"command": "old # vibe-memory hook --agent"}]},
+                    {"hooks": [{"command": hooks.command("/old", "codex", "Stop")}]},
                 ],
                 "SessionStart": [{"command": "vibe-memory hook --agent in data, not handler"}],
             },
@@ -120,11 +157,136 @@ class MergeDocumentTest(unittest.TestCase):
         }])
         self.assertEqual(cleaned["hooks"]["SessionStart"], source["hooks"]["SessionStart"])
         self.assertEqual(source["hooks"]["Stop"][0]["hooks"], [
-            {"command": "custom-stop"}, {"command": "old # vibe-memory hook --agent"},
+            {"command": "custom-stop"},
+            {"command": hooks.command("/old", "codex", "Stop")},
         ])
 
 
 class DocumentIOTest(unittest.TestCase):
+    def test_symlink_configs_are_rejected_without_changing_live_or_broken_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            live_target = root / "live-target.json"
+            live_target.write_text('{"custom": true}\n', encoding="utf-8")
+            broken_target = root / "missing-target.json"
+            for name, target in (("live", live_target), ("broken", broken_target)):
+                link = root / f"{name}.json"
+                link.symlink_to(target)
+                before = target.read_bytes() if target.exists() else None
+
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    hooks.load_document(link)
+                self.assertEqual(hooks.status(link, "codex", "/runtime")["status"], "malformed")
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    hooks.repair(link, "codex", "/runtime")
+                with self.assertRaisesRegex(ValueError, "symlink"):
+                    hooks.write_with_backup(link, {"hooks": {}})
+
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(target.read_bytes() if target.exists() else None, before)
+                self.assertEqual(list(root.glob(f"{name}.json.bak.*")), [])
+
+    def test_load_rejects_non_finite_json_and_repair_preserves_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            for index, constant in enumerate(("NaN", "Infinity", "-Infinity")):
+                path = root / f"non-finite-{index}.json"
+                original = f'{{"value": {constant}}}\n'.encode()
+                path.write_bytes(original)
+
+                with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                    hooks.load_document(path)
+                self.assertEqual(hooks.status(path, "codex", "/runtime")["status"], "malformed")
+                with self.assertRaisesRegex(ValueError, "Invalid JSON"):
+                    hooks.repair(path, "codex", "/runtime")
+                self.assertEqual(path.read_bytes(), original)
+                self.assertEqual(list(root.glob(f"{path.name}.bak.*")), [])
+
+    def test_write_fsyncs_temp_backup_and_directory_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "settings.json"
+            path.write_text('{"hooks": {}}\n', encoding="utf-8")
+            real_fsync = os.fsync
+            fsync_calls: list[int] = []
+
+            with mock.patch(
+                "vibe_memory_hooks.os.fsync",
+                side_effect=lambda descriptor: fsync_calls.append(descriptor) or real_fsync(descriptor),
+            ):
+                hooks.write_with_backup(path, {"hooks": {"Stop": []}})
+
+            self.assertEqual(len(fsync_calls), 4)
+
+    def test_temp_mode_is_applied_before_temp_fsync(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "settings.json"
+            path.write_text('{"hooks": {}}\n', encoding="utf-8")
+            path.chmod(0o640)
+            events: list[str] = []
+            real_fchmod = os.fchmod
+            real_fsync = os.fsync
+
+            def track_fchmod(descriptor: int, mode: int) -> None:
+                events.append(f"fchmod:{mode:o}")
+                real_fchmod(descriptor, mode)
+
+            def track_fsync(descriptor: int) -> None:
+                events.append("fsync")
+                real_fsync(descriptor)
+
+            with mock.patch("vibe_memory_hooks.os.fchmod", side_effect=track_fchmod), mock.patch(
+                "vibe_memory_hooks.os.fsync", side_effect=track_fsync
+            ):
+                hooks.write_with_backup(path, {"hooks": {"Stop": []}})
+
+            self.assertEqual(events[:2], ["fchmod:640", "fsync"])
+
+    def test_failure_before_replace_preserves_original_and_removes_incomplete_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "settings.json"
+            original = b'{"hooks": {}}\n'
+            path.write_bytes(original)
+            real_fsync = os.fsync
+            call_count = 0
+
+            def fail_directory_sync(descriptor: int) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 3:
+                    raise OSError("directory sync failed")
+                real_fsync(descriptor)
+
+            with mock.patch("vibe_memory_hooks.os.fsync", side_effect=fail_directory_sync):
+                with self.assertRaisesRegex(OSError, "directory sync failed"):
+                    hooks.write_with_backup(path, {"hooks": {"Stop": []}})
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(path.parent.glob("settings.json.bak.*")), [])
+
+    def test_failure_after_replace_preserves_and_reports_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "settings.json"
+            original = b'{"hooks": {}}\n'
+            path.write_bytes(original)
+            real_fsync = os.fsync
+            call_count = 0
+
+            def fail_final_sync(descriptor: int) -> None:
+                nonlocal call_count
+                call_count += 1
+                if call_count == 4:
+                    raise OSError("final directory sync failed")
+                real_fsync(descriptor)
+
+            with mock.patch("vibe_memory_hooks.os.fsync", side_effect=fail_final_sync):
+                with self.assertRaisesRegex(hooks.ConfigWriteError, "backup") as raised:
+                    hooks.write_with_backup(path, {"hooks": {"Stop": []}})
+
+            self.assertIsNotNone(raised.exception.backup)
+            backup = pathlib.Path(raised.exception.backup)
+            self.assertEqual(backup.read_bytes(), original)
+            self.assertNotEqual(path.read_bytes(), original)
+
     def test_load_document_missing_and_malformed_content_do_not_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "settings.json"
@@ -191,6 +353,47 @@ class DocumentIOTest(unittest.TestCase):
 
 
 class StatusAndRepairTest(unittest.TestCase):
+    def test_repair_compare_and_swap_rejects_noncooperating_external_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            path.write_text('{"hooks": {}}\n', encoding="utf-8")
+            external = b'{"external": true, "hooks": {}}\n'
+            real_write = hooks.write_with_backup
+            lock_path = path.with_name(f".{path.name}.vibe-memory.lock")
+
+            def race_write(target, document, **kwargs):
+                self.assertTrue(lock_path.exists())
+                pathlib.Path(target).write_bytes(external)
+                return real_write(target, document, **kwargs)
+
+            with mock.patch("vibe_memory_hooks.write_with_backup", side_effect=race_write):
+                with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently"):
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertEqual(path.read_bytes(), external)
+            self.assertEqual(list(path.parent.glob("hooks.json.bak.*")), [])
+
+    def test_repair_compare_and_swap_rechecks_after_backup_before_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            path.write_text('{"hooks": {}}\n', encoding="utf-8")
+            external = b'{"external": "during-backup", "hooks": {}}\n'
+            real_backup = hooks._create_backup_exclusive
+
+            def race_backup(target, content, mode):
+                backup = real_backup(target, content, mode)
+                pathlib.Path(target).write_bytes(external)
+                return backup
+
+            with mock.patch(
+                "vibe_memory_hooks._create_backup_exclusive", side_effect=race_backup
+            ):
+                with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently"):
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertEqual(path.read_bytes(), external)
+            self.assertEqual(list(path.parent.glob("hooks.json.bak.*")), [])
+
     def test_missing_hooks_object_is_drifted_without_mutation_then_repaired(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
