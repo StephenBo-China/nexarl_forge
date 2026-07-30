@@ -45,29 +45,42 @@ class VibeMemoryCLIUnitTest(unittest.TestCase):
 
     def test_hook_command_invalid_json_is_degraded_and_returns_zero(self) -> None:
         args = argparse.Namespace(agent="codex", event="UserPromptSubmit")
+        sensitive_input = '{"token":"SECRET_JSON_BODY"'
 
-        with mock.patch("vibe_memory_cli.sys.stdin", io.StringIO("{invalid")), io.StringIO(
-        ) as stdout, contextlib.redirect_stdout(stdout):
+        with mock.patch(
+            "vibe_memory_cli.sys.stdin", io.StringIO(sensitive_input)
+        ), io.StringIO() as stdout, contextlib.redirect_stdout(stdout):
             exit_code = vibe_memory_cli.hook_command(args)
-            output = json.loads(stdout.getvalue())
+            raw_output = stdout.getvalue()
+            output = json.loads(raw_output)
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(output["status"], "degraded")
-        self.assertIn("error", output)
+        self.assertEqual(output, {"status": "degraded", "error": "钩子处理失败"})
+        self.assertNotIn("SECRET_JSON_BODY", raw_output)
 
-    def test_hook_command_internal_error_is_degraded_and_unicode_is_not_escaped(self) -> None:
+    def test_hook_command_internal_error_is_degraded_without_leaking_exception(self) -> None:
         args = argparse.Namespace(agent="claude-code", event="Stop")
+        sensitive_message = "SECRET_PAYLOAD=/Users/alice/private/token-123"
 
         with mock.patch("vibe_memory_cli.sys.stdin", io.StringIO("{}")), mock.patch(
-            "vibe_memory_cli.router.handle_event", side_effect=RuntimeError("记忆服务不可用")
+            "vibe_memory_cli.router.handle_event", side_effect=RuntimeError(sensitive_message)
         ), io.StringIO() as stdout, contextlib.redirect_stdout(stdout):
             exit_code = vibe_memory_cli.hook_command(args)
             raw_output = stdout.getvalue()
 
         self.assertEqual(exit_code, 0)
-        self.assertIn("记忆服务不可用", raw_output)
+        self.assertEqual(
+            json.loads(raw_output),
+            {"status": "degraded", "error": "钩子处理失败"},
+        )
+        for sensitive_value in (
+            "SECRET_PAYLOAD",
+            "/Users/alice/private",
+            "token-123",
+        ):
+            self.assertNotIn(sensitive_value, raw_output)
+        self.assertIn("钩子处理失败", raw_output)
         self.assertNotIn("\\u", raw_output)
-        self.assertEqual(json.loads(raw_output)["status"], "degraded")
 
 
 class VibeMemoryCLIIntegrationTest(unittest.TestCase):

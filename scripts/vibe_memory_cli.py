@@ -22,10 +22,10 @@ def hook_command(args: argparse.Namespace) -> int:
             pathlib.Path.cwd(),
         )
         print(json.dumps(result, ensure_ascii=False))
-    except Exception as error:
+    except Exception:
         print(
             json.dumps(
-                {"status": "degraded", "error": str(error)},
+                {"status": "degraded", "error": "钩子处理失败"},
                 ensure_ascii=False,
             )
         )
