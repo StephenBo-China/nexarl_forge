@@ -13,13 +13,19 @@ from datetime import datetime, timezone
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-from vibe_memory_events import NormalizedEvent, normalize_event
+from vibe_memory_events import EVENTS, NormalizedEvent, normalize_event
 
 
 FIXTURES = ROOT / "tests/fixtures/hooks"
 
 
 class NormalizeEventTest(unittest.TestCase):
+    def test_supported_events_are_the_shared_five_event_contract(self) -> None:
+        self.assertEqual(
+            EVENTS,
+            ("SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop"),
+        )
+
     def test_normalized_event_has_only_safe_contract_fields(self) -> None:
         self.assertEqual(
             list(NormalizedEvent.__dataclass_fields__),
@@ -30,10 +36,10 @@ class NormalizeEventTest(unittest.TestCase):
     def test_normalizes_codex_fixture_without_retaining_prompt(self) -> None:
         payload = self._fixture("codex_user_prompt.json")
 
-        normalized = normalize_event("codex", "user_prompt", payload, ROOT)
+        normalized = normalize_event("codex", "UserPromptSubmit", payload, ROOT)
 
         self.assertEqual(normalized.agent, "codex")
-        self.assertEqual(normalized.event, "user_prompt")
+        self.assertEqual(normalized.event, "UserPromptSubmit")
         self.assertEqual(normalized.cwd, ROOT.resolve())
         self.assertEqual(normalized.session_id, "codex-session-42")
         self._assert_timestamp_is_local_and_second_precision(normalized.timestamp)
@@ -43,7 +49,7 @@ class NormalizeEventTest(unittest.TestCase):
     def test_normalizes_claude_fixture_session_id(self) -> None:
         payload = self._fixture("claude_user_prompt.json")
 
-        normalized = normalize_event("claude-code", "user_prompt", payload, ROOT)
+        normalized = normalize_event("claude-code", "UserPromptSubmit", payload, ROOT)
 
         self.assertEqual(normalized.agent, "claude-code")
         self.assertEqual(normalized.session_id, "claude-session-17")
@@ -54,7 +60,9 @@ class NormalizeEventTest(unittest.TestCase):
             fallback = pathlib.Path(value) / "fallback"
             fallback.mkdir()
 
-            normalized = normalize_event("codex", "user_prompt", "not metadata", fallback)
+            normalized = normalize_event(
+                "codex", "UserPromptSubmit", "not metadata", fallback
+            )
 
             self.assertEqual(normalized.cwd, fallback.resolve())
             self.assertEqual(normalized.session_id, "unknown")
@@ -70,7 +78,9 @@ class NormalizeEventTest(unittest.TestCase):
             except (NotImplementedError, OSError) as error:
                 self.skipTest(f"symlinks unavailable: {error}")
 
-            normalized = normalize_event("codex", "user_prompt", {"cwd": str(link)}, root)
+            normalized = normalize_event(
+                "codex", "UserPromptSubmit", {"cwd": str(link)}, root
+            )
 
             self.assertEqual(normalized.cwd, actual.resolve())
 
@@ -78,14 +88,18 @@ class NormalizeEventTest(unittest.TestCase):
         first = {"session_id": "same", "prompt": "harmless", "nested": {"b": 2, "a": 1}}
         second = {"nested": {"a": 1, "b": 2}, "prompt": "harmless", "session_id": "same"}
 
-        first_normalized = normalize_event("codex", "user_prompt", first, ROOT)
-        second_normalized = normalize_event("codex", "user_prompt", second, ROOT)
+        first_normalized = normalize_event("codex", "UserPromptSubmit", first, ROOT)
+        second_normalized = normalize_event("codex", "UserPromptSubmit", second, ROOT)
 
         self.assertEqual(first_normalized.payload_digest, second_normalized.payload_digest)
 
     def test_rejects_unsupported_agent(self) -> None:
         with self.assertRaisesRegex(ValueError, "unsupported agent"):
-            normalize_event("other", "user_prompt", {}, ROOT)
+            normalize_event("other", "UserPromptSubmit", {}, ROOT)
+
+    def test_rejects_unsupported_event(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported event"):
+            normalize_event("codex", "UnknownEvent", {}, ROOT)
 
     def test_rejects_unserializable_payload_without_repr_leakage(self) -> None:
         class SecretValue:
@@ -93,7 +107,9 @@ class NormalizeEventTest(unittest.TestCase):
                 return "SECRET-SHOULD-NOT-LEAK"
 
         with self.assertRaisesRegex(ValueError, "JSON-serializable") as error:
-            normalize_event("codex", "user_prompt", {"secret": SecretValue()}, ROOT)
+            normalize_event(
+                "codex", "UserPromptSubmit", {"secret": SecretValue()}, ROOT
+            )
 
         self.assertNotIn("SECRET-SHOULD-NOT-LEAK", str(error.exception))
 

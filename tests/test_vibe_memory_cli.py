@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,17 +30,18 @@ class VibeMemoryCLIUnitTest(unittest.TestCase):
             "hookSpecificOutput": {"additionalContext": "shared context"},
         }
 
+        router = mock.Mock()
+        router.handle_event.return_value = result
+        expected_cwd = pathlib.Path.cwd()
         with mock.patch("vibe_memory_cli.sys.stdin", io.StringIO("")), mock.patch(
-            "vibe_memory_cli.router.handle_event", return_value=result
-        ) as handle_event, mock.patch(
-            "vibe_memory_cli.pathlib.Path.cwd", return_value=pathlib.Path("/tmp/work")
+            "vibe_memory_cli.importlib.import_module", return_value=router
         ), io.StringIO() as stdout, contextlib.redirect_stdout(stdout):
             exit_code = vibe_memory_cli.hook_command(args)
             output = stdout.getvalue()
 
         self.assertEqual(exit_code, 0)
-        handle_event.assert_called_once_with(
-            "codex", "UserPromptSubmit", {}, pathlib.Path("/tmp/work")
+        router.handle_event.assert_called_once_with(
+            "codex", "UserPromptSubmit", {}, expected_cwd
         )
         self.assertEqual(json.loads(output), result)
 
@@ -62,8 +64,10 @@ class VibeMemoryCLIUnitTest(unittest.TestCase):
         args = argparse.Namespace(agent="claude-code", event="Stop")
         sensitive_message = "SECRET_PAYLOAD=/Users/alice/private/token-123"
 
+        router = mock.Mock()
+        router.handle_event.side_effect = RuntimeError(sensitive_message)
         with mock.patch("vibe_memory_cli.sys.stdin", io.StringIO("{}")), mock.patch(
-            "vibe_memory_cli.router.handle_event", side_effect=RuntimeError(sensitive_message)
+            "vibe_memory_cli.importlib.import_module", return_value=router
         ), io.StringIO() as stdout, contextlib.redirect_stdout(stdout):
             exit_code = vibe_memory_cli.hook_command(args)
             raw_output = stdout.getvalue()
@@ -247,6 +251,118 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(completed.returncode, 2)
+
+    def test_unknown_event_fails_open_with_safe_degraded_json(self) -> None:
+        project = self.base / "project"
+        project.mkdir()
+        self.write_registry(project)
+
+        completed = self.run_cli(
+            project,
+            agent="codex",
+            event="UnknownEvent",
+            stdin='{"prompt":"SECRET_UNKNOWN_EVENT"}',
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "degraded", "error": "钩子处理失败"},
+        )
+        self.assertNotIn("SECRET_UNKNOWN_EVENT", completed.stdout)
+
+    def test_missing_router_import_fails_open_without_traceback_or_path(self) -> None:
+        isolated = self.base / "isolated"
+        isolated.mkdir()
+        isolated_cli = isolated / "vibe_memory_cli.py"
+        shutil.copy2(CLI, isolated_cli)
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(isolated_cli),
+                "hook",
+                "--agent",
+                "codex",
+                "--event",
+                "SessionStart",
+            ],
+            cwd=isolated,
+            env=self.environment,
+            input='{"prompt":"SECRET_IMPORT_PAYLOAD"}',
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stderr, "")
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "degraded", "error": "钩子处理失败"},
+        )
+        for leaked in ("Traceback", "SECRET_IMPORT_PAYLOAD", str(isolated)):
+            self.assertNotIn(leaked, completed.stdout)
+
+    def test_registered_live_or_broken_codex_symlink_is_rejected(self) -> None:
+        for kind in ("live", "broken"):
+            with self.subTest(kind=kind):
+                project = self.base / f"symlink-project-{kind}"
+                project.mkdir()
+                outside = self.base / f"outside-{kind}"
+                if kind == "live":
+                    outside.mkdir()
+                (project / "codex").symlink_to(outside, target_is_directory=True)
+                self.write_registry(project)
+
+                completed = self.run_cli(
+                    project,
+                    agent="codex",
+                    event="SessionStart",
+                    stdin=json.dumps({"session_id": f"symlink-{kind}"}),
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"status": "degraded", "error": "钩子处理失败"},
+                )
+                if outside.exists():
+                    self.assertEqual(list(outside.iterdir()), [])
+
+    def test_registered_protected_target_symlink_is_rejected_without_outside_write(self) -> None:
+        protected_names = (
+            "memory_review_queue.json",
+            "memory_review_state.json",
+            "codex_context_packet.md",
+            "shared_memory_context_packet.md",
+            ".vibe-memory-packets-journal.json",
+            ".vibe-memory-packets.lock",
+        )
+        for index, name in enumerate(protected_names):
+            with self.subTest(name=name):
+                project = self.base / f"target-project-{index}"
+                codex = project / "codex"
+                codex.mkdir(parents=True)
+                outside = self.base / f"outside-target-{index}.txt"
+                outside.write_text("sentinel\n", encoding="utf-8")
+                (codex / name).symlink_to(outside)
+                self.write_registry(project)
+
+                completed = self.run_cli(
+                    project,
+                    agent="claude-code",
+                    event="Stop",
+                    stdin=json.dumps({"session_id": f"target-{index}"}),
+                )
+
+                self.assertEqual(completed.returncode, 0)
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"status": "degraded", "error": "钩子处理失败"},
+                )
+                self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
 
 
 if __name__ == "__main__":

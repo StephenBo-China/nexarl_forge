@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import pathlib
 import sys
 from collections.abc import Sequence
 
-import vibe_memory_router as router
-
 
 def hook_command(args: argparse.Namespace) -> int:
     try:
+        router = importlib.import_module("vibe_memory_router")
         payload = json.loads(sys.stdin.read() or "{}")
         result = router.handle_event(
             args.agent,

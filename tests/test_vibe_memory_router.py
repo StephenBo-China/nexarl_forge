@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
 import pathlib
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -15,6 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
 from vibe_memory_events import NormalizedEvent
+import vibe_memory_router
 from vibe_memory_router import IdempotencyStore, build_context, resolve_registered_project
 
 
@@ -142,22 +147,28 @@ class VibeMemoryRouterTest(unittest.TestCase):
             finally:
                 memory_project.REGISTRY_PATH = original_registry
 
-    def test_idempotency_store_claims_duplicate_event_once(self) -> None:
+    def test_idempotency_store_reserves_then_commits_duplicate_event(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             store = IdempotencyStore(pathlib.Path(value) / "events.json")
             event = self.event()
 
-            self.assertTrue(store.claim(event))
-            self.assertFalse(store.claim(event))
+            reservation = store.reserve(event)
+
+            self.assertIsInstance(reservation, str)
+            self.assertIsNone(store.reserve(event))
+            self.assertTrue(store.commit(event, reservation))
+            self.assertIsNone(store.reserve(event))
 
     def test_idempotency_store_reclaims_expired_event(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             store = IdempotencyStore(pathlib.Path(value) / "events.json", ttl_seconds=30)
             event = self.event()
 
-            with mock.patch("vibe_memory_router.time.time", side_effect=[100.0, 131.0]):
-                self.assertTrue(store.claim(event))
-                self.assertTrue(store.claim(event))
+            with mock.patch("vibe_memory_router.time.time", return_value=100.0):
+                reservation = store.reserve(event)
+                self.assertTrue(store.commit(event, reservation))
+            with mock.patch("vibe_memory_router.time.time", return_value=131.0):
+                self.assertIsNotNone(store.reserve(event))
 
     def test_idempotency_store_distinguishes_each_key_field(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -171,10 +182,10 @@ class VibeMemoryRouterTest(unittest.TestCase):
                 self.event(payload_digest="b" * 64),
             ]
 
-            self.assertTrue(store.claim(base))
+            self.assertIsNotNone(store.reserve(base))
             for event in variants:
                 with self.subTest(event=event):
-                    self.assertTrue(store.claim(event))
+                    self.assertIsNotNone(store.reserve(event))
 
     def test_idempotency_store_does_not_collide_on_pipe_delimited_fields(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -182,8 +193,8 @@ class VibeMemoryRouterTest(unittest.TestCase):
             first = self.event(session_id="session|event", event="stop")
             second = self.event(session_id="session", event="event|stop")
 
-            self.assertTrue(store.claim(first))
-            self.assertTrue(store.claim(second))
+            self.assertIsNotNone(store.reserve(first))
+            self.assertIsNotNone(store.reserve(second))
 
     def test_idempotency_store_preserves_corrupt_or_nonobject_data(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -194,9 +205,249 @@ class VibeMemoryRouterTest(unittest.TestCase):
                     store = IdempotencyStore(path)
 
                     with self.assertRaisesRegex(ValueError, "idempotency store"):
-                        store.claim(self.event())
+                        store.reserve(self.event())
 
                     self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_idempotency_release_and_commit_require_reservation_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            store = IdempotencyStore(pathlib.Path(value) / "events.json")
+            event = self.event()
+            reservation = store.reserve(event)
+            self.assertIsInstance(reservation, str)
+
+            self.assertFalse(store.release(event, "not-the-owner"))
+            self.assertFalse(store.commit(event, "not-the-owner"))
+            self.assertIsNone(store.reserve(event))
+            self.assertTrue(store.release(event, reservation))
+            self.assertIsNotNone(store.reserve(event))
+
+    def test_idempotency_concurrent_reserve_has_one_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "events.json"
+            event = self.event()
+
+            def reserve() -> str | None:
+                return IdempotencyStore(path).reserve(event)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                reservations = list(executor.map(lambda _: reserve(), range(8)))
+
+            self.assertEqual(sum(item is not None for item in reservations), 1)
+
+    def test_handle_event_releases_reservation_after_downstream_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            state = pathlib.Path(value) / "events.json"
+            event_payload = {"session_id": "retry-session"}
+            safe_context = "personal-only context"
+
+            with mock.patch(
+                "vibe_memory_router._idempotency_path", return_value=state
+            ), mock.patch(
+                "vibe_memory_router._registry_projects", return_value=[]
+            ), mock.patch(
+                "vibe_memory_router.build_context",
+                side_effect=[RuntimeError("downstream failed"), safe_context],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "downstream failed"):
+                    vibe_memory_router.handle_event(
+                        "codex", "SessionStart", event_payload, pathlib.Path(value)
+                    )
+                retried = vibe_memory_router.handle_event(
+                    "codex", "SessionStart", event_payload, pathlib.Path(value)
+                )
+
+            self.assertEqual(retried["status"], "ok")
+
+    def test_dead_reservation_owner_is_reclaimed_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "events.json"
+            code = (
+                "import pathlib, sys\n"
+                "from vibe_memory_events import NormalizedEvent\n"
+                "from vibe_memory_router import IdempotencyStore\n"
+                "event = NormalizedEvent('codex', 'SessionStart', pathlib.Path(sys.argv[2]), "
+                "'dead-session', '2026-07-30T12:00:00+08:00', 'd' * 64)\n"
+                "print(IdempotencyStore(pathlib.Path(sys.argv[1])).reserve(event), flush=True)\n"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(ROOT / "scripts")
+            completed = subprocess.run(
+                [sys.executable, "-c", code, str(path), value],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertTrue(completed.stdout.strip())
+            event = self.event(
+                event="SessionStart",
+                cwd=pathlib.Path(value),
+                session_id="dead-session",
+                payload_digest="d" * 64,
+            )
+
+            self.assertIsNotNone(IdempotencyStore(path).reserve(event))
+
+    def test_killed_lock_holder_does_not_block_next_reservation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "events.json"
+            code = (
+                "import pathlib, sys, time\n"
+                "from vibe_memory_router import IdempotencyStore\n"
+                "store = IdempotencyStore(pathlib.Path(sys.argv[1]))\n"
+                "with store._locked():\n"
+                "    print('locked', flush=True)\n"
+                "    time.sleep(60)\n"
+            )
+            environment = os.environ.copy()
+            environment["PYTHONPATH"] = str(ROOT / "scripts")
+            process = subprocess.Popen(
+                [sys.executable, "-c", code, str(path)],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                process.kill()
+                process.wait(timeout=5)
+                started = time.monotonic()
+                reservation = IdempotencyStore(path).reserve(self.event())
+                elapsed = time.monotonic() - started
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+            self.assertIsNotNone(reservation)
+            self.assertLess(elapsed, 2.0)
+
+    def test_context_packet_transaction_rolls_back_both_on_second_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            first = codex / "codex_context_packet.md"
+            second = codex / "shared_memory_context_packet.md"
+            first.write_text("old\n", encoding="utf-8")
+            second.write_text("old\n", encoding="utf-8")
+            original_write = vibe_memory_router._atomic_write_packet
+            failed = False
+
+            def fail_second_once(path: pathlib.Path, content: str) -> None:
+                nonlocal failed
+                if (
+                    path.name == "shared_memory_context_packet.md"
+                    and content == "new\n"
+                    and not failed
+                ):
+                    failed = True
+                    raise OSError("injected second write failure")
+                original_write(path, content)
+
+            with mock.patch(
+                "vibe_memory_router._atomic_write_packet", side_effect=fail_second_once
+            ):
+                with self.assertRaisesRegex(OSError, "second write failure"):
+                    vibe_memory_router._write_context_packets(project, "new\n")
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "old\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "old\n")
+            self.assertFalse((codex / ".vibe-memory-packets-journal.json").exists())
+
+    def test_context_packet_transaction_recovers_interrupted_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            first = codex / "codex_context_packet.md"
+            second = codex / "shared_memory_context_packet.md"
+            first.write_text("old\n", encoding="utf-8")
+            second.write_text("old\n", encoding="utf-8")
+            original_write = vibe_memory_router._atomic_write_packet
+
+            def interrupt_and_break_rollback(path: pathlib.Path, content: str) -> None:
+                if path.name == "shared_memory_context_packet.md" and content == "new\n":
+                    raise OSError("injected crash before second write")
+                if content == "old\n":
+                    raise OSError("injected crash during rollback")
+                original_write(path, content)
+
+            with mock.patch(
+                "vibe_memory_router._atomic_write_packet",
+                side_effect=interrupt_and_break_rollback,
+            ):
+                with self.assertRaises(OSError):
+                    vibe_memory_router._write_context_packets(project, "new\n")
+
+            journal = codex / ".vibe-memory-packets-journal.json"
+            self.assertTrue(journal.exists())
+            vibe_memory_router._write_context_packets(project, "new\n")
+
+            self.assertEqual(first.read_text(encoding="utf-8"), "new\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "new\n")
+            self.assertFalse(journal.exists())
+
+    def test_context_packet_transaction_serializes_interleaved_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            (project / "codex").mkdir()
+            first_written = threading.Event()
+            original_write = vibe_memory_router._atomic_write_packet
+
+            def slow_first_writer(path: pathlib.Path, content: str) -> None:
+                original_write(path, content)
+                if path.name == "codex_context_packet.md" and content == "first\n":
+                    first_written.set()
+                    time.sleep(0.15)
+
+            with mock.patch(
+                "vibe_memory_router._atomic_write_packet", side_effect=slow_first_writer
+            ):
+                first_thread = threading.Thread(
+                    target=vibe_memory_router._write_context_packets,
+                    args=(project, "first\n"),
+                )
+                second_thread = threading.Thread(
+                    target=vibe_memory_router._write_context_packets,
+                    args=(project, "second\n"),
+                )
+                first_thread.start()
+                self.assertTrue(first_written.wait(timeout=2))
+                second_thread.start()
+                first_thread.join(timeout=3)
+                second_thread.join(timeout=3)
+
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            first = (project / "codex" / "codex_context_packet.md").read_text(
+                encoding="utf-8"
+            )
+            second = (project / "codex" / "shared_memory_context_packet.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertEqual(first, second)
+
+    def test_packet_io_helpers_never_follow_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            outside = root / "outside.txt"
+            outside.write_text("sentinel\n", encoding="utf-8")
+            packet = root / "packet.md"
+            packet.symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, "unsafe packet path"):
+                vibe_memory_router._read_packet(packet)
+            with self.assertRaisesRegex(ValueError, "unsafe packet path"):
+                vibe_memory_router._atomic_write_packet(packet, "replacement\n")
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
 
     def test_build_context_for_unregistered_cwd_is_personal_only(self) -> None:
         event = self.event(cwd=pathlib.Path("/tmp/not-registered"))

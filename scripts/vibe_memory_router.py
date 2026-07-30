@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import shlex
+import stat
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any, Mapping
 
 import memory_project
 import vibe_memory_paths
 from loop_superpowers import atomic_write_text
-from ui_design_store import atomic_write_json, exclusive_lock
+from ui_design_store import atomic_write_json
 from vibe_memory_events import NormalizedEvent, normalize_event
 
 
@@ -35,6 +39,18 @@ PROJECT_CATEGORIES = (
     "project_workflow",
 )
 IDEMPOTENCY_FILENAME = "hook_events.json"
+PACKET_NAMES = ("codex_context_packet.md", "shared_memory_context_packet.md")
+PACKET_LOCK_NAME = ".vibe-memory-packets.lock"
+PACKET_JOURNAL_NAME = ".vibe-memory-packets-journal.json"
+PROTECTED_CODEX_NAMES = (
+    "memory_review_queue.json",
+    "memory_review_queue.json.lock",
+    "memory_review_state.json",
+    "memory_review_state.json.lock",
+    *PACKET_NAMES,
+    PACKET_LOCK_NAME,
+    PACKET_JOURNAL_NAME,
+)
 
 
 def _markdown_escape(value: object) -> str:
@@ -48,14 +64,21 @@ def _markdown_escape(value: object) -> str:
 
 
 class IdempotencyStore:
-    """Claim normalized hook events once within a short retry window."""
+    """Reserve hook events transactionally with crash-released advisory locking."""
 
-    def __init__(self, path: pathlib.Path, ttl_seconds: float = 30) -> None:
+    def __init__(
+        self,
+        path: pathlib.Path,
+        ttl_seconds: float = 30,
+        reservation_timeout: float = 30,
+    ) -> None:
         self.path = pathlib.Path(path)
         self.ttl_seconds = ttl_seconds
+        self.reservation_timeout = reservation_timeout
         self.lock_path = self.path.with_suffix(self.path.suffix + ".lock")
 
-    def claim(self, event: NormalizedEvent) -> bool:
+    @staticmethod
+    def _key(event: NormalizedEvent) -> str:
         key_material = json.dumps(
             [
                 event.agent,
@@ -67,25 +90,123 @@ class IdempotencyStore:
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()
-        with exclusive_lock(self.lock_path):
-            entries = self._read_entries()
+        return hashlib.sha256(key_material.encode("utf-8")).hexdigest()
+
+    @contextlib.contextmanager
+    def _locked(self):
+        parent = self.path.parent
+        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if parent.is_symlink() or not parent.is_dir():
+            raise ValueError("unsafe idempotency state directory")
+        parent.chmod(0o700)
+        for target in (self.path, self.lock_path):
+            if target.is_symlink():
+                raise ValueError("unsafe idempotency state path")
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(self.lock_path, flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ValueError("unsafe idempotency lock")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+    def reserve(self, event: NormalizedEvent) -> str | None:
+        key = self._key(event)
+        with self._locked():
             current = time.time()
-            cutoff = current - self.ttl_seconds
-            live = {
-                entry_key: timestamp
-                for entry_key, timestamp in entries.items()
-                if isinstance(timestamp, (int, float))
-                and not isinstance(timestamp, bool)
-                and timestamp > cutoff
-            }
+            live = self._live_entries(self._read_entries(), current)
             if key in live:
+                return None
+            reservation = uuid.uuid4().hex
+            live[key] = {
+                "status": "in_flight",
+                "owner": reservation,
+                "pid": os.getpid(),
+                "timestamp": current,
+            }
+            atomic_write_json(self.path, live)
+            return reservation
+
+    def commit(self, event: NormalizedEvent, reservation: str | None) -> bool:
+        if not reservation:
+            return False
+        key = self._key(event)
+        with self._locked():
+            current = time.time()
+            live = self._live_entries(self._read_entries(), current)
+            entry = live.get(key)
+            if not self._owned(entry, reservation):
                 return False
-            live[key] = current
+            live[key] = {"status": "committed", "timestamp": current}
             atomic_write_json(self.path, live)
             return True
 
+    def release(self, event: NormalizedEvent, reservation: str | None) -> bool:
+        if not reservation:
+            return False
+        key = self._key(event)
+        with self._locked():
+            current = time.time()
+            live = self._live_entries(self._read_entries(), current)
+            if not self._owned(live.get(key), reservation):
+                return False
+            del live[key]
+            atomic_write_json(self.path, live)
+            return True
+
+    @staticmethod
+    def _owned(entry: object, reservation: str) -> bool:
+        return (
+            isinstance(entry, dict)
+            and entry.get("status") == "in_flight"
+            and entry.get("owner") == reservation
+        )
+
+    def _live_entries(
+        self, entries: dict[str, object], current: float
+    ) -> dict[str, object]:
+        live: dict[str, object] = {}
+        for key, entry in entries.items():
+            if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+                if entry > current - self.ttl_seconds:
+                    live[key] = {"status": "committed", "timestamp": entry}
+                continue
+            if not isinstance(entry, dict):
+                continue
+            timestamp = entry.get("timestamp")
+            if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+                continue
+            status_value = entry.get("status")
+            if status_value == "committed" and timestamp > current - self.ttl_seconds:
+                live[key] = entry
+            elif (
+                status_value == "in_flight"
+                and timestamp > current - self.reservation_timeout
+                and self._pid_is_alive(entry.get("pid"))
+            ):
+                live[key] = entry
+        return live
+
+    @staticmethod
+    def _pid_is_alive(value: object) -> bool:
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            return False
+        try:
+            os.kill(value, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def _read_entries(self) -> dict[str, object]:
+        if self.path.is_symlink():
+            raise ValueError("unsafe idempotency state path")
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
@@ -214,8 +335,23 @@ def _idempotency_path() -> pathlib.Path:
     return runtime.install_root / "state" / IDEMPOTENCY_FILENAME
 
 
+def _safe_codex_dir(project_root: pathlib.Path) -> pathlib.Path:
+    root = pathlib.Path(project_root).resolve()
+    codex = root / "codex"
+    if codex.is_symlink():
+        raise ValueError("unsafe project memory directory")
+    codex.mkdir(parents=False, exist_ok=True)
+    if not codex.is_dir() or codex.resolve() != codex:
+        raise ValueError("unsafe project memory directory")
+    for name in PROTECTED_CODEX_NAMES:
+        if (codex / name).is_symlink():
+            raise ValueError("unsafe project memory path")
+    return codex
+
+
 def _refresh_review_queue(project_root: pathlib.Path) -> Mapping[str, int]:
     """Refresh and return counts for exactly one registered project."""
+    codex = _safe_codex_dir(project_root)
     script = pathlib.Path(__file__).resolve().parent / "memory_review_queue.py"
     environment = os.environ.copy()
     environment["MEMORY_REVIEW_PROJECT_ROOT"] = str(project_root)
@@ -228,14 +364,143 @@ def _refresh_review_queue(project_root: pathlib.Path) -> Mapping[str, int]:
         timeout=8,
         check=True,
     )
-    queue_path = project_root / "codex" / "memory_review_queue.json"
+    _safe_codex_dir(project_root)
+    queue_path = codex / "memory_review_queue.json"
     try:
-        queue = json.loads(queue_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        queue_text = _read_packet(queue_path)
+        if queue_text is None:
+            raise ValueError("missing queue")
+        queue = json.loads(queue_text)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
         raise ValueError(f"invalid memory review queue {queue_path}: {error}") from error
     if not isinstance(queue, dict) or not isinstance(queue.get("counts"), dict):
         raise ValueError(f"invalid memory review queue {queue_path}: missing counts")
     return queue["counts"]
+
+
+@contextlib.contextmanager
+def _project_packet_lock(codex: pathlib.Path):
+    lock_path = codex / PACKET_LOCK_NAME
+    if lock_path.is_symlink():
+        raise ValueError("unsafe packet lock")
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_path, flags, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("unsafe packet lock")
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory(path: pathlib.Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _atomic_write_packet(path: pathlib.Path, content: str) -> None:
+    if path.is_symlink():
+        raise ValueError("unsafe packet path")
+    atomic_write_text(path, content)
+
+
+def _read_packet(path: pathlib.Path) -> str | None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError("unsafe packet path") from error
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError("unsafe packet path")
+        with os.fdopen(descriptor, encoding="utf-8") as handle:
+            descriptor = -1
+            return handle.read()
+    except OSError as error:
+        raise ValueError("unsafe packet path") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _restore_packet(path: pathlib.Path, content: object) -> None:
+    if path.is_symlink():
+        raise ValueError("unsafe packet path")
+    if content is None:
+        path.unlink(missing_ok=True)
+    elif isinstance(content, str):
+        _atomic_write_packet(path, content)
+    else:
+        raise ValueError("invalid packet rollback journal")
+
+
+def _remove_journal(journal: pathlib.Path) -> None:
+    journal.unlink(missing_ok=True)
+    _fsync_directory(journal.parent)
+
+
+def _recover_packet_transaction(codex: pathlib.Path) -> None:
+    journal = codex / PACKET_JOURNAL_NAME
+    if not journal.exists():
+        return
+    if journal.is_symlink():
+        raise ValueError("unsafe packet journal")
+    try:
+        journal_text = _read_packet(journal)
+        if journal_text is None:
+            return
+        value = json.loads(journal_text)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise ValueError("invalid packet transaction journal") from error
+    if not isinstance(value, dict):
+        raise ValueError("invalid packet transaction journal")
+    content = value.get("new")
+    if value.get("version") != 1 or not isinstance(content, str):
+        raise ValueError("invalid packet transaction journal")
+    for name in PACKET_NAMES:
+        _atomic_write_packet(codex / name, content)
+    _remove_journal(journal)
+
+
+def _write_context_packets(project_root: pathlib.Path, content: str) -> None:
+    codex = _safe_codex_dir(project_root)
+    with _project_packet_lock(codex):
+        codex = _safe_codex_dir(project_root)
+        _recover_packet_transaction(codex)
+        targets = tuple(codex / name for name in PACKET_NAMES)
+        previous = [_read_packet(path) for path in targets]
+        journal = codex / PACKET_JOURNAL_NAME
+        atomic_write_json(
+            journal,
+            {"version": 1, "new": content, "previous": previous},
+        )
+        _fsync_directory(codex)
+        try:
+            for path in targets:
+                _atomic_write_packet(path, content)
+            _remove_journal(journal)
+        except BaseException:
+            try:
+                for path, old_content in zip(targets, previous):
+                    _restore_packet(path, old_content)
+                _remove_journal(journal)
+            except BaseException:
+                pass
+            raise
 
 
 def _registry_projects() -> list[dict[str, object]]:
@@ -253,24 +518,27 @@ def handle_event(
 ) -> dict[str, Any]:
     """Route one shared hook event without retaining its raw payload."""
     normalized = normalize_event(agent, event, payload, cwd)
-    if not IdempotencyStore(_idempotency_path()).claim(normalized):
+    store = IdempotencyStore(_idempotency_path())
+    reservation = store.reserve(normalized)
+    if reservation is None:
         return {"status": "duplicate"}
+    try:
+        project_root = resolve_registered_project(normalized.cwd, _registry_projects())
+        counts: Mapping[str, int]
+        if project_root is None:
+            counts = {"pending": 0, "personal_pending": 0, "project_pending": 0}
+        else:
+            counts = _refresh_review_queue(project_root)
 
-    project_root = resolve_registered_project(normalized.cwd, _registry_projects())
-    counts: Mapping[str, int]
-    if project_root is None:
-        counts = {"pending": 0, "personal_pending": 0, "project_pending": 0}
-    else:
-        counts = _refresh_review_queue(project_root)
-
-    context = build_context(normalized, project_root, counts)
-    if project_root is not None:
-        atomic_write_text(project_root / "codex" / "codex_context_packet.md", context)
-        atomic_write_text(
-            project_root / "codex" / "shared_memory_context_packet.md", context
-        )
-
-    return {
-        "status": "ok",
-        "hookSpecificOutput": {"additionalContext": context},
-    }
+        context = build_context(normalized, project_root, counts)
+        if project_root is not None:
+            _write_context_packets(project_root, context)
+        if not store.commit(normalized, reservation):
+            raise RuntimeError("idempotency reservation ownership lost")
+        return {
+            "status": "ok",
+            "hookSpecificOutput": {"additionalContext": context},
+        }
+    except BaseException:
+        store.release(normalized, reservation)
+        raise

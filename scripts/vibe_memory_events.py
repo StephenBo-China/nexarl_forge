@@ -9,6 +9,9 @@ import pathlib
 from datetime import datetime
 
 
+EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop")
+
+
 @dataclasses.dataclass(frozen=True)
 class NormalizedEvent:
     agent: str
@@ -25,6 +28,8 @@ def normalize_event(
     """Return safe metadata for a supported hook event and a digest of its payload."""
     if agent not in {"codex", "claude-code"}:
         raise ValueError(f"unsupported agent: {agent}")
+    if event not in EVENTS:
+        raise ValueError(f"unsupported event: {event}")
 
     payload_digest = _payload_digest(payload)
     metadata = payload if isinstance(payload, dict) else {}

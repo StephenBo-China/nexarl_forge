@@ -28,10 +28,10 @@ import tempfile
 from typing import Any, NoReturn
 
 from ui_design_store import exclusive_lock
+from vibe_memory_events import EVENTS
 
 
 MANAGED_SIGNATURE = "vibe-memory hook --agent"
-EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop")
 AGENTS = ("codex", "claude-code")
 _NO_SOURCE_CHECK = object()
 RENAME_SWAP = 0x00000002
