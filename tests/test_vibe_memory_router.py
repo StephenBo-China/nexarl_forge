@@ -18,6 +18,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
+import memory_review_queue
 from vibe_memory_events import NormalizedEvent
 import vibe_memory_router
 from vibe_memory_router import IdempotencyStore, build_context, resolve_registered_project
@@ -531,6 +532,189 @@ class VibeMemoryRouterTest(unittest.TestCase):
             self.assertTrue((held / "memory_review_queue.json").exists())
             self.assertTrue((held / "memory_review_queue.json.lock").exists())
             self.assertFalse((held / ".vibe-memory-packets.lock").exists())
+
+    def test_hook_refresh_does_not_block_normal_queue_build_on_persistent_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            personal = project / "home" / ".codex" / "personal_memory"
+            personal.mkdir(parents=True)
+            (personal / "proposals.md").write_text("# Proposals\n", encoding="utf-8")
+            original_lock = memory_review_queue.exclusive_lock
+            paths = {
+                "PROJECT_PROPOSALS": codex / "memory_proposals.md",
+                "PROJECT_QUEUE": codex / "memory_review_queue.json",
+                "PROJECT_STATE": codex / "memory_review_state.json",
+                "PERSONAL_PROPOSALS": personal / "proposals.md",
+            }
+
+            with mock.patch(
+                "vibe_memory_router.pathlib.Path.home", return_value=project / "home"
+            ):
+                vibe_memory_router._refresh_review_queue(project)
+            with mock.patch.multiple(memory_review_queue, **paths), mock.patch(
+                "memory_review_queue.exclusive_lock",
+                side_effect=lambda path: original_lock(path, timeout=0.05),
+            ):
+                started = time.monotonic()
+                queue = memory_review_queue.build_queue()
+
+            self.assertEqual(queue["counts"]["pending"], 0)
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_path_and_descriptor_queue_producers_are_mutually_exclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            codex = project / "codex"
+            codex.mkdir()
+            home = project / "home"
+            (home / ".codex" / "personal_memory").mkdir(parents=True)
+            script = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                "import memory_review_queue as queue\n"
+                "original = queue.parse_project_candidates\n"
+                "def parse_while_locked():\n"
+                " print('locked', flush=True)\n"
+                " sys.stdin.readline()\n"
+                " return original()\n"
+                "queue.parse_project_candidates = parse_while_locked\n"
+                "queue.build_queue()\n"
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "MEMORY_REVIEW_PROJECT_ROOT": str(project),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script],
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            finished = threading.Event()
+            errors: list[BaseException] = []
+
+            def refresh() -> None:
+                try:
+                    with mock.patch(
+                        "vibe_memory_router.pathlib.Path.home", return_value=home
+                    ):
+                        vibe_memory_router._refresh_review_queue(project)
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    finished.set()
+
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                thread = threading.Thread(target=refresh)
+                thread.start()
+                self.assertFalse(finished.wait(timeout=0.15))
+                assert process.stdin is not None
+                process.stdin.write("release\n")
+                process.stdin.flush()
+                process.wait(timeout=3)
+                self.assertEqual(process.returncode, 0, process.stderr.read())
+                thread.join(timeout=3)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+
+            self.assertTrue(finished.is_set())
+            self.assertEqual(errors, [])
+
+    def test_queue_lock_is_released_when_holder_is_killed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            lock_path = pathlib.Path(value) / "memory_review_queue.json.lock"
+            script = (
+                "import pathlib,sys,time\n"
+                f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
+                "import memory_review_queue as queue\n"
+                "with queue.queue_lock(path=pathlib.Path(sys.argv[1]), timeout=2):\n"
+                " print('locked', flush=True)\n"
+                " time.sleep(30)\n"
+            )
+            process = subprocess.Popen(
+                [sys.executable, "-c", script, str(lock_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "locked")
+                process.kill()
+                process.wait(timeout=3)
+                started = time.monotonic()
+                with memory_review_queue.queue_lock(path=lock_path, timeout=1):
+                    pass
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=3)
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+
+            self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_queue_lock_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            outside = root / "outside.lock"
+            outside.write_text("sentinel\n", encoding="utf-8")
+            lock_path = root / "memory_review_queue.json.lock"
+            lock_path.symlink_to(outside)
+
+            with self.assertRaisesRegex(ValueError, "unsafe queue lock"):
+                with memory_review_queue.queue_lock(path=lock_path, timeout=0):
+                    pass
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
+
+    def test_queue_refresh_enforces_total_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            (project / "codex").mkdir()
+
+            with self.assertRaisesRegex(TimeoutError, "queue refresh deadline"):
+                vibe_memory_router._refresh_review_queue(
+                    project, timeout_seconds=0.0
+                )
+
+            self.assertFalse((project / "codex" / "memory_review_queue.json").exists())
+
+    def test_queue_refresh_hard_deadline_interrupts_blocking_stage(self) -> None:
+        if not hasattr(vibe_memory_router.signal, "setitimer"):
+            self.skipTest("interval timers unavailable")
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            (project / "codex").mkdir()
+
+            def block_read(**_kwargs: object) -> str:
+                time.sleep(1.0)
+                return ""
+
+            started = time.monotonic()
+            with mock.patch(
+                "vibe_memory_router._read_bounded_regular", side_effect=block_read
+            ), self.assertRaisesRegex(TimeoutError, "queue refresh deadline"):
+                vibe_memory_router._refresh_review_queue(
+                    project, timeout_seconds=0.05
+                )
+
+            self.assertLess(time.monotonic() - started, 0.5)
 
     def test_build_context_for_unregistered_cwd_is_personal_only(self) -> None:
         event = self.event(cwd=pathlib.Path("/tmp/not-registered"))

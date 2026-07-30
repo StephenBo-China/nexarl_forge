@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -20,6 +21,7 @@ CLI = SCRIPTS / "vibe_memory_cli.py"
 sys.path.insert(0, str(SCRIPTS))
 
 import vibe_memory_cli
+import vibe_memory_router
 
 
 class VibeMemoryCLIUnitTest(unittest.TestCase):
@@ -118,6 +120,7 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
         agent: str,
         event: str,
         stdin: str = "{}",
+        timeout: float = 5.0,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -135,6 +138,7 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
             capture_output=True,
             text=True,
             check=False,
+            timeout=timeout,
         )
 
     def write_registry(self, *roots: pathlib.Path) -> None:
@@ -333,7 +337,9 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
 
     def test_registered_protected_target_symlink_is_rejected_without_outside_write(self) -> None:
         protected_names = (
+            "memory_proposals.md",
             "memory_review_queue.json",
+            "memory_review_queue.json.lock",
             "memory_review_state.json",
             "codex_context_packet.md",
             "shared_memory_context_packet.md",
@@ -363,6 +369,129 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
                     {"status": "degraded", "error": "钩子处理失败"},
                 )
                 self.assertEqual(outside.read_text(encoding="utf-8"), "sentinel\n")
+
+    def test_registered_fifo_queue_inputs_fail_open_promptly(self) -> None:
+        sources = (
+            "project_proposals",
+            "project_state",
+            "personal_proposals",
+            "packet_journal",
+            "codex_packet",
+            "shared_packet",
+            "idempotency_state",
+        )
+        for source in sources:
+            with self.subTest(source=source):
+                project = self.base / f"fifo-{source}"
+                codex = project / "codex"
+                codex.mkdir(parents=True)
+                (codex / "memory_proposals.md").write_text("# Proposals\n", encoding="utf-8")
+                idempotency_state = (
+                    self.home
+                    / "Library"
+                    / "Application Support"
+                    / "VibeMemory"
+                    / "state"
+                    / "hook_events.json"
+                )
+                idempotency_state.parent.mkdir(parents=True, exist_ok=True)
+                target = {
+                    "project_proposals": codex / "memory_proposals.md",
+                    "project_state": codex / "memory_review_state.json",
+                    "personal_proposals": self.home
+                    / ".codex"
+                    / "personal_memory"
+                    / "proposals.md",
+                    "packet_journal": codex / ".vibe-memory-packets-journal.json",
+                    "codex_packet": codex / "codex_context_packet.md",
+                    "shared_packet": codex / "shared_memory_context_packet.md",
+                    "idempotency_state": idempotency_state,
+                }[source]
+                target.unlink(missing_ok=True)
+                os.mkfifo(target)
+                self.write_registry(project)
+
+                started = time.monotonic()
+                try:
+                    completed = self.run_cli(
+                        project,
+                        agent="codex",
+                        event="SessionStart",
+                        stdin=json.dumps({"session_id": f"fifo-{source}"}),
+                        timeout=2.0,
+                    )
+                finally:
+                    target.unlink(missing_ok=True)
+                    if source == "personal_proposals":
+                        target.write_text("# Proposals\n", encoding="utf-8")
+
+                self.assertLess(time.monotonic() - started, 2.0)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"status": "degraded", "error": "钩子处理失败"},
+                )
+                self.assertEqual(completed.stderr, "")
+
+    def test_oversized_queue_inputs_fail_open_without_exposing_paths(self) -> None:
+        oversized = b"x" * (vibe_memory_router.MAX_QUEUE_INPUT_BYTES + 1)
+        for source in ("project_proposals", "project_state", "personal_proposals"):
+            with self.subTest(source=source):
+                project = self.base / f"oversized-{source}"
+                codex = project / "codex"
+                codex.mkdir(parents=True)
+                (codex / "memory_proposals.md").write_text("# Proposals\n", encoding="utf-8")
+                target = {
+                    "project_proposals": codex / "memory_proposals.md",
+                    "project_state": codex / "memory_review_state.json",
+                    "personal_proposals": self.home
+                    / ".codex"
+                    / "personal_memory"
+                    / "proposals.md",
+                }[source]
+                target.write_bytes(oversized)
+                self.write_registry(project)
+
+                completed = self.run_cli(
+                    project,
+                    agent="claude-code",
+                    event="Stop",
+                    stdin=json.dumps({"session_id": f"oversized-{source}"}),
+                )
+                if source == "personal_proposals":
+                    target.write_text("# Proposals\n", encoding="utf-8")
+
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(
+                    json.loads(completed.stdout),
+                    {"status": "degraded", "error": "钩子处理失败"},
+                )
+                self.assertEqual(completed.stderr, "")
+                self.assertNotIn(str(target), completed.stdout)
+
+    def test_personal_proposals_symlink_fails_open_without_reading_target(self) -> None:
+        project = self.base / "personal-proposal-symlink"
+        project.mkdir()
+        proposals = self.home / ".codex" / "personal_memory" / "proposals.md"
+        outside = self.base / "outside-personal-proposals.md"
+        outside.write_text("SECRET_OUTSIDE_PROPOSAL\n", encoding="utf-8")
+        proposals.unlink()
+        proposals.symlink_to(outside)
+        self.write_registry(project)
+
+        completed = self.run_cli(
+            project,
+            agent="codex",
+            event="SessionStart",
+            stdin=json.dumps({"session_id": "personal-symlink"}),
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            json.loads(completed.stdout),
+            {"status": "degraded", "error": "钩子处理失败"},
+        )
+        self.assertNotIn("SECRET_OUTSIDE_PROPOSAL", completed.stdout)
 
 
 if __name__ == "__main__":

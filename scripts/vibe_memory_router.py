@@ -9,7 +9,9 @@ import json
 import os
 import pathlib
 import shlex
+import signal
 import stat
+import threading
 import time
 import uuid
 from typing import Any, Mapping
@@ -40,7 +42,10 @@ IDEMPOTENCY_FILENAME = "hook_events.json"
 PACKET_NAMES = ("codex_context_packet.md", "shared_memory_context_packet.md")
 PACKET_LOCK_NAME = ".vibe-memory-packets.lock"
 PACKET_JOURNAL_NAME = ".vibe-memory-packets-journal.json"
-QUEUE_LOCK_NAME = "memory_review_queue.json.lock"
+QUEUE_LOCK_NAME = memory_review_queue.QUEUE_LOCK_FILENAME
+MAX_QUEUE_INPUT_BYTES = 4 * 1024 * 1024
+QUEUE_REFRESH_TIMEOUT_SECONDS = 8.0
+READ_CHUNK_BYTES = 64 * 1024
 PROTECTED_CODEX_NAMES = (
     "memory_review_queue.json",
     QUEUE_LOCK_NAME,
@@ -204,13 +209,10 @@ class IdempotencyStore:
         return True
 
     def _read_entries(self) -> dict[str, object]:
-        if self.path.is_symlink():
-            raise ValueError("unsafe idempotency state path")
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
-        except (OSError, json.JSONDecodeError) as error:
+            text = _read_bounded_regular(path=self.path)
+            value = json.loads(text) if text is not None else {}
+        except (OSError, ValueError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid idempotency store {self.path}: {error}") from error
         if not isinstance(value, dict):
             raise ValueError(f"invalid idempotency store {self.path}: root must be an object")
@@ -392,39 +394,178 @@ def _open_codex_dir(project_root: pathlib.Path):
         os.close(root_fd)
 
 
-def _refresh_review_queue(project_root: pathlib.Path) -> Mapping[str, int]:
+def _check_queue_deadline(deadline: float) -> None:
+    if time.monotonic() >= deadline:
+        raise TimeoutError("queue refresh deadline exceeded")
+
+
+@contextlib.contextmanager
+def _hard_queue_refresh_deadline(timeout_seconds: float):
+    """Interrupt a blocking main-thread stage without leaving a worker behind."""
+    supported = all(
+        hasattr(signal, name)
+        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    )
+    if (
+        timeout_seconds <= 0
+        or not supported
+        or threading.current_thread() is not threading.main_thread()
+    ):
+        yield
+        return
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    if previous_timer[0] > 0:
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def deadline_reached(_signum: int, _frame: object) -> None:
+        raise TimeoutError("queue refresh deadline exceeded")
+
+    signal.signal(signal.SIGALRM, deadline_reached)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _read_bounded_regular(
+    *,
+    path: pathlib.Path | None = None,
+    directory_fd: int | None = None,
+    name: str | None = None,
+    max_bytes: int = MAX_QUEUE_INPUT_BYTES,
+    deadline: float | None = None,
+) -> str | None:
+    if (path is None) == (directory_fd is None):
+        raise ValueError("queue input requires exactly one location")
+    if directory_fd is not None:
+        if name is None:
+            raise ValueError("missing queue input name")
+        _validate_name(name)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if deadline is not None:
+        _check_queue_deadline(deadline)
+    try:
+        if path is not None:
+            descriptor = os.open(path, flags)
+        else:
+            assert directory_fd is not None and name is not None
+            descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise ValueError("unsafe queue input") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("unsafe queue input")
+        if opened.st_size > max_bytes:
+            raise ValueError("queue input exceeds size limit")
+        content = bytearray()
+        while True:
+            if deadline is not None:
+                _check_queue_deadline(deadline)
+            remaining = max_bytes + 1 - len(content)
+            if remaining <= 0:
+                raise ValueError("queue input exceeds size limit")
+            try:
+                chunk = os.read(descriptor, min(READ_CHUNK_BYTES, remaining))
+            except BlockingIOError as error:
+                raise ValueError("unsafe queue input") from error
+            if not chunk:
+                break
+            content.extend(chunk)
+            if len(content) > max_bytes:
+                raise ValueError("queue input exceeds size limit")
+        if deadline is not None:
+            _check_queue_deadline(deadline)
+        try:
+            return bytes(content).decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("invalid queue input encoding") from error
+    finally:
+        os.close(descriptor)
+
+
+def _refresh_review_queue(
+    project_root: pathlib.Path,
+    *,
+    timeout_seconds: float = QUEUE_REFRESH_TIMEOUT_SECONDS,
+) -> Mapping[str, int]:
     """Refresh and return counts for exactly one registered project."""
+    deadline = time.monotonic() + max(timeout_seconds, 0.0)
+    _check_queue_deadline(deadline)
+    with _hard_queue_refresh_deadline(timeout_seconds):
+        return _refresh_review_queue_before_deadline(
+            project_root,
+            deadline=deadline,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def _refresh_review_queue_before_deadline(
+    project_root: pathlib.Path,
+    *,
+    deadline: float,
+    timeout_seconds: float,
+) -> Mapping[str, int]:
     project_root = pathlib.Path(project_root).resolve()
     personal_source = pathlib.Path.home() / ".codex" / "personal_memory" / "proposals.md"
-    try:
-        personal_text = personal_source.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        personal_text = ""
-    with _open_codex_dir(project_root) as codex_fd, _advisory_lock_at(
-        codex_fd, QUEUE_LOCK_NAME
-    ):
-        project_text = _read_at(codex_fd, "memory_proposals.md") or ""
-        state_text = _read_at(codex_fd, "memory_review_state.json")
-        default_state: dict[str, Any] = {"items": {}, "last_reminder_at": ""}
-        try:
-            state = json.loads(state_text) if state_text is not None else default_state
-        except json.JSONDecodeError:
-            state = default_state
-        if not isinstance(state, dict):
-            state = default_state
-        state.setdefault("items", {})
-        state.setdefault("last_reminder_at", "")
-        if state_text is None:
-            _atomic_write_json_at(codex_fd, "memory_review_state.json", state)
-        queue = memory_review_queue.build_queue_from_documents(
-            project_text,
-            personal_text,
-            state,
-            project_source_path=project_root / "codex" / "memory_proposals.md",
-            personal_source_path=personal_source,
-        )
-        _atomic_write_json_at(codex_fd, "memory_review_queue.json", queue)
-        return queue["counts"]
+    personal_text = _read_bounded_regular(
+        path=personal_source, deadline=deadline
+    ) or ""
+    _check_queue_deadline(deadline)
+    with _open_codex_dir(project_root) as codex_fd:
+        _check_queue_deadline(deadline)
+        with memory_review_queue.queue_lock(
+            directory_fd=codex_fd,
+            name=QUEUE_LOCK_NAME,
+            timeout=timeout_seconds,
+            deadline=deadline,
+        ):
+            project_text = _read_bounded_regular(
+                directory_fd=codex_fd,
+                name="memory_proposals.md",
+                deadline=deadline,
+            ) or ""
+            state_text = _read_bounded_regular(
+                directory_fd=codex_fd,
+                name="memory_review_state.json",
+                deadline=deadline,
+            )
+            default_state: dict[str, Any] = {"items": {}, "last_reminder_at": ""}
+            try:
+                state = json.loads(state_text) if state_text is not None else default_state
+            except json.JSONDecodeError:
+                state = default_state
+            if not isinstance(state, dict):
+                state = default_state
+            state.setdefault("items", {})
+            state.setdefault("last_reminder_at", "")
+            _check_queue_deadline(deadline)
+            if state_text is None:
+                _atomic_write_json_at(codex_fd, "memory_review_state.json", state)
+                _check_queue_deadline(deadline)
+            queue = memory_review_queue.build_queue_from_documents(
+                project_text,
+                personal_text,
+                state,
+                project_source_path=project_root / "codex" / "memory_proposals.md",
+                personal_source_path=personal_source,
+            )
+            _check_queue_deadline(deadline)
+            _atomic_write_json_at(codex_fd, "memory_review_queue.json", queue)
+            _check_queue_deadline(deadline)
+            return queue["counts"]
 
 
 @contextlib.contextmanager
@@ -508,27 +649,10 @@ def _atomic_write_json_at(
 
 
 def _read_at(directory_fd: int, name: str) -> str | None:
-    _validate_name(name)
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(name, flags, dir_fd=directory_fd)
-    except FileNotFoundError:
-        return None
-    except OSError as error:
+        return _read_bounded_regular(directory_fd=directory_fd, name=name)
+    except (OSError, ValueError) as error:
         raise ValueError("unsafe packet path") from error
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError("unsafe packet path")
-        with os.fdopen(descriptor, encoding="utf-8") as handle:
-            descriptor = -1
-            return handle.read()
-    except OSError as error:
-        raise ValueError("unsafe packet path") from error
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
 
 
 def _restore_at(directory_fd: int, name: str, content: object) -> None:

@@ -10,7 +10,9 @@ explicit user action from the CLI or local review server.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import os
@@ -39,6 +41,7 @@ PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"
 PROJECT_LONG = CODEX_DIR / "codex_long_memory.md"
 PROJECT_QUEUE = CODEX_DIR / "memory_review_queue.json"
 PROJECT_STATE = CODEX_DIR / "memory_review_state.json"
+QUEUE_LOCK_FILENAME = "memory_review_queue.json.lock"
 SOURCE_EVENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
 RESERVED_CANDIDATE_METADATA_KEYS = {
     "approval_rule",
@@ -120,6 +123,108 @@ AGENT_CATEGORIES = {
 
 def now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _queue_lock_name(name: str) -> str:
+    if not name or pathlib.PurePath(name).name != name or name in {".", ".."}:
+        raise ValueError("unsafe queue lock")
+    return name
+
+
+def _queue_lock_stat(
+    *, path: pathlib.Path | None, directory_fd: int | None, name: str
+) -> os.stat_result | None:
+    try:
+        if path is not None:
+            return os.stat(path, follow_symlinks=False)
+        assert directory_fd is not None
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+@contextlib.contextmanager
+def queue_lock(
+    path: pathlib.Path | None = None,
+    *,
+    directory_fd: int | None = None,
+    name: str = QUEUE_LOCK_FILENAME,
+    timeout: float = 10.0,
+    deadline: float | None = None,
+    poll_interval: float = 0.02,
+):
+    """Lock the persistent queue-lock inode from a path or pinned directory fd."""
+    if (path is None) == (directory_fd is None):
+        raise ValueError("queue lock requires exactly one location")
+    name = _queue_lock_name(name)
+    if path is not None:
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_deadline = time.monotonic() + max(timeout, 0.0)
+    lock_deadline = (
+        timeout_deadline if deadline is None else min(timeout_deadline, deadline)
+    )
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor = -1
+    while True:
+        try:
+            if path is not None:
+                descriptor = os.open(path, flags, 0o600)
+            else:
+                assert directory_fd is not None
+                descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except OSError as error:
+            raise ValueError("unsafe queue lock") from error
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(descriptor)
+            descriptor = -1
+            raise ValueError("unsafe queue lock")
+        os.fchmod(descriptor, 0o600)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                linked = _queue_lock_stat(
+                    path=path, directory_fd=directory_fd, name=name
+                )
+                if linked is None or (
+                    linked.st_dev,
+                    linked.st_ino,
+                ) != (opened.st_dev, opened.st_ino):
+                    os.close(descriptor)
+                    descriptor = -1
+                    break
+                remaining = lock_deadline - time.monotonic()
+                if remaining <= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                    raise TimeoutError("timed out waiting for queue lock") from None
+                time.sleep(min(max(poll_interval, 0.001), remaining))
+        if descriptor < 0:
+            continue
+        linked = _queue_lock_stat(path=path, directory_fd=directory_fd, name=name)
+        if linked is None or (linked.st_dev, linked.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            os.close(descriptor)
+            descriptor = -1
+            if time.monotonic() >= lock_deadline:
+                raise TimeoutError("timed out waiting for queue lock")
+            continue
+        break
+
+    try:
+        yield
+    finally:
+        os.close(descriptor)
 
 
 def read_text(path: pathlib.Path) -> str:
@@ -583,8 +688,8 @@ def _build_queue_from_items(
 
 
 def build_queue() -> dict[str, Any]:
-    queue_lock = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
-    with exclusive_lock(queue_lock):
+    queue_lock_path = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
+    with queue_lock(path=queue_lock_path):
         queue = _build_queue_from_items(
             parse_project_candidates() + parse_personal_candidates(),
             state_map(),
