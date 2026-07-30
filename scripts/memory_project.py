@@ -4,19 +4,24 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import json
 import os
 import pathlib
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 from typing import Any
+import uuid
 
 import loop_superpowers
 import ui_design_preferences
 import ui_design_store
+import vibe_memory_install
 import vibe_memory_paths
 
 
@@ -67,13 +72,129 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     )
 
 
-def registry() -> dict[str, Any]:
-    data = read_json(REGISTRY_PATH, {"current_project": "", "projects": []})
-    if not isinstance(data, dict):
-        data = {"current_project": "", "projects": []}
+def _empty_registry() -> dict[str, Any]:
+    return {"current_project": "", "projects": []}
+
+
+@contextlib.contextmanager
+def _registry_lock(exclusive: bool):
+    parent = REGISTRY_PATH.absolute().parent
+    vibe_memory_install._validate_install_ancestor_chain(parent)
+    canonical_parent = vibe_memory_install._canonical_install_path(parent)
+    if not exclusive and not canonical_parent.exists():
+        yield None
+        return
+    if exclusive:
+        parent_fd = vibe_memory_install._open_or_create_directory_chain(canonical_parent)
+    else:
+        parent_fd = os.open(
+            canonical_parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield parent_fd
+    finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        os.close(parent_fd)
+
+
+def _read_registry_at(parent_fd: int) -> dict[str, Any]:
+    name = REGISTRY_PATH.name
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _empty_registry()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("project registry must be a regular file")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("project registry changed while opening")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("project registry is malformed") from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("current_project", ""), str)
+        or not isinstance(data.get("projects", []), list)
+    ):
+        raise ValueError("project registry has an invalid structure")
     data.setdefault("current_project", "")
     data.setdefault("projects", [])
     return data
+
+
+def _write_registry_at(parent_fd: int, value: dict[str, Any]) -> None:
+    content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary_name = f".{REGISTRY_PATH.name}.tmp-{uuid.uuid4().hex}"
+    descriptor = os.open(
+        temporary_name,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short project registry write")
+            offset += written
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        try:
+            active = os.stat(REGISTRY_PATH.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            active = None
+        if active is not None and not stat.S_ISREG(active.st_mode):
+            raise ValueError("project registry must be a regular file")
+        os.replace(
+            temporary_name,
+            REGISTRY_PATH.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def registry() -> dict[str, Any]:
+    with _registry_lock(exclusive=False) as parent_fd:
+        if parent_fd is None:
+            return _empty_registry()
+        return _read_registry_at(parent_fd)
+
+
+def _mutate_registry(mutator: Any) -> dict[str, Any]:
+    with _registry_lock(exclusive=True) as parent_fd:
+        data = _read_registry_at(parent_fd)
+        mutator(data)
+        _write_registry_at(parent_fd, data)
+        return data
 
 
 def ui_design_config(_root: pathlib.Path) -> dict[str, Any]:
@@ -285,16 +406,26 @@ def register_project(root: str | pathlib.Path, make_current: bool = True) -> dic
     project_root = normalize_project_root(root)
     if not project_root.is_dir():
         raise ValueError(f"project root must be an existing directory: {project_root}")
-    data = registry()
     entry = project_entry(project_root)
-    projects = [p for p in data.get("projects", []) if p.get("root") != str(project_root)]
-    projects.append(entry)
-    projects.sort(key=lambda item: item.get("name", ""))
-    data["projects"] = projects
-    if make_current:
-        data["current_project"] = str(project_root)
-    write_json(REGISTRY_PATH, data)
-    return data
+    def mutate(data: dict[str, Any]) -> None:
+        projects = [p for p in data.get("projects", []) if p.get("root") != str(project_root)]
+        projects.append(entry)
+        projects.sort(key=lambda item: item.get("name", ""))
+        data["projects"] = projects
+        if make_current:
+            data["current_project"] = str(project_root)
+    return _mutate_registry(mutate)
+
+
+def unregister_project(root: str | pathlib.Path) -> dict[str, Any]:
+    project_root = str(normalize_project_root(root))
+    def mutate(data: dict[str, Any]) -> None:
+        data["projects"] = [
+            item for item in data.get("projects", []) if item.get("root") != project_root
+        ]
+        if data.get("current_project") == project_root:
+            data["current_project"] = ""
+    return _mutate_registry(mutate)
 
 
 def set_current_project(root: str | pathlib.Path) -> dict[str, Any]:
@@ -310,9 +441,7 @@ def list_projects() -> dict[str, Any]:
             entry = project_entry(pathlib.Path(root))
             entry["last_opened_at"] = item.get("last_opened_at", "")
             refreshed.append(entry)
-    data["projects"] = refreshed
-    write_json(REGISTRY_PATH, data)
-    return data
+    return {**data, "projects": refreshed}
 
 
 def current_project(default: pathlib.Path | None = None) -> pathlib.Path:

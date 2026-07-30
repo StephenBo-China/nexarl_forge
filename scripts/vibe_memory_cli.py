@@ -141,21 +141,11 @@ def open_command(_args: argparse.Namespace) -> int:
     return 0
 
 
-def unregister_project(root: str) -> dict[str, object]:
-    project_root = str(memory_project.normalize_project_root(root))
-    data = memory_project.registry()
-    data["projects"] = [item for item in data.get("projects", []) if item.get("root") != project_root]
-    if data.get("current_project") == project_root:
-        data["current_project"] = ""
-    memory_project.write_json(memory_project.REGISTRY_PATH, data)
-    return data
-
-
 def project_command(args: argparse.Namespace) -> int:
     if args.project_command == "register":
         value = memory_project.register_project(args.project_root)
     elif args.project_command == "unregister":
-        value = unregister_project(args.project_root)
+        value = memory_project.unregister_project(args.project_root)
     elif args.project_command == "list":
         value = memory_project.list_projects()
     else:

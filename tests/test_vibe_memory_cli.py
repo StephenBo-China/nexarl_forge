@@ -198,6 +198,84 @@ exec /usr/bin/python3 "${SOURCE_ROOT}/scripts/vibe_memory_cli.py" install --sour
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
+class ProjectRegistryTransactionTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = pathlib.Path(self.temporary.name)
+        self.home = self.base / "home"
+        self.home.mkdir()
+        self.registry = self.home / ".codex/memory_review/projects.json"
+        self.environment = os.environ.copy()
+        self.environment.update({
+            "HOME": str(self.home),
+            "MEMORY_REVIEW_PROJECT_REGISTRY": str(self.registry),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def command(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(CLI), *arguments],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+
+    def test_project_list_is_absolutely_read_only(self) -> None:
+        project = self.base / "notes"
+        project.mkdir()
+        registered = self.command("project", "register", str(project))
+        self.assertEqual(registered.returncode, 0, registered.stderr)
+        before = self.registry.read_bytes()
+        before_stat = self.registry.stat()
+
+        listed = self.command("project", "list")
+
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(self.registry.read_bytes(), before)
+        self.assertEqual(self.registry.stat().st_mtime_ns, before_stat.st_mtime_ns)
+
+    def test_registry_symlink_is_rejected_without_overwriting_sentinel(self) -> None:
+        project = self.base / "notes"
+        project.mkdir()
+        self.registry.parent.mkdir(parents=True)
+        sentinel = self.base / "sentinel.json"
+        sentinel.write_text('{"sentinel":true}\n', encoding="utf-8")
+        self.registry.symlink_to(sentinel)
+
+        completed = self.command("project", "register", str(project))
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), '{"sentinel":true}\n')
+        self.assertTrue(self.registry.is_symlink())
+
+    def test_twenty_four_concurrent_registers_do_not_lose_projects(self) -> None:
+        projects = [self.base / f"notes-{index:02d}" for index in range(24)]
+        for project in projects:
+            project.mkdir()
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(CLI), "project", "register", str(project)],
+                env=self.environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for project in projects
+        ]
+        results = [process.communicate(timeout=30) + (process.returncode,) for process in processes]
+        self.assertTrue(all(code == 0 for _stdout, _stderr, code in results), results)
+
+        listed = self.command("project", "list")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        roots = {item["root"] for item in json.loads(listed.stdout)["projects"]}
+        self.assertEqual(roots, {str(project.resolve()) for project in projects})
+
+
 class VibeMemoryCLIUnitTest(unittest.TestCase):
     def test_hook_command_treats_empty_stdin_as_empty_object(self) -> None:
         args = argparse.Namespace(agent="codex", event="UserPromptSubmit")
