@@ -250,9 +250,20 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(approved["decision"]["source_agent"], "claude-code")
             self.assertEqual(approved["decision"]["source_agents"], ["claude-code"])
             self.assertEqual(approved["decision"]["policy_version"], 4)
+            self.assertEqual(approved["decision"]["identity"], project_item["identity"])
+            self.assertEqual(
+                approved["decision"]["equivalence"], project_item["equivalence"]
+            )
             self.assertEqual(
                 approved_personal["decision"]["source_agents"],
                 ["claude-code", "codex"],
+            )
+            self.assertEqual(
+                approved_personal["decision"]["identity"], personal_item["identity"]
+            )
+            self.assertEqual(
+                approved_personal["decision"]["equivalence"],
+                personal_item["equivalence"],
             )
             text = (temp / "personal_proposals.md").read_text(encoding="utf-8")
             self.assertIn("status: pending", text)
@@ -266,7 +277,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertNotIn("source_agent", approved_text)
             self.assertNotIn("policy_version", approved_text)
 
-    def test_candidate_identity_includes_scope_target_category_title_and_summary(self) -> None:
+    def test_candidate_equivalence_ignores_title_but_keeps_other_identity_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
             temp = pathlib.Path(temp_value)
             originals = {
@@ -306,12 +317,33 @@ class MemoryReviewQualityTest(unittest.TestCase):
                     review.create_agent_candidate(
                         "project", "long", "project_workflow", "标题一", summary
                     ),
+                    review.create_agent_candidate(
+                        "personal", "long", "work_style", "标题一",
+                        "用户希望不同摘要继续形成一条独立候选记录。",
+                    ),
                 ]
+                personal_items = review.parse_personal_candidates()
             finally:
                 for name, original in originals.items():
                     setattr(review, name, original)
 
-            self.assertTrue(all(result["created"] for result in results))
+            self.assertEqual(
+                [result["created"] for result in results],
+                [True, False, True, True, True, True],
+            )
+            first = next(item for item in personal_items if "标题一" in item["content"])
+            self.assertEqual(
+                first["identity"],
+                review.candidate_identity(
+                    "personal", "long", "work_style", "标题一", summary
+                ),
+            )
+            self.assertEqual(
+                first["equivalence"],
+                review.candidate_equivalence(
+                    "personal", "long", "work_style", summary
+                ),
+            )
 
     def test_sensitive_candidate_title_is_rejected_before_write_or_approval(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
@@ -432,7 +464,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
             proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
             read_barrier = threading.Barrier(2)
             start_barrier = threading.Barrier(3)
-            results: list[dict] = []
+            results: list[tuple[str, dict]] = []
             errors: list[BaseException] = []
 
             def synchronized_read(path: pathlib.Path) -> str:
@@ -442,15 +474,15 @@ class MemoryReviewQualityTest(unittest.TestCase):
                     return snapshot
                 return originals["read_text"](path)
 
-            def create(source_agent: str) -> None:
+            def create(source_agent: str, title: str) -> None:
                 try:
                     start_barrier.wait(timeout=3)
                     results.append(
-                        review.create_agent_candidate(
-                            "personal", "long", "work_style", "并发候选",
+                        (title, review.create_agent_candidate(
+                            "personal", "long", "work_style", title,
                             "用户希望跨项目候选在并发代理调用时仍然只生成一条。",
                             source_agent=source_agent,
-                        )
+                        ))
                     )
                 except BaseException as error:
                     errors.append(error)
@@ -467,8 +499,11 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.build_queue = lambda: {}
                 review.read_text = synchronized_read
                 threads = [
-                    threading.Thread(target=create, args=(agent,))
-                    for agent in ("codex", "claude-code")
+                    threading.Thread(target=create, args=(agent, title))
+                    for agent, title in (
+                        ("codex", "Codex 首个标题"),
+                        ("claude-code", "Claude 备选标题"),
+                    )
                 ]
                 for thread in threads:
                     thread.start()
@@ -476,15 +511,130 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 for thread in threads:
                     thread.join(timeout=5)
                 alive = [thread.name for thread in threads if thread.is_alive()]
+                review.read_text = originals["read_text"]
+                item = review.parse_personal_candidates()[0]
             finally:
                 for name, original in originals.items():
                     setattr(review, name, original)
 
             self.assertEqual(alive, [])
             self.assertEqual(errors, [])
-            self.assertEqual(sorted(result["created"] for result in results), [False, True])
+            self.assertEqual(
+                sorted(result["created"] for _, result in results), [False, True]
+            )
             text = proposals.read_text(encoding="utf-8")
             self.assertEqual(text.count("并发代理调用时仍然只生成一条"), 1)
+            winning_title = next(title for title, result in results if result["created"])
+            losing_title = next(title for title, result in results if not result["created"])
+            self.assertIn(f"**标题：{winning_title}**", text)
+            self.assertNotIn(f"**标题：{losing_title}**", text)
+            self.assertEqual(item["source_agents"], ["claude-code", "codex"])
+
+    def test_legacy_pending_candidate_is_deduplicated_and_upgraded_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            proposals = temp / "personal_proposals.md"
+            summary = "用户希望旧格式候选也参与等价内容去重并合并代理来源。"
+            proposals.write_text(
+                "# Proposals\n\n### M-legacy\n\n"
+                "memory_id: M-legacy\nstatus: pending\ntarget: long\n"
+                "created: 2026-07-30T12:00:00+08:00\n"
+                "source_event: agent_summary\ncategory: work_style\n\n"
+                "candidate:\n\n```text\n"
+                f"**标题：旧格式标题**\n\n**分类：工作方式**\n\n{summary}\n"
+                "```\n\napproval_rule: Promote only after explicit approval.\n",
+                encoding="utf-8",
+            )
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue",
+                )
+            }
+            try:
+                review.PERSONAL_PROPOSALS = proposals
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = lambda: {}
+                result = review.create_agent_candidate(
+                    "personal", "long", "work_style", "新建议标题", summary,
+                    source_agent="codex",
+                )
+                item = review.parse_personal_candidates()[0]
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertFalse(result["created"])
+            self.assertEqual(result["id"], "M-legacy")
+            text = proposals.read_text(encoding="utf-8")
+            self.assertEqual(text.count("### M-legacy"), 1)
+            self.assertNotIn("新建议标题", text)
+            self.assertIn("source_agent: unknown", text)
+            self.assertIn("source_agents: codex,unknown", text)
+            self.assertIn("equivalence:", text)
+            self.assertEqual(item["source_agents"], ["codex", "unknown"])
+            self.assertEqual(
+                item["identity"],
+                review.candidate_identity(
+                    "personal", "long", "work_style", "旧格式标题", summary
+                ),
+            )
+
+    def test_equivalent_approved_memory_is_not_reproposed_under_a_new_title(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            summary = "用户希望已批准的等价内容不会因为标题变化再次进入候选队列，并保留额外限定。"
+            different_summary = "用户希望已批准的等价内容不会因为标题变化再次进入候选队列"
+            originals = {
+                name: getattr(review, name)
+                for name in (
+                    "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
+                    "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
+                    "PROJECT_STATE", "CODEX_DIR", "build_queue",
+                )
+            }
+            try:
+                review.PERSONAL_PROPOSALS = temp / "personal_proposals.md"
+                review.PERSONAL_PROPOSALS.write_text("# Proposals\n", encoding="utf-8")
+                review.PERSONAL_LONG = temp / "personal_long.md"
+                review.PERSONAL_LONG.write_text(
+                    "# Long Memory\n\n**标题：已批准标题**\n\n"
+                    f"**分类：工作方式**\n\n{summary}\n",
+                    encoding="utf-8",
+                )
+                review.PERSONAL_SHORT = temp / "personal_short.md"
+                review.PROJECT_PROPOSALS = temp / "project_proposals.md"
+                review.PROJECT_LONG = temp / "project_long.md"
+                review.PROJECT_QUEUE = temp / "queue.json"
+                review.PROJECT_STATE = temp / "state.json"
+                review.CODEX_DIR = temp / "codex"
+                review.build_queue = lambda: {}
+                result = review.create_agent_candidate(
+                    "personal", "long", "work_style", "新的建议标题", summary,
+                    source_agent="claude-code",
+                )
+                different = review.create_agent_candidate(
+                    "personal", "long", "work_style", "不同内容标题",
+                    different_summary,
+                    source_agent="codex",
+                )
+            finally:
+                for name, original in originals.items():
+                    setattr(review, name, original)
+
+            self.assertFalse(result["created"])
+            self.assertTrue(different["created"])
+            proposal_text = (temp / "personal_proposals.md").read_text(encoding="utf-8")
+            self.assertEqual(proposal_text.count("memory_id:"), 1)
+            self.assertIn(different_summary, proposal_text)
 
     def test_concurrent_scopes_rebuild_one_atomic_queue_without_lost_items(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

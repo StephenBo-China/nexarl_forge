@@ -152,7 +152,7 @@ def candidate_provenance(body: str) -> tuple[str, list[str], int]:
 
 def without_candidate_metadata(body: str) -> str:
     return re.sub(
-        r"^(?:-\s*)?(?:candidate_id|source_event|source_agent|source_agents|policy_version|identity|category):\s*.+$",
+        r"^(?:-\s*)?(?:candidate_id|source_event|source_agent|source_agents|policy_version|identity|equivalence|category):\s*.+$",
         "",
         body,
         flags=re.MULTILINE,
@@ -168,19 +168,45 @@ def write_proposals_atomically(path: pathlib.Path, content: str) -> None:
 
 
 def merge_candidate_source_agent(
-    text: str, identity: str, source_agent: str
+    text: str, equivalence: str, source_agent: str, scope: str
 ) -> tuple[str, str, list[str]] | None:
     headings = list(re.finditer(r"^### .+$", text, flags=re.MULTILINE))
     for index, heading_match in enumerate(headings):
         body_start = heading_match.end()
         body_end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
         body = text[body_start:body_end]
-        if metadata_value(body, "identity") != identity:
+        if scope == "personal" and (metadata_value(body, "status") or "pending") != "pending":
+            continue
+        stored_identity, stored_equivalence, _, _, _ = candidate_keys_from_section(
+            scope, heading_match.group(0).strip(), body
+        )
+        if stored_equivalence != equivalence:
             continue
         _, source_agents, _ = candidate_provenance(body)
         merged_agents = sorted({*source_agents, source_agent})
-        if merged_agents != source_agents:
-            prefix = "- " if re.search(r"^- source_agent:", body, flags=re.MULTILINE) else ""
+        prefix = "- " if scope == "project" else ""
+        additions: list[str] = []
+        if not metadata_value(body, "source_agent"):
+            additions.append(
+                f"{prefix}source_agent: " + ("`unknown`" if prefix else "unknown")
+            )
+        if not metadata_value(body, "identity") and stored_identity:
+            additions.append(
+                f"{prefix}identity: "
+                + (f"`{stored_identity}`" if prefix else stored_identity)
+            )
+        if not metadata_value(body, "equivalence"):
+            additions.append(
+                f"{prefix}equivalence: "
+                + (f"`{stored_equivalence}`" if prefix else stored_equivalence)
+            )
+        if additions:
+            source_event_line = re.search(
+                r"^(?:-\s*)?source_event:\s*.+$", body, flags=re.MULTILINE
+            )
+            insertion = source_event_line.end() if source_event_line else 0
+            body = body[:insertion] + "\n" + "\n".join(additions) + body[insertion:]
+        if merged_agents != source_agents or not metadata_value(body, "source_agents"):
             value = ",".join(merged_agents)
             rendered = f"{prefix}source_agents: " + (f"`{value}`" if prefix else value)
             if re.search(r"^(?:-\s*)?source_agents:\s*.+$", body, flags=re.MULTILINE):
@@ -233,6 +259,74 @@ def candidate_identity(
         separators=(",", ":"),
     )
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def candidate_equivalence(scope: str, target: str, category: str, summary: str) -> str:
+    value = json.dumps(
+        [scope, target, category, normalize_memory(summary)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def candidate_content_parts(content: str) -> tuple[str, str, str]:
+    title_match = re.search(r"\*\*标题：(.*?)\*\*", content, flags=re.S)
+    category_match = re.search(r"\*\*分类：(.*?)\*\*", content, flags=re.S)
+    title = title_match.group(1).strip() if title_match else ""
+    category_label = category_match.group(1).strip() if category_match else ""
+    if category_match:
+        summary = content[category_match.end() :].strip()
+    elif title_match:
+        summary = content[title_match.end() :].strip()
+    else:
+        summary = content.strip()
+    return title, category_label, summary
+
+
+def category_key(scope: str, value: str) -> str:
+    if value in AGENT_CATEGORIES[scope]:
+        return value
+    for key, label in AGENT_CATEGORIES[scope].items():
+        if value == label:
+            return key
+    return ""
+
+
+def candidate_keys_from_section(
+    scope: str, heading: str, body: str
+) -> tuple[str, str, str, str, str]:
+    target = metadata_value(body, "target") or ("long" if scope == "project" else "")
+    content = first_fenced_text(body) if scope == "personal" else without_candidate_metadata(body)
+    content_title, content_category, summary = candidate_content_parts(content)
+    category = metadata_value(body, "category") or category_key(scope, content_category)
+    title = content_title
+    if not title and scope == "project":
+        heading_text = heading.removeprefix("### ").strip()
+        title = heading_text.split(" - ", 1)[1] if " - " in heading_text else heading_text
+    identity = metadata_value(body, "identity")
+    equivalence = metadata_value(body, "equivalence")
+    if not identity and target and category and title and summary:
+        identity = candidate_identity(scope, target, category, title, summary)
+    if not equivalence and target and category and summary:
+        equivalence = candidate_equivalence(scope, target, category, summary)
+    return identity, equivalence, category, title, summary
+
+
+def approved_contains_equivalent(
+    text: str, scope: str, category: str, summary: str
+) -> bool:
+    sections = split_heading_sections(text)
+    bodies = [body for _, body in sections] if sections else [text]
+    expected_summary = normalize_memory(summary)
+    for body in bodies:
+        _, category_label, approved_summary = candidate_content_parts(body)
+        if (
+            category_key(scope, category_label) == category
+            and normalize_memory(approved_summary) == expected_summary
+        ):
+            return True
+    return False
 
 
 def risk_flags(text: str) -> list[str]:
@@ -294,8 +388,9 @@ def parse_project_candidates() -> list[dict[str, Any]]:
         created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
         source_event = metadata_value(body, "source_event")
         source_agent, source_agents, policy_version = candidate_provenance(body)
-        identity = metadata_value(body, "identity")
-        category = metadata_value(body, "category")
+        identity, equivalence, category, _, _ = candidate_keys_from_section(
+            "project", heading, body
+        )
         content = without_candidate_metadata(body)
         checkpoint = is_project_checkpoint(heading, content)
         items.append(
@@ -311,6 +406,7 @@ def parse_project_candidates() -> list[dict[str, Any]]:
                 "source_agents": source_agents,
                 "policy_version": policy_version,
                 "identity": identity,
+                "equivalence": equivalence,
                 "category": category,
                 "source_path": str(PROJECT_PROPOSALS),
                 "created_at": created,
@@ -339,8 +435,9 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
         created = metadata_value(body, "created") or heading.removeprefix("### ").strip()
         source_event = metadata_value(body, "source_event")
         source_agent, source_agents, policy_version = candidate_provenance(body)
-        identity = metadata_value(body, "identity")
-        category = metadata_value(body, "category")
+        identity, equivalence, category, _, _ = candidate_keys_from_section(
+            "personal", heading, body
+        )
         content = first_fenced_text(body)
         items.append(
             {
@@ -355,6 +452,7 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
                 "source_agents": source_agents,
                 "policy_version": policy_version,
                 "identity": identity,
+                "equivalence": equivalence,
                 "category": category,
                 "source_path": str(PERSONAL_PROPOSALS),
                 "created_at": created,
@@ -423,12 +521,15 @@ def create_agent_candidate(
         raise ValueError("candidate contains sensitive material")
     markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
     identity = candidate_identity(scope, target, category, title, summary)
+    equivalence = candidate_equivalence(scope, target, category, summary)
     proposals = PERSONAL_PROPOSALS if scope == "personal" else PROJECT_PROPOSALS
     proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
     result: dict[str, Any]
     with exclusive_lock(proposal_lock):
         existing = read_text(proposals)
-        merged = merge_candidate_source_agent(existing, identity, source_agent)
+        merged = merge_candidate_source_agent(
+            existing, equivalence, source_agent, scope
+        )
         if merged is not None:
             updated, candidate_id, source_agents = merged
             if updated != existing:
@@ -445,7 +546,7 @@ def create_agent_candidate(
             else:
                 approved_path = PROJECT_LONG
             approved = read_text(approved_path)
-            if normalize_memory(markdown) in normalize_memory(approved):
+            if approved_contains_equivalent(approved, scope, category, summary):
                 result = {"created": False, "reason": "duplicate"}
             else:
                 created = now()
@@ -463,6 +564,7 @@ def create_agent_candidate(
                         f"created: {created}\nsource_event: {source_event}\n"
                         f"source_agent: {source_agent}\nsource_agents: {rendered_agents}\n"
                         f"policy_version: {policy_version}\nidentity: {identity}\n"
+                        f"equivalence: {equivalence}\n"
                         f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n"
                         "approval_rule: Promote only after explicit user approval of this exact content."
                     )
@@ -476,6 +578,7 @@ def create_agent_candidate(
                         f"- source_agents: `{rendered_agents}`\n"
                         f"- policy_version: `{policy_version}`\n"
                         f"- identity: `{identity}`\n"
+                        f"- equivalence: `{equivalence}`\n"
                         f"- category: `{category}`"
                     )
                     candidate_id = stable_id(
@@ -489,6 +592,7 @@ def create_agent_candidate(
                         f"- source_agents: `{rendered_agents}`\n"
                         f"- policy_version: `{policy_version}`\n"
                         f"- identity: `{identity}`\n"
+                        f"- equivalence: `{equivalence}`\n"
                         f"- category: `{category}`"
                     )
                     section = f"\n{heading}\n\n{body}\n"
@@ -602,6 +706,8 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
             "source_agent": item.get("source_agent", "unknown"),
             "source_agents": item.get("source_agents", [item.get("source_agent", "unknown")]),
             "policy_version": item.get("policy_version", 1),
+            "identity": item.get("identity", ""),
+            "equivalence": item.get("equivalence", ""),
         },
     )
     return find_item(candidate_id)
