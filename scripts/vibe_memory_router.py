@@ -4,13 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import pathlib
 import shlex
+import subprocess
+import sys
 import time
-from typing import Mapping
+from typing import Any, Mapping
 
+import memory_project
+import vibe_memory_paths
+from loop_superpowers import atomic_write_text
 from ui_design_store import atomic_write_json, exclusive_lock
-from vibe_memory_events import NormalizedEvent
+from vibe_memory_events import NormalizedEvent, normalize_event
 
 
 PERSONAL_CATEGORIES = (
@@ -28,6 +34,7 @@ PROJECT_CATEGORIES = (
     "technical_constraint",
     "project_workflow",
 )
+IDEMPOTENCY_FILENAME = "hook_events.json"
 
 
 def _markdown_escape(value: object) -> str:
@@ -103,6 +110,9 @@ def build_context(
         personal_root / "proposals.md",
     ]
     project_section = ""
+    project_pending_line = ""
+    project_category_line = ""
+    approval_scope = "Official personal long/short memory"
     command_parts = ["python3"]
     if project_root is not None:
         root = pathlib.Path(project_root)
@@ -115,6 +125,11 @@ def build_context(
             *required,
         ]
         project_section = f"\nRegistered project: `{_markdown_escape(root)}`\n"
+        project_pending_line = (
+            f'\n- project candidates: {pending.get("project_pending", 0)}'
+        )
+        project_category_line = f"\n- Project categories: {', '.join(PROJECT_CATEGORIES)}."
+        approval_scope += " and project long memory"
         command_parts = [
             "env",
             f"MEMORY_REVIEW_PROJECT_ROOT={root}",
@@ -122,7 +137,6 @@ def build_context(
         ]
     required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
-    project_categories = ", ".join(PROJECT_CATEGORIES)
     command_parts.extend(
         [
             str(pathlib.Path(__file__).resolve().parent / "memory_review.py"),
@@ -151,8 +165,7 @@ def build_context(
 - source agent: {_markdown_escape(event.agent)}
 - event: {_markdown_escape(event.event)}
 - pending total: {pending.get("pending", 0)}
-- personal candidates: {pending.get("personal_pending", 0)}
-- project candidates: {pending.get("project_pending", 0)}
+- personal candidates: {pending.get("personal_pending", 0)}{project_pending_line}
 {project_section}
 ## Required Memory
 
@@ -160,13 +173,12 @@ def build_context(
 
 ## Approval and Candidate Governance
 
-- Official personal long/short memory and project long memory may change only
+- {approval_scope} may change only
   after explicit approval of the exact candidate content.
 - Write candidates only to the proposals files; never write directly to
   approved long or short memory.
 - The active conversation model may create at most two distilled candidates.
-- Personal categories: {personal_categories}.
-- Project categories: {project_categories}.
+- Personal categories: {personal_categories}.{project_category_line}
 - Never capture raw prompts, secrets, filesystem paths, one-off tasks,
   screenshots, URLs, credentials, tokens, or uncertain assumptions.
 - Hooks provide metadata and policy context only; they do not summarize prompts
@@ -195,3 +207,70 @@ def resolve_registered_project(
         if current == root or root in current.parents:
             matches.append(root)
     return max(matches, key=lambda root: len(root.parts)) if matches else None
+
+
+def _idempotency_path() -> pathlib.Path:
+    runtime = vibe_memory_paths.for_home()
+    return runtime.install_root / "state" / IDEMPOTENCY_FILENAME
+
+
+def _refresh_review_queue(project_root: pathlib.Path) -> Mapping[str, int]:
+    """Refresh and return counts for exactly one registered project."""
+    script = pathlib.Path(__file__).resolve().parent / "memory_review_queue.py"
+    environment = os.environ.copy()
+    environment["MEMORY_REVIEW_PROJECT_ROOT"] = str(project_root)
+    subprocess.run(
+        [sys.executable, str(script), "refresh"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=8,
+        check=True,
+    )
+    queue_path = project_root / "codex" / "memory_review_queue.json"
+    try:
+        queue = json.loads(queue_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid memory review queue {queue_path}: {error}") from error
+    if not isinstance(queue, dict) or not isinstance(queue.get("counts"), dict):
+        raise ValueError(f"invalid memory review queue {queue_path}: missing counts")
+    return queue["counts"]
+
+
+def _registry_projects() -> list[dict[str, object]]:
+    value = memory_project.registry().get("projects", [])
+    if not isinstance(value, list):
+        return []
+    return [entry for entry in value if isinstance(entry, dict)]
+
+
+def handle_event(
+    agent: str,
+    event: str,
+    payload: object,
+    cwd: pathlib.Path,
+) -> dict[str, Any]:
+    """Route one shared hook event without retaining its raw payload."""
+    normalized = normalize_event(agent, event, payload, cwd)
+    if not IdempotencyStore(_idempotency_path()).claim(normalized):
+        return {"status": "duplicate"}
+
+    project_root = resolve_registered_project(normalized.cwd, _registry_projects())
+    counts: Mapping[str, int]
+    if project_root is None:
+        counts = {"pending": 0, "personal_pending": 0, "project_pending": 0}
+    else:
+        counts = _refresh_review_queue(project_root)
+
+    context = build_context(normalized, project_root, counts)
+    if project_root is not None:
+        atomic_write_text(project_root / "codex" / "codex_context_packet.md", context)
+        atomic_write_text(
+            project_root / "codex" / "shared_memory_context_packet.md", context
+        )
+
+    return {
+        "status": "ok",
+        "hookSpecificOutput": {"additionalContext": context},
+    }
