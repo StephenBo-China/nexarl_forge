@@ -1,23 +1,26 @@
 """Safely merge Vibe Memory's managed Codex and Claude Code hook entries.
 
-POSIX does not provide a pathname-level byte compare-and-swap for writers that
-ignore our lock. Repair therefore holds the validated source inode open through
-replacement and recovers writes reproduced on that inode. Identity and content
-checks also avoid blindly replacing a newer pathname, though no userspace
-protocol can eliminate every race with a fully noncooperating writer.
+On Darwin, repair uses ``renamex_np`` with ``RENAME_SWAP`` for existing files
+and ``RENAME_EXCL`` for new files. The exchanged-out file is verified before
+the change is accepted, closing the final pathname race against atomic saves.
+Other POSIX systems retain the weaker userspace inode/content CAS fallback:
+it detects and recovers many noncooperating writes, but cannot eliminate every
+race without an equivalent kernel exchange primitive.
 """
 
 from __future__ import annotations
 
 import copy
+import ctypes
 import datetime as dt
 import json
 import os
 import pathlib
 import shlex
 import stat
+import sys
 import tempfile
-from typing import Any
+from typing import Any, NoReturn
 
 from ui_design_store import exclusive_lock
 
@@ -26,6 +29,8 @@ MANAGED_SIGNATURE = "vibe-memory hook --agent"
 EVENTS = ("SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact", "Stop")
 AGENTS = ("codex", "claude-code")
 _NO_SOURCE_CHECK = object()
+RENAME_SWAP = 0x00000002
+RENAME_EXCL = 0x00000004
 
 
 class ConcurrentConfigChange(RuntimeError):
@@ -65,7 +70,11 @@ def _validate_agent_event(agent: str, event: str) -> None:
 def command(runtime: str | pathlib.Path, agent: str, event: str) -> str:
     """Return a shell-safe managed hook command for one supported event."""
     _validate_agent_event(agent, event)
-    runtime_path = pathlib.PurePath(runtime) / "scripts" / "vibe_memory_cli.py"
+    runtime_path = (
+        pathlib.Path(runtime).expanduser().resolve(strict=False)
+        / "scripts"
+        / "vibe_memory_cli.py"
+    )
     executable = shlex.quote(str(runtime_path))
     return (
         f"/usr/bin/python3 {executable} hook --agent {agent} --event {event} "
@@ -83,7 +92,11 @@ def _require_document(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
 
 
 def _is_managed_handler(handler: Any) -> bool:
-    if not isinstance(handler, dict) or not isinstance(handler.get("command"), str):
+    if (
+        not isinstance(handler, dict)
+        or handler.get("type") != "command"
+        or not isinstance(handler.get("command"), str)
+    ):
         return False
     marker = f" # {MANAGED_SIGNATURE}"
     if not handler["command"].endswith(marker):
@@ -253,6 +266,29 @@ def _fsync_directory(path: pathlib.Path) -> None:
         os.close(descriptor)
 
 
+def _darwin_rename(
+    source: str | pathlib.Path,
+    destination: str | pathlib.Path,
+    flags: int,
+) -> None:
+    """Invoke Darwin's flagged atomic rename and raise the corresponding errno."""
+    if sys.platform != "darwin":
+        raise NotImplementedError("flagged atomic rename is only supported on Darwin")
+    libc = ctypes.CDLL(None, use_errno=True)
+    renamex_np = libc.renamex_np
+    renamex_np.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+    renamex_np.restype = ctypes.c_int
+    result = renamex_np(os.fsencode(source), os.fsencode(destination), flags)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(source),
+            str(destination),
+        )
+
+
 def _create_artifact_exclusive(
     target: pathlib.Path, content: bytes, mode: int, label: str
 ) -> pathlib.Path:
@@ -375,6 +411,32 @@ def _restore_external_bytes(
         temporary.unlink(missing_ok=True)
 
 
+def _raise_preserved_conflict(
+    target: pathlib.Path,
+    temporary: pathlib.Path,
+    content: bytes,
+    mode: int,
+    backup: pathlib.Path | None,
+    outcome: str,
+    *,
+    temporary_is_attempt: bool = True,
+) -> NoReturn:
+    """Persist the manager attempt only after the external active path is safe."""
+    try:
+        attempt = _create_attempt_exclusive(target, content, mode)
+    except Exception as exc:
+        raise ConcurrentConfigChange(
+            f"hook configuration changed concurrently; {outcome}: {target}",
+            backup=backup,
+            attempt=temporary if temporary_is_attempt else None,
+        ) from exc
+    raise ConcurrentConfigChange(
+        f"hook configuration changed concurrently; {outcome}: {target}",
+        backup=backup,
+        attempt=attempt,
+    )
+
+
 def write_with_backup(
     path: str | pathlib.Path,
     value: Any,
@@ -444,6 +506,106 @@ def write_with_backup(
         if current_source == content:
             temporary.unlink(missing_ok=True)
             return {"changed": False, "path": str(target), "backup": None}
+        if sys.platform == "darwin" and expected_source is not _NO_SOURCE_CHECK:
+            if expected_source is None:
+                try:
+                    _darwin_rename(temporary, target, RENAME_EXCL)
+                except FileExistsError:
+                    _raise_preserved_conflict(
+                        target,
+                        temporary,
+                        content,
+                        existing_mode,
+                        None,
+                        "newer active path preserved",
+                    )
+                replaced = True
+                _fsync_directory(target.parent)
+                return {"changed": True, "path": str(target), "backup": None}
+
+            _darwin_rename(temporary, target, RENAME_SWAP)
+            replaced = True
+
+            def exchanged_source_matches() -> bool:
+                try:
+                    if _source_bytes(temporary) != expected_source:
+                        return False
+                    if held_identity is None:
+                        return True
+                    return _path_matches(temporary, held_identity, expected_source)
+                except (OSError, ConfigSymlinkError):
+                    return False
+
+            if not exchanged_source_matches():
+                _darwin_rename(temporary, target, RENAME_SWAP)
+                replaced = False
+                _raise_preserved_conflict(
+                    target,
+                    temporary,
+                    content,
+                    existing_mode,
+                    None,
+                    "external bytes restored",
+                )
+            if manager_identity is None or not _path_matches(
+                target, manager_identity, content
+            ):
+                replaced = False
+                _raise_preserved_conflict(
+                    target,
+                    temporary,
+                    content,
+                    existing_mode,
+                    None,
+                    "newer active path preserved",
+                    temporary_is_attempt=False,
+                )
+
+            backup_mode = stat.S_IMODE(temporary.stat().st_mode)
+            try:
+                backup = _create_backup_exclusive(target, expected_source, backup_mode)
+            except Exception:
+                if manager_identity is not None and _path_matches(
+                    target, manager_identity, content
+                ):
+                    _darwin_rename(temporary, target, RENAME_SWAP)
+                replaced = False
+                raise
+            if not exchanged_source_matches():
+                _darwin_rename(temporary, target, RENAME_SWAP)
+                replaced = False
+                backup.unlink(missing_ok=True)
+                backup = None
+                _raise_preserved_conflict(
+                    target,
+                    temporary,
+                    content,
+                    existing_mode,
+                    None,
+                    "external bytes restored",
+                )
+            if manager_identity is None or not _path_matches(
+                target, manager_identity, content
+            ):
+                replaced = False
+                backup.unlink(missing_ok=True)
+                backup = None
+                _raise_preserved_conflict(
+                    target,
+                    temporary,
+                    content,
+                    existing_mode,
+                    None,
+                    "newer active path preserved",
+                    temporary_is_attempt=False,
+                )
+            temporary.unlink()
+            _fsync_directory(target.parent)
+            return {
+                "changed": True,
+                "path": str(target),
+                "backup": str(backup),
+            }
         if current_source is not None:
             current_mode = stat.S_IMODE(target.stat().st_mode)
             backup = _create_backup_exclusive(target, current_source, current_mode)
@@ -478,8 +640,9 @@ def write_with_backup(
                     attempt=attempt,
                 )
         _fsync_directory(target.parent)
-    except ConcurrentConfigChange:
-        temporary.unlink(missing_ok=True)
+    except ConcurrentConfigChange as conflict:
+        if conflict.attempt != str(temporary):
+            temporary.unlink(missing_ok=True)
         if not replaced and backup is not None and backup.exists():
             backup.unlink(missing_ok=True)
             try:
@@ -515,6 +678,7 @@ def write_with_backup(
 
 def status(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
     """Report whether a hook document is missing, current, drifted, or malformed."""
+    _validate_agent_event(agent, EVENTS[0])
     target = pathlib.Path(path)
     if target.is_symlink():
         error = ConfigSymlinkError(f"hook configuration path must not be a symlink: {target}")

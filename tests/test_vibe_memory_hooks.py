@@ -51,7 +51,8 @@ class ManagedCommandTest(unittest.TestCase):
                 executable, *arguments = shlex.split(value.split(" # ", 1)[0])
                 self.assertEqual(executable, "/usr/bin/python3")
                 self.assertEqual(arguments, [
-                    f"{runtime}/scripts/vibe_memory_cli.py", "hook", "--agent", agent,
+                    str(pathlib.Path(runtime).resolve() / "scripts" / "vibe_memory_cli.py"),
+                    "hook", "--agent", agent,
                     "--event", event,
                 ])
                 self.assertIn(hooks.MANAGED_SIGNATURE, value)
@@ -62,8 +63,32 @@ class ManagedCommandTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "event"):
             hooks.command("/runtime", "codex", "PreToolUse")
 
+    def test_relative_runtime_is_resolved_and_repeated_merge_is_idempotent(self) -> None:
+        first = hooks.merge_document({"hooks": {}}, "codex", ".")
+        second = hooks.merge_document(first, "codex", ".")
+
+        self.assertEqual(first, second)
+        generated = first["hooks"]["Stop"][0]["hooks"][0]["command"]
+        script = shlex.split(generated.split(" # ", 1)[0])[1]
+        self.assertTrue(pathlib.Path(script).is_absolute())
+        self.assertEqual(
+            pathlib.Path(script),
+            pathlib.Path.cwd().resolve() / "scripts" / "vibe_memory_cli.py",
+        )
+
 
 class MergeDocumentTest(unittest.TestCase):
+    def test_prompt_handler_with_managed_command_shape_survives(self) -> None:
+        prompt = {
+            "type": "prompt",
+            "command": hooks.command("/old", "codex", "Stop"),
+        }
+        source = {"hooks": {"Stop": [{"hooks": [prompt]}]}}
+
+        cleaned = hooks.remove_managed_entries(source)
+
+        self.assertEqual(cleaned["hooks"]["Stop"], [{"hooks": [prompt]}])
+
     def test_ownership_requires_exact_managed_command_tokens(self) -> None:
         managed = hooks.command("/old runtime", "codex", "Stop")
         command_prefix, command_comment = managed.split(" # ", 1)
@@ -80,7 +105,8 @@ class MergeDocumentTest(unittest.TestCase):
             "hooks": {
                 "Stop": [{
                     "hooks": [
-                        {"command": command_value} for command_value in [managed, *custom_commands]
+                        {"type": "command", "command": managed},
+                        *[{"command": command_value} for command_value in custom_commands],
                     ]
                 }]
             }
@@ -168,9 +194,12 @@ class MergeDocumentTest(unittest.TestCase):
                 "Stop": [
                     {"matcher": "all", "hooks": [
                         {"command": "custom-stop"},
-                        {"command": hooks.command("/old", "codex", "Stop")},
+                        {"type": "command", "command": hooks.command("/old", "codex", "Stop")},
                     ]},
-                    {"hooks": [{"command": hooks.command("/old", "codex", "Stop")}]},
+                    {"hooks": [{
+                        "type": "command",
+                        "command": hooks.command("/old", "codex", "Stop"),
+                    }]},
                 ],
                 "SessionStart": [{"command": "vibe-memory hook --agent in data, not handler"}],
             },
@@ -184,11 +213,25 @@ class MergeDocumentTest(unittest.TestCase):
         self.assertEqual(cleaned["hooks"]["SessionStart"], source["hooks"]["SessionStart"])
         self.assertEqual(source["hooks"]["Stop"][0]["hooks"], [
             {"command": "custom-stop"},
-            {"command": hooks.command("/old", "codex", "Stop")},
+            {"type": "command", "command": hooks.command("/old", "codex", "Stop")},
         ])
 
 
 class DocumentIOTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin rename flags only")
+    def test_darwin_rename_swap_exchanges_two_files(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            first = root / "first"
+            second = root / "second"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+
+            hooks._darwin_rename(first, second, hooks.RENAME_SWAP)
+
+            self.assertEqual(first.read_bytes(), b"second")
+            self.assertEqual(second.read_bytes(), b"first")
+
     def test_load_rejects_bom_utf16_and_utf32_without_repair_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -402,6 +445,130 @@ class DocumentIOTest(unittest.TestCase):
 
 
 class StatusAndRepairTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_backup_failure_swaps_original_back(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            original = b'{"hooks": {}}\n'
+            path.write_bytes(original)
+
+            with mock.patch(
+                "vibe_memory_hooks._create_backup_exclusive",
+                side_effect=OSError("backup failed"),
+            ):
+                with self.assertRaises(OSError):
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertEqual(path.read_bytes(), original)
+            self.assertEqual(list(root.glob("hooks.json.bak.*")), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_atomic_exchange_restores_external_atomic_save(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            original = b'{"hooks": {}}\n'
+            external = b'{"external": "atomic-save", "hooks": {}}\n'
+            path.write_bytes(original)
+            real_rename = hooks._darwin_rename
+            injected = False
+
+            def race_exchange(source, destination, flags):
+                nonlocal injected
+                if not injected and flags == hooks.RENAME_SWAP:
+                    replacement = root / "external.json"
+                    replacement.write_bytes(external)
+                    os.replace(replacement, destination)
+                    injected = True
+                return real_rename(source, destination, flags)
+
+            with mock.patch("vibe_memory_hooks._darwin_rename", side_effect=race_exchange):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), external)
+            self.assertIsNone(raised.exception.backup)
+            self.assertIsNotNone(raised.exception.attempt)
+            self.assertIn(
+                hooks.MANAGED_SIGNATURE.encode(),
+                pathlib.Path(raised.exception.attempt).read_bytes(),
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_repair_restores_external_before_attempt_artifact_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            external = b'{"external": "must-survive", "hooks": {}}\n'
+            path.write_bytes(b'{"hooks": {}}\n')
+            real_rename = hooks._darwin_rename
+            injected = False
+
+            def race_exchange(source, destination, flags):
+                nonlocal injected
+                if not injected and flags == hooks.RENAME_SWAP:
+                    replacement = root / "external.json"
+                    replacement.write_bytes(external)
+                    os.replace(replacement, destination)
+                    injected = True
+                return real_rename(source, destination, flags)
+
+            with mock.patch(
+                "vibe_memory_hooks._darwin_rename", side_effect=race_exchange
+            ), mock.patch(
+                "vibe_memory_hooks._create_attempt_exclusive",
+                side_effect=OSError("attempt fsync failed"),
+            ):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ) as raised:
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), external)
+            self.assertIsNotNone(raised.exception.attempt)
+            self.assertIn(
+                hooks.MANAGED_SIGNATURE.encode(),
+                pathlib.Path(raised.exception.attempt).read_bytes(),
+            )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin exclusive rename only")
+    def test_repair_new_file_race_does_not_overwrite_external_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "hooks.json"
+            external = b'{"external": "created-first", "hooks": {}}\n'
+            real_rename = hooks._darwin_rename
+            injected = False
+
+            def race_exclusive(source, destination, flags):
+                nonlocal injected
+                if not injected and flags == hooks.RENAME_EXCL:
+                    pathlib.Path(destination).write_bytes(external)
+                    injected = True
+                return real_rename(source, destination, flags)
+
+            with mock.patch("vibe_memory_hooks._darwin_rename", side_effect=race_exclusive):
+                with self.assertRaisesRegex(
+                    hooks.ConcurrentConfigChange, "changed concurrently"
+                ):
+                    hooks.repair(path, "codex", "/runtime")
+
+            self.assertTrue(injected)
+            self.assertEqual(path.read_bytes(), external)
+            self.assertEqual(list(root.glob("hooks.json.bak.*")), [])
+
+    def test_status_validates_agent_before_reporting_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "missing.json"
+
+            with self.assertRaisesRegex(ValueError, "unsupported agent"):
+                hooks.status(path, "unsupported", "/runtime")
+
     def test_repair_rejects_same_byte_external_inode_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "hooks.json"
@@ -430,25 +597,47 @@ class StatusAndRepairTest(unittest.TestCase):
             original = b'{"hooks": {}}\n'
             external = b'{"external": "final-window", "hooks": {}}\n'
             path.write_bytes(original)
-            real_replace = os.replace
             injected = False
 
-            def race_replace(source, destination):
-                nonlocal injected
-                if not injected and pathlib.Path(destination) == path:
-                    path.write_bytes(external)
-                    injected = True
-                return real_replace(source, destination)
+            if sys.platform == "darwin":
+                real_rename = hooks._darwin_rename
 
-            with mock.patch("vibe_memory_hooks.os.replace", side_effect=race_replace):
+                def race_replace(source, destination, flags):
+                    nonlocal injected
+                    if not injected and flags == hooks.RENAME_SWAP:
+                        path.write_bytes(external)
+                        injected = True
+                    return real_rename(source, destination, flags)
+
+                patcher = mock.patch(
+                    "vibe_memory_hooks._darwin_rename", side_effect=race_replace
+                )
+            else:
+                real_replace = os.replace
+
+                def race_replace(source, destination):
+                    nonlocal injected
+                    if not injected and pathlib.Path(destination) == path:
+                        path.write_bytes(external)
+                        injected = True
+                    return real_replace(source, destination)
+
+                patcher = mock.patch(
+                    "vibe_memory_hooks.os.replace", side_effect=race_replace
+                )
+
+            with patcher:
                 with self.assertRaisesRegex(hooks.ConcurrentConfigChange, "changed concurrently") as raised:
                     hooks.repair(path, "codex", "/runtime")
 
             self.assertTrue(injected)
             self.assertEqual(path.read_bytes(), external)
-            self.assertIsNotNone(raised.exception.backup)
+            if sys.platform == "darwin":
+                self.assertIsNone(raised.exception.backup)
+            else:
+                self.assertIsNotNone(raised.exception.backup)
+                self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
             self.assertIsNotNone(raised.exception.attempt)
-            self.assertEqual(pathlib.Path(raised.exception.backup).read_bytes(), original)
             attempt = pathlib.Path(raised.exception.attempt)
             self.assertIn(hooks.MANAGED_SIGNATURE.encode(), attempt.read_bytes())
 
