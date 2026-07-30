@@ -435,6 +435,15 @@ def _copy_release_content(
                     relative = pathlib.Path(raw_relative)
                     parent_fd = directory_fds[relative.parent]
                     os.mkdir(relative.name, 0o700, dir_fd=parent_fd)
+                    created = os.stat(
+                        relative.name,
+                        dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    if not stat.S_ISDIR(created.st_mode):
+                        raise FileExistsError(f"created release directory is unsafe: {relative}")
+                    created_identity = _temporary_identity(created)
+                    temporary_release.creation_ledger[str(relative)] = created_identity
                     descriptor = os.open(
                         relative.name,
                         _DIRECTORY_OPEN_FLAGS,
@@ -452,11 +461,11 @@ def _copy_release_content(
                         raise
                     if (
                         not stat.S_ISDIR(opened.st_mode)
-                        or _temporary_identity(opened) != _temporary_identity(active)
+                        or _temporary_identity(opened) != created_identity
+                        or _temporary_identity(active) != created_identity
                     ):
                         os.close(descriptor)
                         raise FileExistsError(f"created release directory changed: {relative}")
-                    temporary_release.creation_ledger[str(relative)] = _temporary_identity(opened)
                     directory_fds[relative] = descriptor
                 for raw_relative, (entry_type, content) in source_snapshot.items():
                     if entry_type != "file":
@@ -672,49 +681,106 @@ def _delete_tree_contents_fd(
             raise TemporaryCleanupConflict(
                 f"temporary cleanup conflict while inspecting {relative}"
             )
-        if stat.S_ISDIR(expected_identity[2]):
+        while True:
+            quarantine_name = f".cleanup-child-{uuid.uuid4().hex}"
             try:
-                child_fd = os.open(name, _DIRECTORY_OPEN_FLAGS, dir_fd=directory_fd)
+                _darwin_renameat(
+                    directory_fd,
+                    name,
+                    directory_fd,
+                    quarantine_name,
+                    RENAME_EXCL,
+                )
+                break
+            except FileExistsError:
+                continue
             except OSError as error:
                 raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict while opening {relative}"
+                    f"temporary cleanup conflict while claiming {relative}"
                 ) from error
+
+        try:
+            claimed = os.stat(
+                quarantine_name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except OSError as error:
             try:
-                if _temporary_identity(os.fstat(child_fd)) != expected_identity:
-                    raise TemporaryCleanupConflict(
-                        f"temporary cleanup conflict while opening {relative}"
+                _restore_cleanup_claim(directory_fd, quarantine_name, name)
+            except TemporaryCleanupConflict:
+                pass
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict while inspecting claimed {relative}"
+            ) from error
+        if _temporary_identity(claimed) != expected_identity:
+            _restore_cleanup_claim(directory_fd, quarantine_name, name)
+            raise TemporaryCleanupConflict(
+                f"temporary cleanup conflict; replacement preserved at {relative}"
+            )
+
+        try:
+            if stat.S_ISDIR(expected_identity[2]):
+                try:
+                    child_fd = os.open(
+                        quarantine_name,
+                        _DIRECTORY_OPEN_FLAGS,
+                        dir_fd=directory_fd,
                     )
-                _delete_tree_contents_fd(child_fd, creation_ledger, relative)
-            finally:
-                os.close(child_fd)
+                except OSError as error:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict while opening claimed {relative}"
+                    ) from error
+                try:
+                    if _temporary_identity(os.fstat(child_fd)) != expected_identity:
+                        raise TemporaryCleanupConflict(
+                            f"temporary cleanup conflict while opening claimed {relative}"
+                        )
+                    _delete_tree_contents_fd(child_fd, creation_ledger, relative)
+                finally:
+                    os.close(child_fd)
+                try:
+                    active = os.stat(
+                        quarantine_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict before removing claimed {relative}"
+                    ) from error
+                if _temporary_identity(active) != expected_identity:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict before removing claimed {relative}"
+                    )
+                try:
+                    os.rmdir(quarantine_name, dir_fd=directory_fd)
+                except OSError as error:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict before removing claimed {relative}"
+                    ) from error
+            else:
+                try:
+                    active = os.stat(
+                        quarantine_name,
+                        dir_fd=directory_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict before unlinking claimed {relative}"
+                    ) from error
+                if _temporary_identity(active) != expected_identity:
+                    raise TemporaryCleanupConflict(
+                        f"temporary cleanup conflict before unlinking claimed {relative}"
+                    )
+                os.unlink(quarantine_name, dir_fd=directory_fd)
+        except Exception:
             try:
-                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError as error:
-                raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before removing {relative}"
-                ) from error
-            if _temporary_identity(active) != expected_identity:
-                raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before removing {relative}"
-                )
-            try:
-                os.rmdir(name, dir_fd=directory_fd)
-            except OSError as error:
-                raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before removing {relative}"
-                ) from error
-        else:
-            try:
-                active = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            except OSError as error:
-                raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before unlinking {relative}"
-                ) from error
-            if _temporary_identity(active) != expected_identity:
-                raise TemporaryCleanupConflict(
-                    f"temporary cleanup conflict before unlinking {relative}"
-                )
-            os.unlink(name, dir_fd=directory_fd)
+                _restore_cleanup_claim(directory_fd, quarantine_name, name)
+            except TemporaryCleanupConflict:
+                pass
+            raise
 
 
 def _temporary_tree_inventory_fd(

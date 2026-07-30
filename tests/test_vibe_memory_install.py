@@ -1335,6 +1335,251 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertFalse((paths.install_root / "releases/1.0.0").exists())
             self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
 
+    def test_cleanup_child_claim_preserves_replacement_after_final_identity_check(self) -> None:
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                source = self.make_source(root)
+                if kind == "directory":
+                    (source / "docs/empty").mkdir()
+                paths = self.make_paths(root)
+                real_copy = vibe_memory_install._copy_release_content
+                real_renameat = vibe_memory_install._darwin_renameat
+                target_relative = pathlib.Path("README.md" if kind == "file" else "docs/empty")
+                target_name = target_relative.name
+                owned_name = f"{target_name}.owned"
+                unknown_bytes = b"UNKNOWN CLAIM REPLACEMENT\n"
+                unknown_identity: list[tuple[int, int]] = []
+                injected: list[bool] = []
+                temporary_path: list[pathlib.Path] = []
+
+                def copy_then_fail(source_snapshot: object, temporary_release: pathlib.Path) -> None:
+                    real_copy(source_snapshot, temporary_release)
+                    temporary_path.append(pathlib.Path(os.fspath(temporary_release)))
+                    raise OSError("simulated copy failure before child claim")
+
+                def replace_before_child_claim(
+                    source_parent_fd: int,
+                    source_name: str,
+                    destination_parent_fd: int,
+                    destination_name: str,
+                    flags: int,
+                ) -> None:
+                    if (
+                        source_name == target_name
+                        and destination_name.startswith(".cleanup-child-")
+                        and not injected
+                    ):
+                        os.rename(
+                            source_name,
+                            owned_name,
+                            src_dir_fd=source_parent_fd,
+                            dst_dir_fd=source_parent_fd,
+                        )
+                        if kind == "file":
+                            descriptor = os.open(
+                                source_name,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                0o600,
+                                dir_fd=source_parent_fd,
+                            )
+                            try:
+                                with os.fdopen(descriptor, "wb", closefd=False) as handle:
+                                    handle.write(unknown_bytes)
+                                metadata = os.fstat(descriptor)
+                            finally:
+                                os.close(descriptor)
+                        else:
+                            os.mkdir(source_name, 0o700, dir_fd=source_parent_fd)
+                            descriptor = os.open(
+                                source_name,
+                                vibe_memory_install._DIRECTORY_OPEN_FLAGS,
+                                dir_fd=source_parent_fd,
+                            )
+                            try:
+                                marker = os.open(
+                                    "marker",
+                                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                    0o600,
+                                    dir_fd=descriptor,
+                                )
+                                try:
+                                    with os.fdopen(marker, "wb", closefd=False) as handle:
+                                        handle.write(unknown_bytes)
+                                finally:
+                                    os.close(marker)
+                                metadata = os.fstat(descriptor)
+                            finally:
+                                os.close(descriptor)
+                        unknown_identity.append((metadata.st_dev, metadata.st_ino))
+                        injected.append(True)
+                    real_renameat(
+                        source_parent_fd,
+                        source_name,
+                        destination_parent_fd,
+                        destination_name,
+                        flags,
+                    )
+
+                with mock.patch.object(
+                    vibe_memory_install,
+                    "_copy_release_content",
+                    side_effect=copy_then_fail,
+                ), mock.patch.object(
+                    vibe_memory_install,
+                    "_darwin_renameat",
+                    side_effect=replace_before_child_claim,
+                ):
+                    with self.assertRaises(vibe_memory_install.TemporaryCleanupConflict):
+                        vibe_memory_install.install_runtime(source, paths)
+
+                target = temporary_path[0] / target_relative
+                metadata = target.stat()
+                self.assertEqual(injected, [True])
+                self.assertEqual((metadata.st_dev, metadata.st_ino), unknown_identity[0])
+                self.assertTrue((target.parent / owned_name).exists())
+                if kind == "file":
+                    self.assertEqual(target.read_bytes(), unknown_bytes)
+                else:
+                    self.assertEqual((target / "marker").read_bytes(), unknown_bytes)
+                self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+                self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+
+    def test_created_directory_open_failure_cleans_partial_temp_without_fd_leak(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_mkdir = vibe_memory_install.os.mkdir
+            real_open = vibe_memory_install.os.open
+            baseline = len(os.listdir("/dev/fd"))
+
+            for _ in range(8):
+                docs_parents: set[int] = set()
+                injected: list[bool] = []
+
+                def record_docs_mkdir(
+                    path: pathlib.Path | str,
+                    mode: int = 0o777,
+                    *args: object,
+                    **kwargs: object,
+                ) -> None:
+                    real_mkdir(path, mode, *args, **kwargs)
+                    parent_fd = kwargs.get("dir_fd")
+                    if path == "docs" and isinstance(parent_fd, int):
+                        docs_parents.add(parent_fd)
+
+                def fail_docs_open(
+                    path: pathlib.Path | str,
+                    flags: int,
+                    *args: object,
+                    **kwargs: object,
+                ) -> int:
+                    if (
+                        path == "docs"
+                        and kwargs.get("dir_fd") in docs_parents
+                        and not injected
+                    ):
+                        injected.append(True)
+                        raise OSError("injected created directory open failure")
+                    return real_open(path, flags, *args, **kwargs)
+
+                with mock.patch.object(
+                    vibe_memory_install.os,
+                    "mkdir",
+                    side_effect=record_docs_mkdir,
+                ), mock.patch.object(
+                    vibe_memory_install.os,
+                    "open",
+                    side_effect=fail_docs_open,
+                ):
+                    with self.assertRaisesRegex(
+                        OSError,
+                        "injected created directory open failure",
+                    ):
+                        vibe_memory_install.install_runtime(source, paths)
+
+                self.assertEqual(injected, [True])
+                self.assertEqual(
+                    list((paths.install_root / "releases").glob(".1.0.0.tmp-*")),
+                    [],
+                )
+
+            self.assertEqual(len(os.listdir("/dev/fd")), baseline)
+
+    def test_created_directory_replacement_between_stat_and_open_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            paths = self.make_paths(root)
+            real_open = vibe_memory_install.os.open
+            unknown_bytes = b"UNKNOWN DIRECTORY BETWEEN STAT AND OPEN\n"
+            unknown_identity: list[tuple[int, int]] = []
+            temporary_path: list[pathlib.Path] = []
+
+            def replace_docs_before_open(
+                path: pathlib.Path | str,
+                flags: int,
+                *args: object,
+                **kwargs: object,
+            ) -> int:
+                parent_fd = kwargs.get("dir_fd")
+                temporary = list(
+                    (paths.install_root / "releases").glob(".1.0.0.tmp-*")
+                )
+                if (
+                    path == "docs"
+                    and isinstance(parent_fd, int)
+                    and temporary
+                    and not unknown_identity
+                ):
+                    os.rename(
+                        "docs",
+                        "docs.owned",
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                    )
+                    os.mkdir("docs", 0o700, dir_fd=parent_fd)
+                    unknown_fd = real_open(
+                        "docs",
+                        vibe_memory_install._DIRECTORY_OPEN_FLAGS,
+                        dir_fd=parent_fd,
+                    )
+                    try:
+                        marker = os.open(
+                            "marker",
+                            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                            0o600,
+                            dir_fd=unknown_fd,
+                        )
+                        try:
+                            with os.fdopen(marker, "wb", closefd=False) as handle:
+                                handle.write(unknown_bytes)
+                        finally:
+                            os.close(marker)
+                        metadata = os.fstat(unknown_fd)
+                    finally:
+                        os.close(unknown_fd)
+                    unknown_identity.append((metadata.st_dev, metadata.st_ino))
+                    temporary_path.append(temporary[0])
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.object(
+                vibe_memory_install.os,
+                "open",
+                side_effect=replace_docs_before_open,
+            ):
+                with self.assertRaises(vibe_memory_install.TemporaryCleanupConflict):
+                    vibe_memory_install.install_runtime(source, paths)
+
+            docs = temporary_path[0] / "docs"
+            metadata = docs.stat()
+            self.assertEqual((metadata.st_dev, metadata.st_ino), unknown_identity[0])
+            self.assertEqual((docs / "marker").read_bytes(), unknown_bytes)
+            self.assertTrue((temporary_path[0] / "docs.owned").is_dir())
+            self.assertFalse((paths.install_root / "releases/1.0.0").exists())
+            self.assertFalse(os.path.lexists(str(paths.install_root / "current")))
+
     def test_descriptor_validation_failures_do_not_leak_install_fds(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
