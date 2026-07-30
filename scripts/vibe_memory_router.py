@@ -15,7 +15,10 @@ def resolve_registered_project(
         raw_root = entry.get("root") if isinstance(entry, dict) else None
         if not isinstance(raw_root, str) or not raw_root:
             continue
-        root = pathlib.Path(raw_root).expanduser().resolve()
+        try:
+            root = pathlib.Path(raw_root).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
         if current == root or root in current.parents:
             matches.append(root)
     return max(matches, key=lambda root: len(root.parts)) if matches else None

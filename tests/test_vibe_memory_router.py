@@ -54,6 +54,21 @@ class VibeMemoryRouterTest(unittest.TestCase):
 
             self.assertEqual(resolved, root.resolve())
 
+    def test_resolve_registered_project_ignores_invalid_root_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value) / "project"
+            cwd = root / "src"
+            cwd.mkdir(parents=True)
+
+            for invalid_root in ("~nonexistent-user/project", "bad\x00root"):
+                with self.subTest(invalid_root=invalid_root):
+                    resolved = resolve_registered_project(
+                        cwd,
+                        [{"root": invalid_root}, {"root": str(root)}],
+                    )
+
+                    self.assertEqual(resolved, root.resolve())
+
     def test_resolve_registered_project_uses_canonical_symlink_paths(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = pathlib.Path(value)
