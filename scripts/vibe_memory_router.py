@@ -6,12 +6,14 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import pathlib
 import shlex
-import signal
 import stat
-import threading
+import subprocess
+import sys
+import tempfile
 import time
 import uuid
 from typing import Any, Mapping
@@ -46,6 +48,17 @@ QUEUE_LOCK_NAME = memory_review_queue.QUEUE_LOCK_FILENAME
 MAX_QUEUE_INPUT_BYTES = 4 * 1024 * 1024
 QUEUE_REFRESH_TIMEOUT_SECONDS = 8.0
 READ_CHUNK_BYTES = 64 * 1024
+MAX_QUEUE_WORKER_OUTPUT_BYTES = 4096
+QUEUE_COUNT_NAMES = {
+    "pending",
+    "actionable_pending",
+    "checkpoint_pending",
+    "project_pending",
+    "personal_pending",
+    "approved",
+    "rejected",
+    "deferred",
+}
 PROTECTED_CODEX_NAMES = (
     "memory_review_queue.json",
     QUEUE_LOCK_NAME,
@@ -399,38 +412,6 @@ def _check_queue_deadline(deadline: float) -> None:
         raise TimeoutError("queue refresh deadline exceeded")
 
 
-@contextlib.contextmanager
-def _hard_queue_refresh_deadline(timeout_seconds: float):
-    """Interrupt a blocking main-thread stage without leaving a worker behind."""
-    supported = all(
-        hasattr(signal, name)
-        for name in ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
-    )
-    if (
-        timeout_seconds <= 0
-        or not supported
-        or threading.current_thread() is not threading.main_thread()
-    ):
-        yield
-        return
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    if previous_timer[0] > 0:
-        yield
-        return
-    previous_handler = signal.getsignal(signal.SIGALRM)
-
-    def deadline_reached(_signum: int, _frame: object) -> None:
-        raise TimeoutError("queue refresh deadline exceeded")
-
-    signal.signal(signal.SIGALRM, deadline_reached)
-    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
-    try:
-        yield
-    finally:
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
-
-
 def _read_bounded_regular(
     *,
     path: pathlib.Path | None = None,
@@ -501,71 +482,126 @@ def _refresh_review_queue(
     *,
     timeout_seconds: float = QUEUE_REFRESH_TIMEOUT_SECONDS,
 ) -> Mapping[str, int]:
-    """Refresh and return counts for exactly one registered project."""
-    deadline = time.monotonic() + max(timeout_seconds, 0.0)
-    _check_queue_deadline(deadline)
-    with _hard_queue_refresh_deadline(timeout_seconds):
-        return _refresh_review_queue_before_deadline(
-            project_root,
-            deadline=deadline,
-            timeout_seconds=timeout_seconds,
+    """Refresh in a killable child while retaining the verified directory fd."""
+    if timeout_seconds <= 0:
+        raise TimeoutError("queue refresh deadline exceeded")
+    project_root = pathlib.Path(project_root).resolve()
+    with _open_codex_dir(project_root) as codex_fd:
+        command = _queue_worker_command(codex_fd, project_root, timeout_seconds)
+        environment = os.environ.copy()
+        environment["HOME"] = str(pathlib.Path.home())
+        with tempfile.TemporaryFile() as output:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                close_fds=True,
+                pass_fds=(codex_fd,),
+            )
+            try:
+                process.communicate(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                try:
+                    process.communicate(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise TimeoutError("queue refresh deadline exceeded") from None
+            output.seek(0)
+            encoded_output = output.read(MAX_QUEUE_WORKER_OUTPUT_BYTES + 1)
+    if process.returncode != 0:
+        raise ValueError("queue worker failed")
+    if len(encoded_output) > MAX_QUEUE_WORKER_OUTPUT_BYTES:
+        raise ValueError("invalid queue worker output")
+    try:
+        stdout = encoded_output.decode("utf-8")
+        counts = json.loads(stdout)
+    except (UnicodeDecodeError, TypeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid queue worker output") from error
+    if (
+        not isinstance(counts, dict)
+        or set(counts) != QUEUE_COUNT_NAMES
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in counts.values()
         )
+    ):
+        raise ValueError("invalid queue worker output")
+    return counts
 
 
-def _refresh_review_queue_before_deadline(
+def _queue_worker_command(
+    codex_fd: int, project_root: pathlib.Path, timeout_seconds: float
+) -> list[str]:
+    return [
+        sys.executable,
+        str(pathlib.Path(__file__).resolve()),
+        "--queue-worker",
+        str(codex_fd),
+        str(project_root),
+        repr(timeout_seconds),
+    ]
+
+
+def _refresh_review_queue_on_fd(
+    codex_fd: int,
     project_root: pathlib.Path,
     *,
-    deadline: float,
     timeout_seconds: float,
 ) -> Mapping[str, int]:
-    project_root = pathlib.Path(project_root).resolve()
+    opened = os.fstat(codex_fd)
+    if codex_fd < 3 or not stat.S_ISDIR(opened.st_mode):
+        raise ValueError("invalid queue worker directory")
+    deadline = time.monotonic() + timeout_seconds
+    _check_queue_deadline(deadline)
     personal_source = pathlib.Path.home() / ".codex" / "personal_memory" / "proposals.md"
     personal_text = _read_bounded_regular(
         path=personal_source, deadline=deadline
     ) or ""
     _check_queue_deadline(deadline)
-    with _open_codex_dir(project_root) as codex_fd:
-        _check_queue_deadline(deadline)
-        with memory_review_queue.queue_lock(
+    with memory_review_queue.queue_lock(
+        directory_fd=codex_fd,
+        name=QUEUE_LOCK_NAME,
+        timeout=timeout_seconds,
+        deadline=deadline,
+    ):
+        project_text = _read_bounded_regular(
             directory_fd=codex_fd,
-            name=QUEUE_LOCK_NAME,
-            timeout=timeout_seconds,
+            name="memory_proposals.md",
             deadline=deadline,
-        ):
-            project_text = _read_bounded_regular(
-                directory_fd=codex_fd,
-                name="memory_proposals.md",
-                deadline=deadline,
-            ) or ""
-            state_text = _read_bounded_regular(
-                directory_fd=codex_fd,
-                name="memory_review_state.json",
-                deadline=deadline,
-            )
-            default_state: dict[str, Any] = {"items": {}, "last_reminder_at": ""}
-            try:
-                state = json.loads(state_text) if state_text is not None else default_state
-            except json.JSONDecodeError:
-                state = default_state
-            if not isinstance(state, dict):
-                state = default_state
-            state.setdefault("items", {})
-            state.setdefault("last_reminder_at", "")
+        ) or ""
+        state_text = _read_bounded_regular(
+            directory_fd=codex_fd,
+            name="memory_review_state.json",
+            deadline=deadline,
+        )
+        default_state: dict[str, Any] = {"items": {}, "last_reminder_at": ""}
+        try:
+            state = json.loads(state_text) if state_text is not None else default_state
+        except json.JSONDecodeError:
+            state = default_state
+        if not isinstance(state, dict):
+            state = default_state
+        state.setdefault("items", {})
+        state.setdefault("last_reminder_at", "")
+        _check_queue_deadline(deadline)
+        if state_text is None:
+            _atomic_write_json_at(codex_fd, "memory_review_state.json", state)
             _check_queue_deadline(deadline)
-            if state_text is None:
-                _atomic_write_json_at(codex_fd, "memory_review_state.json", state)
-                _check_queue_deadline(deadline)
-            queue = memory_review_queue.build_queue_from_documents(
-                project_text,
-                personal_text,
-                state,
-                project_source_path=project_root / "codex" / "memory_proposals.md",
-                personal_source_path=personal_source,
-            )
-            _check_queue_deadline(deadline)
-            _atomic_write_json_at(codex_fd, "memory_review_queue.json", queue)
-            _check_queue_deadline(deadline)
-            return queue["counts"]
+        queue = memory_review_queue.build_queue_from_documents(
+            project_text,
+            personal_text,
+            state,
+            project_source_path=project_root / "codex" / "memory_proposals.md",
+            personal_source_path=personal_source,
+        )
+        _check_queue_deadline(deadline)
+        _atomic_write_json_at(codex_fd, "memory_review_queue.json", queue)
+        _check_queue_deadline(deadline)
+        return queue["counts"]
 
 
 @contextlib.contextmanager
@@ -756,3 +792,41 @@ def handle_event(
     except BaseException:
         store.release(normalized, reservation)
         raise
+
+
+def _queue_worker_main(arguments: list[str]) -> int:
+    try:
+        if len(arguments) != 4 or arguments[0] != "--queue-worker":
+            raise ValueError("invalid queue worker arguments")
+        descriptor_text, project_root_text, timeout_text = arguments[1:]
+        if not descriptor_text.isascii() or not descriptor_text.isdecimal():
+            raise ValueError("invalid queue worker descriptor")
+        codex_fd = int(descriptor_text)
+        if codex_fd < 3 or codex_fd > 1_000_000:
+            raise ValueError("invalid queue worker descriptor")
+        project_root = pathlib.Path(project_root_text)
+        if not project_root.is_absolute():
+            raise ValueError("invalid queue worker project root")
+        timeout_seconds = float(timeout_text)
+        if (
+            not math.isfinite(timeout_seconds)
+            or timeout_seconds <= 0
+            or timeout_seconds > QUEUE_REFRESH_TIMEOUT_SECONDS
+        ):
+            raise ValueError("invalid queue worker timeout")
+        counts = _refresh_review_queue_on_fd(
+            codex_fd,
+            project_root,
+            timeout_seconds=timeout_seconds,
+        )
+        payload = json.dumps(dict(counts), ensure_ascii=False, separators=(",", ":"))
+        if len(payload.encode("utf-8")) > MAX_QUEUE_WORKER_OUTPUT_BYTES:
+            raise ValueError("invalid queue worker output")
+    except BaseException:
+        return 70
+    sys.stdout.write(payload + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_queue_worker_main(sys.argv[1:]))

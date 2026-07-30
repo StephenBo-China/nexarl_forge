@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import concurrent.futures
+import io
 import json
 import os
 import pathlib
+import signal
 import shlex
 import subprocess
 import sys
@@ -505,22 +507,22 @@ class VibeMemoryRouterTest(unittest.TestCase):
             outside = project / "outside"
             outside.mkdir()
             held = project / "codex-held"
-            original_write = vibe_memory_router._atomic_write_json_at
+            original_popen = subprocess.Popen
             swapped = False
 
-            def swap_parent_then_write(
-                directory_fd: int, name: str, payload: object, mode: int = 0o600
-            ) -> None:
+            def swap_parent_then_spawn(
+                *args: object, **kwargs: object
+            ) -> subprocess.Popen[str]:
                 nonlocal swapped
                 if not swapped:
                     codex.rename(held)
                     codex.symlink_to(outside, target_is_directory=True)
                     swapped = True
-                original_write(directory_fd, name, payload, mode)
+                return original_popen(*args, **kwargs)  # type: ignore[arg-type]
 
             with mock.patch(
-                "vibe_memory_router._atomic_write_json_at",
-                side_effect=swap_parent_then_write,
+                "vibe_memory_router.subprocess.Popen",
+                side_effect=swap_parent_then_spawn,
             ), mock.patch(
                 "vibe_memory_router.pathlib.Path.home", return_value=project / "home"
             ):
@@ -696,25 +698,147 @@ class VibeMemoryRouterTest(unittest.TestCase):
             self.assertFalse((project / "codex" / "memory_review_queue.json").exists())
 
     def test_queue_refresh_hard_deadline_interrupts_blocking_stage(self) -> None:
-        if not hasattr(vibe_memory_router.signal, "setitimer"):
+        if not hasattr(signal, "setitimer"):
             self.skipTest("interval timers unavailable")
         with tempfile.TemporaryDirectory() as value:
             project = pathlib.Path(value)
             (project / "codex").mkdir()
+            previous_handler = signal.getsignal(signal.SIGALRM)
 
-            def block_read(**_kwargs: object) -> str:
-                time.sleep(1.0)
-                return ""
+            def existing_handler(_signum: int, _frame: object) -> None:
+                pass
+
+            signal.signal(signal.SIGALRM, existing_handler)
+            signal.setitimer(signal.ITIMER_REAL, 5.0)
+            timer_before = signal.getitimer(signal.ITIMER_REAL)
+            blocking_command = [
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ]
 
             started = time.monotonic()
-            with mock.patch(
-                "vibe_memory_router._read_bounded_regular", side_effect=block_read
-            ), self.assertRaisesRegex(TimeoutError, "queue refresh deadline"):
-                vibe_memory_router._refresh_review_queue(
-                    project, timeout_seconds=0.05
+            try:
+                with mock.patch(
+                    "vibe_memory_router._queue_worker_command",
+                    return_value=blocking_command,
+                ), self.assertRaisesRegex(TimeoutError, "queue refresh deadline"):
+                    vibe_memory_router._refresh_review_queue(
+                        project, timeout_seconds=0.05
+                    )
+                elapsed = time.monotonic() - started
+                timer_after = signal.getitimer(signal.ITIMER_REAL)
+                self.assertIs(signal.getsignal(signal.SIGALRM), existing_handler)
+                self.assertAlmostEqual(
+                    timer_after[0], timer_before[0] - elapsed, delta=0.2
                 )
+                self.assertEqual(timer_after[1], timer_before[1])
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
 
-            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertLess(elapsed, 0.5)
+
+    def test_queue_worker_timeout_from_thread_kills_reaps_and_cannot_write_late(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            (project / "codex").mkdir()
+            marker = project / "late-worker-write.txt"
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import pathlib,sys,time; time.sleep(0.5); "
+                    "pathlib.Path(sys.argv[1]).write_text('late')"
+                ),
+                str(marker),
+            ]
+            original_popen = subprocess.Popen
+            children: list[subprocess.Popen[str]] = []
+            errors: list[BaseException] = []
+
+            def capture_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+                process = original_popen(*args, **kwargs)  # type: ignore[arg-type]
+                children.append(process)
+                return process
+
+            def refresh() -> None:
+                try:
+                    vibe_memory_router._refresh_review_queue(
+                        project, timeout_seconds=0.05
+                    )
+                except BaseException as error:
+                    errors.append(error)
+
+            with mock.patch(
+                "vibe_memory_router._queue_worker_command", return_value=command
+            ), mock.patch(
+                "vibe_memory_router.subprocess.Popen", side_effect=capture_popen
+            ):
+                thread = threading.Thread(target=refresh)
+                thread.start()
+                thread.join(timeout=0.5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], TimeoutError)
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            children[0].wait(timeout=0.1)
+            time.sleep(0.6)
+            self.assertFalse(marker.exists())
+            self.assertFalse(
+                (project / "codex" / "memory_review_queue.json").exists()
+            )
+
+    def test_queue_worker_failures_and_oversized_output_are_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            project = pathlib.Path(value)
+            (project / "codex").mkdir()
+            commands = {
+                "exit": [sys.executable, "-c", "raise SystemExit(3)"],
+                "invalid": [
+                    sys.executable,
+                    "-c",
+                    "print('SECRET_WORKER_OUTPUT')",
+                ],
+                "oversized": [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import sys; sys.stdout.write('x' * "
+                        f"{vibe_memory_router.MAX_QUEUE_WORKER_OUTPUT_BYTES + 1})"
+                    ),
+                ],
+            }
+
+            for kind, command in commands.items():
+                with self.subTest(kind=kind), mock.patch(
+                    "vibe_memory_router._queue_worker_command", return_value=command
+                ):
+                    with self.assertRaises(ValueError) as raised:
+                        vibe_memory_router._refresh_review_queue(
+                            project, timeout_seconds=1.0
+                        )
+                    message = str(raised.exception)
+                    self.assertNotIn("SECRET_WORKER_OUTPUT", message)
+                    self.assertNotIn(str(project), message)
+
+    def test_queue_worker_entry_rejects_untrusted_arguments(self) -> None:
+        cases = (
+            [],
+            ["--queue-worker", "not-a-fd", "/tmp/project", "1"],
+            ["--queue-worker", "0", "/tmp/project", "1"],
+            ["--queue-worker", "3", "relative-project", "1"],
+            ["--queue-worker", "3", "/tmp/project", "nan"],
+            ["--queue-worker", "3", "/tmp/project", "9"],
+        )
+        for arguments in cases:
+            with self.subTest(arguments=arguments), io.StringIO() as stdout, mock.patch(
+                "vibe_memory_router.sys.stdout", stdout
+            ):
+                self.assertEqual(vibe_memory_router._queue_worker_main(list(arguments)), 70)
+                self.assertEqual(stdout.getvalue(), "")
 
     def test_build_context_for_unregistered_cwd_is_personal_only(self) -> None:
         event = self.event(cwd=pathlib.Path("/tmp/not-registered"))
