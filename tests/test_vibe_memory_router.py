@@ -889,7 +889,8 @@ class VibeMemoryRouterTest(unittest.TestCase):
         self.assertIn("paths", context.lower())
         self.assertIn("one-off", context.lower())
         self.assertIn("explicit approval of the exact candidate content", context.lower())
-        self.assertIn("memory_review.py propose", context)
+        self.assertIn("vibe_memory_cli.py", context)
+        self.assertIn("memory propose", context)
         self.assertIn("--source-agent claude-code", context)
         self.assertIn("--policy-version 1", context)
 
@@ -906,12 +907,16 @@ class VibeMemoryRouterTest(unittest.TestCase):
         marker = "Candidate CLI:\n\n    "
         self.assertIn(marker, context)
         command = context.split(marker, 1)[1].splitlines()[0]
-        script = ROOT / "scripts" / "memory_review.py"
+        script = (
+            vibe_memory_router.vibe_memory_paths.for_home().install_root
+            / "current/scripts/vibe_memory_cli.py"
+        )
         expected_parts = [
             "env",
             f"MEMORY_REVIEW_PROJECT_ROOT={project}",
             "python3",
             str(script),
+            "memory",
             "propose",
             "--scope", "personal",
             "--target", "long",
@@ -928,10 +933,10 @@ class VibeMemoryRouterTest(unittest.TestCase):
     def test_build_context_command_executes_hostile_project_root_with_bin_sh(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             temp = pathlib.Path(value)
-            scripts = temp / "fake scripts"
-            scripts.mkdir()
-            fake_router = scripts / "vibe_memory_router.py"
-            fake_script = scripts / "memory_review.py"
+            install_root = temp / "fake install"
+            scripts = install_root / "current/scripts"
+            scripts.mkdir(parents=True)
+            fake_script = scripts / "vibe_memory_cli.py"
             fake_script.write_text(
                 "import json, os, sys\n"
                 "print(json.dumps({'root': os.environ.get('MEMORY_REVIEW_PROJECT_ROOT'), "
@@ -939,7 +944,8 @@ class VibeMemoryRouterTest(unittest.TestCase):
                 encoding="utf-8",
             )
             project = temp / "project with spaces ' $(touch injected) `touch injected2`"
-            with mock.patch("vibe_memory_router.__file__", str(fake_router)):
+            fake_paths = mock.Mock(install_root=install_root)
+            with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=fake_paths):
                 context = build_context(self.event(), project_root=project, pending={})
             command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
 
@@ -953,7 +959,7 @@ class VibeMemoryRouterTest(unittest.TestCase):
 
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["root"], str(project))
-            self.assertEqual(payload["argv"][0], "propose")
+            self.assertEqual(payload["argv"][:2], ["memory", "propose"])
             self.assertFalse((temp / "injected").exists())
             self.assertFalse((temp / "injected2").exists())
 

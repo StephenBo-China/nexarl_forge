@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import subprocess
 from typing import Any
@@ -351,6 +352,9 @@ def project_title(root: pathlib.Path) -> str:
 
 
 def agent_candidate_protocol(root: pathlib.Path) -> str:
+    stable_cli = RUNTIME_PATHS.install_root / "current/scripts/vibe_memory_cli.py"
+    project_environment = shlex.quote(str(root))
+    cli_command = shlex.quote(str(stable_cli))
     return f"""## Agent-Generated Memory Candidates
 
 The active conversation model performs candidate summarization itself. Hooks
@@ -381,7 +385,7 @@ pending and approved memory before writing.
 Write a distilled candidate with:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT={root} python3 {APP_ROOT}/scripts/memory_review.py propose \\
+MEMORY_REVIEW_PROJECT_ROOT={project_environment} python3 {cli_command} memory propose \\
   --scope personal|project --target long|short --category CATEGORY \\
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```

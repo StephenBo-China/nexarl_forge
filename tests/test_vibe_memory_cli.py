@@ -24,6 +24,142 @@ import vibe_memory_cli
 import vibe_memory_router
 
 
+class VibeMemoryLifecycleTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.home = pathlib.Path(self.temporary.name) / "home"
+        self.home.mkdir()
+        self.paths = vibe_memory_cli.vibe_memory_paths.for_home(self.home)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def invoke(self, argv: list[str]) -> tuple[int, object, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths), \
+                contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = vibe_memory_cli.main(argv)
+        output = stdout.getvalue()
+        return code, json.loads(output) if output else None, stderr.getvalue()
+
+    def test_doctor_json_has_exact_stable_keys_and_exit_semantics(self) -> None:
+        healthy = {name: {"ok": True, "status": "current"} for name in (
+            "runtime", "codex_hooks", "claude_hooks", "service", "data"
+        )}
+        with mock.patch("vibe_memory_cli.collect_status", return_value=healthy):
+            code, output, _ = self.invoke(["doctor", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(set(output), {"runtime", "codex_hooks", "claude_hooks", "service", "data"})
+        self.assertTrue(all(set(item) >= {"ok", "status"} for item in output.values()))
+
+        unhealthy = dict(healthy)
+        unhealthy["service"] = {"ok": False, "status": "unreachable", "action": "start service"}
+        with mock.patch("vibe_memory_cli.collect_status", return_value=unhealthy):
+            code, output, _ = self.invoke(["doctor", "--json"])
+        self.assertEqual(code, 1)
+        self.assertFalse(output["service"]["ok"])
+
+    def test_install_delegates_runtime_plist_and_hooks_without_launchctl(self) -> None:
+        runtime = self.paths.install_root / "current"
+        args = ["install", "--source-root", "/portable/source", "--with-claude-hooks"]
+        with mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", return_value={"version": "1.0.0"}) as install, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.prepare_data", return_value={"files": []}) as prepare, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
+                mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created"}, {"status": "created"}]) as repair, \
+                mock.patch("vibe_memory_cli.subprocess.run") as run:
+            code, output, _ = self.invoke(args)
+        self.assertEqual(code, 0)
+        install.assert_called_once_with(pathlib.Path("/portable/source"), self.paths)
+        prepare.assert_called_once_with(self.paths)
+        render.assert_called_once_with(self.paths, port=8897)
+        write.assert_called_once()
+        self.assertEqual(repair.call_args_list, [
+            mock.call(self.home / ".codex/hooks.json", "codex", runtime),
+            mock.call(self.home / ".claude/settings.json", "claude-code", runtime),
+        ])
+        run.assert_not_called()
+        self.assertEqual(output["status"], "installed")
+
+    def test_install_error_is_nonzero_and_not_hook_degraded(self) -> None:
+        with mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", side_effect=ValueError("unsafe source")):
+            code, output, stderr = self.invoke(["install", "--source-root", "/bad"])
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertIn("install failed", stderr)
+        self.assertNotIn("degraded", stderr)
+
+    def test_open_only_invokes_usr_bin_open_after_loopback_health(self) -> None:
+        with mock.patch("vibe_memory_cli.health_ok", return_value=True), mock.patch(
+            "vibe_memory_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)
+        ) as run:
+            code, output, _ = self.invoke(["open"])
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(["/usr/bin/open", "http://127.0.0.1:8897/"], check=False)
+        self.assertEqual(output["status"], "opened")
+
+        with mock.patch("vibe_memory_cli.health_ok", return_value=False), mock.patch(
+            "vibe_memory_cli.subprocess.run"
+        ) as run:
+            code, output, stderr = self.invoke(["open"])
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertIn("health", stderr)
+        run.assert_not_called()
+
+    def test_project_register_list_unregister_and_explicit_init(self) -> None:
+        notes = pathlib.Path(self.temporary.name) / "notes"
+        notes.mkdir()
+        registry = self.paths.project_registry
+        with mock.patch.object(vibe_memory_cli.memory_project, "REGISTRY_PATH", registry):
+            code, registered, _ = self.invoke(["project", "register", str(notes)])
+            self.assertEqual(code, 0)
+            self.assertEqual(registered["current_project"], str(notes.resolve()))
+            self.assertFalse((notes / "codex").exists())
+
+            code, listed, _ = self.invoke(["project", "list"])
+            self.assertEqual(code, 0)
+            self.assertEqual(listed["current_project"], str(notes.resolve()))
+
+            code, initialized, _ = self.invoke(["project", "init", str(notes)])
+            self.assertEqual(code, 0)
+            self.assertTrue(initialized["ok"])
+            self.assertTrue((notes / "codex/codex_long_memory.md").exists())
+
+            code, removed, _ = self.invoke(["project", "unregister", str(notes)])
+            self.assertEqual(code, 0)
+            self.assertEqual(removed["current_project"], "")
+            self.assertEqual(removed["projects"], [])
+
+    def test_memory_commands_delegate_to_review_apis(self) -> None:
+        candidate = {"id": "candidate-1", "status": "pending", "scope": "personal", "target": "personal_long", "risk_flags": [], "summary": "summary", "content": "content"}
+        with mock.patch("vibe_memory_cli.memory_review_queue.create_agent_candidate", return_value=candidate) as propose:
+            code, output, _ = self.invoke(["memory", "propose", "--scope", "personal", "--target", "long", "--category", "work_style", "--title", "Title", "--summary", "Summary", "--source-agent", "codex", "--policy-version", "2"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["id"], "candidate-1")
+        propose.assert_called_once_with("personal", "long", "work_style", "Title", "Summary", "agent_summary", source_agent="codex", policy_version=2)
+
+        with mock.patch("vibe_memory_cli.memory_review_queue.approve", return_value=candidate) as approve:
+            code, output, _ = self.invoke(["memory", "approve", "candidate-1", "--target", "personal_long"])
+        self.assertEqual(code, 0)
+        approve.assert_called_once_with("candidate-1", target="personal_long", content=None)
+        self.assertEqual(output["status"], "approved")
+
+
+class InstallScriptContractTest(unittest.TestCase):
+    def test_install_script_exact_contract_and_is_executable(self) -> None:
+        script = ROOT / "install.sh"
+        self.assertEqual(script.read_text(encoding="utf-8"), """#!/usr/bin/env bash
+set -euo pipefail
+SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec /usr/bin/python3 "${SOURCE_ROOT}/scripts/vibe_memory_cli.py" install --source-root "${SOURCE_ROOT}" "$@"
+""")
+        self.assertTrue(os.access(script, os.X_OK))
+        completed = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
 class VibeMemoryCLIUnitTest(unittest.TestCase):
     def test_hook_command_treats_empty_stdin_as_empty_object(self) -> None:
         args = argparse.Namespace(agent="codex", event="UserPromptSubmit")
@@ -141,6 +277,17 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
             timeout=timeout,
         )
 
+    def run_lifecycle(self, cwd: pathlib.Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(CLI), *arguments],
+            cwd=cwd,
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+
     def write_registry(self, *roots: pathlib.Path) -> None:
         self.registry.write_text(
             json.dumps(
@@ -151,6 +298,49 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def test_real_project_and_memory_lifecycle_preserves_approval_gate(self) -> None:
+        notes = self.base / "plain-notes"
+        notes.mkdir()
+        registered = self.run_lifecycle(notes, "project", "register", str(notes))
+        self.assertEqual(registered.returncode, 0, registered.stderr)
+        self.assertEqual(json.loads(registered.stdout)["current_project"], str(notes.resolve()))
+        self.assertFalse((notes / "codex").exists())
+
+        initialized = self.run_lifecycle(notes, "project", "init", str(notes))
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
+        instructions = (notes / "AGENTS.md").read_text(encoding="utf-8")
+        stable_cli = self.home / "Library/Application Support/VibeMemory/current/scripts/vibe_memory_cli.py"
+        self.assertIn(str(stable_cli), instructions)
+        self.assertIn("memory propose", instructions)
+        self.assertNotIn(str(ROOT / "scripts/memory_review.py"), instructions)
+        proposed = self.run_lifecycle(
+            notes,
+            "memory", "propose",
+            "--scope", "personal",
+            "--target", "long",
+            "--category", "work_style",
+            "--title", "Review before promotion",
+            "--summary", "The user prefers approval before durable memory promotion.",
+            "--source-agent", "codex",
+            "--policy-version", "1",
+        )
+        self.assertEqual(proposed.returncode, 0, proposed.stderr)
+        candidate_id = json.loads(proposed.stdout)["id"]
+        long_path = self.home / ".codex/personal_memory/long.md"
+        self.assertNotIn("Review before promotion", long_path.read_text(encoding="utf-8"))
+
+        listed = self.run_lifecycle(notes, "memory", "list", "--status", "pending")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(candidate_id, [item["id"] for item in json.loads(listed.stdout)["items"]])
+        shown = self.run_lifecycle(notes, "memory", "show", candidate_id)
+        self.assertEqual(json.loads(shown.stdout)["id"], candidate_id)
+
+        approved = self.run_lifecycle(
+            notes, "memory", "approve", candidate_id, "--target", "personal_long"
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        self.assertIn("Review before promotion", long_path.read_text(encoding="utf-8"))
 
     def test_unregistered_codex_event_returns_personal_context_without_creating_codex(self) -> None:
         registered = self.base / "registered"
@@ -210,6 +400,11 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"Registered project: `{project.resolve()}`", context)
         self.assertIn("source agent: claude-code", context)
+        self.assertIn(
+            str(self.home / "Library/Application Support/VibeMemory/current/scripts/vibe_memory_cli.py"),
+            context,
+        )
+        self.assertIn("memory propose", context)
         self.assertNotIn("do not save", context)
         queue = json.loads((codex / "memory_review_queue.json").read_text(encoding="utf-8"))
         self.assertEqual(queue["counts"]["project_pending"], 1)

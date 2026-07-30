@@ -7,6 +7,7 @@ import pathlib
 import plistlib
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1810,6 +1811,71 @@ class RuntimeInstallTest(unittest.TestCase):
                 ):
                     with self.assertRaises((KeyError, ValueError, plistlib.InvalidFileException)):
                         vibe_memory_install.render_launch_agent(paths)
+
+    def test_install_launch_agent_is_atomic_and_rejects_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            target = pathlib.Path(value) / "home/Library/LaunchAgents/com.noema.vibe-memory.plist"
+
+            result = vibe_memory_install.install_launch_agent(paths, "first\n")
+            self.assertEqual(result, {"changed": True, "path": str(target)})
+            self.assertEqual(target.read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+            self.assertEqual(
+                vibe_memory_install.install_launch_agent(paths, "first\n"),
+                {"changed": False, "path": str(target)},
+            )
+
+            target.unlink()
+            outside = pathlib.Path(value) / "outside"
+            outside.write_text("preserve", encoding="utf-8")
+            target.symlink_to(outside)
+            with self.assertRaises(ValueError):
+                vibe_memory_install.install_launch_agent(paths, "replacement\n")
+            self.assertEqual(outside.read_text(encoding="utf-8"), "preserve")
+
+    def test_prepare_data_creates_private_defaults_without_overwriting(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            first = vibe_memory_install.prepare_data(paths)
+            self.assertTrue(all(item["status"] == "created" for item in first["files"]))
+            long_memory = paths.personal_memory / "long.md"
+            long_memory.write_text("approved content\n", encoding="utf-8")
+
+            second = vibe_memory_install.prepare_data(paths)
+            self.assertTrue(all(item["status"] == "existing" for item in second["files"]))
+            self.assertEqual(long_memory.read_text(encoding="utf-8"), "approved content\n")
+            registry = json.loads(paths.project_registry.read_text(encoding="utf-8"))
+            self.assertEqual(registry, {"current_project": "", "projects": []})
+            for path in (
+                paths.personal_memory / "long.md",
+                paths.personal_memory / "short.md",
+                paths.personal_memory / "proposals.md",
+                paths.project_registry,
+            ):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_installed_current_cli_runs_with_system_python_without_clone_path(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(ROOT, paths)
+            cli = paths.install_root / "current/scripts/vibe_memory_cli.py"
+            environment = os.environ.copy()
+            environment.update({"HOME": str(root / "home"), "PYTHONDONTWRITEBYTECODE": "1"})
+            completed = subprocess.run(
+                ["/usr/bin/python3", str(cli), "status"],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(
+                set(json.loads(completed.stdout)),
+                {"runtime", "codex_hooks", "claude_hooks", "service", "data"},
+            )
+            self.assertNotIn("/Users/stephenbo", completed.stdout)
 
 
 if __name__ == "__main__":

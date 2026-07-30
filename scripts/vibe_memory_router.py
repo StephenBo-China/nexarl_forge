@@ -272,9 +272,16 @@ def build_context(
         ]
     required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
+    stable_cli = (
+        vibe_memory_paths.for_home().install_root
+        / "current"
+        / "scripts"
+        / "vibe_memory_cli.py"
+    )
     command_parts.extend(
         [
-            str(pathlib.Path(__file__).resolve().parent / "memory_review.py"),
+            str(stable_cli),
+            "memory",
             "propose",
             "--scope",
             "personal",

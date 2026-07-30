@@ -1093,3 +1093,107 @@ def render_launch_agent(paths: RuntimePaths, port: int = 8897) -> str:
         raise ValueError("rendered launch agent is not a valid plist") from error
     _validate_launch_agent(plist, runtime, port)
     return rendered
+
+
+def install_launch_agent(paths: RuntimePaths, content: str) -> dict[str, object]:
+    """Atomically install the managed LaunchAgent without following symlinks."""
+    home = pathlib.Path(paths.personal_memory).parents[1]
+    parent = home / "Library" / "LaunchAgents"
+    _validate_install_ancestor_chain(parent)
+    canonical_parent = _canonical_install_path(parent)
+    parent_fd = _open_or_create_directory_chain(canonical_parent)
+    name = "com.noema.vibe-memory.plist"
+    target = parent / name
+    encoded = content.encode("utf-8")
+    try:
+        if _entry_exists(parent_fd, name):
+            current = _read_regular_file_at(parent_fd, name, target)
+            if current == encoded:
+                return {"changed": False, "path": str(target)}
+        temporary_name = f".{name}.tmp-{uuid.uuid4().hex}"
+        descriptor = os.open(
+            temporary_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            offset = 0
+            while offset < len(encoded):
+                written = os.write(descriptor, encoded[offset:])
+                if written <= 0:
+                    raise OSError("short LaunchAgent write")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            if _entry_exists(parent_fd, name):
+                metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("LaunchAgent target must be a regular file")
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        return {"changed": True, "path": str(target)}
+    finally:
+        os.close(parent_fd)
+
+
+def _ensure_private_data_file(path: pathlib.Path, content: str) -> dict[str, str]:
+    _validate_install_ancestor_chain(path.parent)
+    parent_fd = _open_or_create_directory_chain(_canonical_install_path(path.parent))
+    try:
+        if _entry_exists(parent_fd, path.name):
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"managed data path must be a regular file: {path}")
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                os.fchmod(descriptor, 0o600)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return {"path": str(path), "status": "existing"}
+        _write_file_at(content.encode("utf-8"), parent_fd, path.name)
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        os.fsync(parent_fd)
+        return {"path": str(path), "status": "created"}
+    finally:
+        os.close(parent_fd)
+
+
+def prepare_data(paths: RuntimePaths) -> dict[str, list[dict[str, str]]]:
+    """Create only missing private data roots and empty governance files."""
+    defaults = (
+        (paths.personal_memory / "long.md", "# Personal Codex Long Memory\n"),
+        (paths.personal_memory / "short.md", "# Personal Codex Short Memory\n"),
+        (paths.personal_memory / "proposals.md", "# Personal Memory Proposals\n"),
+        (
+            paths.project_registry,
+            json.dumps({"current_project": "", "projects": []}, indent=2, sort_keys=True) + "\n",
+        ),
+    )
+    return {"files": [_ensure_private_data_file(path, content) for path, content in defaults]}
