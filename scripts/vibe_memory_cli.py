@@ -97,6 +97,39 @@ def health_ok(paths: vibe_memory_paths.RuntimePaths, timeout: float = 0.6) -> bo
     return bool(health_status(paths, timeout=timeout)["ok"])
 
 
+def _persisted_python_status(
+    paths: vibe_memory_paths.RuntimePaths,
+) -> tuple[str | None, str | None]:
+    """Return the recorded interpreter or a doctor-safe Python diagnostic."""
+    config_path = paths.install_root / "config.json"
+    try:
+        value = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, "python: persisted runtime configuration is unreadable"
+    if not isinstance(value, dict):
+        return None, "python: persisted runtime configuration is invalid"
+    executable = value.get("python_executable")
+    version = value.get("python_version")
+    if not isinstance(executable, str) or not executable:
+        return None, "python: persisted interpreter is missing"
+    if not isinstance(version, str):
+        return None, "python: persisted interpreter version is missing"
+    parts = version.split(".")
+    if len(parts) != 2 or not all(part.isdigit() for part in parts):
+        return None, "python: persisted interpreter version is invalid"
+    recorded = (int(parts[0]), int(parts[1]))
+    if recorded < vibe_memory_install.MINIMUM_PYTHON:
+        return None, "python: persisted interpreter must be Python 3.10 or newer"
+    try:
+        validated = vibe_memory_install.validate_python(executable)
+        actual = vibe_memory_install.probe_python(validated)
+    except vibe_memory_install.InstallError:
+        return None, "python: persisted interpreter is unavailable or below Python 3.10"
+    if actual != recorded:
+        return None, "python: persisted interpreter version does not match the executable"
+    return validated, None
+
+
 def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str, object]]:
     runtime = paths.install_root / "current"
     runtime_cli = runtime / "scripts" / "vibe_memory_cli.py"
@@ -115,22 +148,26 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
         )
     except FileNotFoundError:
         launcher_ok = False
-    try:
-        runtime_config = vibe_memory_install.read_runtime_config(paths)
-        interpreter_ok = isinstance(runtime_config.get("python_executable"), str)
-    except (OSError, ValueError, vibe_memory_install.InstallError):
-        interpreter_ok = False
-    if launcher_ok:
+    persisted_python, python_error = _persisted_python_status(paths)
+    if python_error is None:
         try:
-            launcher_ok = launcher.read_text(encoding="utf-8") == vibe_memory_install.render_launcher(paths)
+            vibe_memory_install.read_runtime_config(paths)
+        except (OSError, ValueError, vibe_memory_install.InstallError):
+            python_error = "python: persisted runtime configuration is invalid"
+    interpreter_ok = python_error is None
+    if launcher_ok and persisted_python is not None:
+        try:
+            launcher_ok = launcher.read_text(encoding="utf-8") == vibe_memory_install.render_launcher(
+                paths, python_executable=persisted_python
+            )
         except (OSError, ValueError, vibe_memory_install.InstallError):
             launcher_ok = False
     if not current_ok:
         runtime_status = "missing"
+    elif not interpreter_ok:
+        runtime_status = "python_error"
     elif not launcher_ok:
         runtime_status = "launcher_invalid" if launcher_present else "launcher_missing"
-    elif not interpreter_ok:
-        runtime_status = "python_invalid"
     else:
         runtime_status = "current"
     runtime_ok = runtime_status == "current"
@@ -146,14 +183,17 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
     )
     data_ok = all(path.is_file() and not path.is_symlink() for path in data_files)
     service = health_status(paths)
+    runtime_entry: dict[str, object] = {
+        "ok": runtime_ok,
+        "status": runtime_status,
+        "path": str(runtime),
+        "launcher": str(launcher),
+        "action": None if runtime_ok else "run install",
+    }
+    if python_error is not None:
+        runtime_entry["error"] = python_error
     return {
-        "runtime": {
-            "ok": runtime_ok,
-            "status": runtime_status,
-            "path": str(runtime),
-            "launcher": str(launcher),
-            "action": None if runtime_ok else "run install",
-        },
+        "runtime": runtime_entry,
         "codex_hooks": {
             "ok": codex["status"] == "current",
             "status": codex["status"],
@@ -261,6 +301,7 @@ def install_command(args: argparse.Namespace) -> int:
         hook_targets.append((home / ".claude/settings.json", "claude-code", "claude"))
     launch_agent = paths.launch_agent
     runtime_config_path = paths.install_root / "config.json"
+    install_state_path = vibe_memory_install.install_state_path(paths)
     try:
         python_executable = vibe_memory_install.discover_python()
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
@@ -281,6 +322,7 @@ def install_command(args: argparse.Namespace) -> int:
         snapshots[launch_agent] = _snapshot_managed_file(launch_agent)
         snapshots[runtime_config_path] = _snapshot_managed_file(runtime_config_path)
         snapshots[launcher] = _snapshot_managed_file(launcher)
+        snapshots[install_state_path] = _snapshot_managed_file(install_state_path)
         current_before = _snapshot_current(runtime)
     except Exception:
         _json({"status": "failed", "phase": "preflight", "error": "installation preflight failed"})
@@ -315,11 +357,24 @@ def install_command(args: argparse.Namespace) -> int:
             rollback_paths.add(target)
             attempted_hook_targets.add(target)
             hooks[name] = vibe_memory_hooks.repair(target, agent, launcher)
+        clients = ["codex"] + (["claude-code"] if args.with_claude_hooks else [])
+        rollback_paths.add(install_state_path)
+        vibe_memory_install.write_install_state(
+            paths,
+            vibe_memory_install._install_state_document(
+                current_version=installed["version"],
+                previous_version=None,
+                port=args.port,
+                installed_clients=clients,
+                python_executable=python_executable,
+            ),
+        )
         _json({
             "status": "installed",
             "runtime": installed,
             "runtime_config": runtime_config,
             "launcher": launcher_result,
+            "install_state": {"path": str(install_state_path)},
             "control_plane": control_plane,
             "data": data,
             "launch_agent": plist_result,

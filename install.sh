@@ -22,4 +22,5 @@ if [ -z "${PYTHON}" ]; then
 fi
 
 export VIBE_MEMORY_PYTHON="${PYTHON}"
-exec "$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py" install --source-root "${SOURCE_ROOT}" "$@"
+"$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py" install --source-root "${SOURCE_ROOT}" "$@"
+"$HOME/.local/bin/vibe-memory" doctor --json

@@ -101,6 +101,57 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(result["runtime"]["status"], "launcher_invalid")
         self.assertEqual(result["runtime"]["action"], "run install")
 
+    def test_doctor_reports_missing_persisted_python_as_python_error(self) -> None:
+        release = self.paths.install_root / "releases/1.0.0/scripts"
+        release.mkdir(parents=True)
+        (release / "vibe_memory_cli.py").write_text("# cli\n", encoding="utf-8")
+        (self.paths.install_root / "current").symlink_to("releases/1.0.0")
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        config_path = self.paths.install_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        del config["python_executable"]
+        del config["python_version"]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        vibe_memory_cli.vibe_memory_install.install_launcher(
+            self.paths, python_executable=sys.executable
+        )
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "python_error")
+        self.assertIn("python", result["runtime"]["error"])
+
+    def test_doctor_reports_low_persisted_python_without_launcher_fallback(self) -> None:
+        release = self.paths.install_root / "releases/1.0.0/scripts"
+        release.mkdir(parents=True)
+        (release / "vibe_memory_cli.py").write_text("# cli\n", encoding="utf-8")
+        (self.paths.install_root / "current").symlink_to("releases/1.0.0")
+        config_path = self.paths.install_root / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "app_version": "1.0.0",
+            "port": 9123,
+            "python_executable": "/usr/bin/python3",
+            "python_version": "3.9",
+            "schema_version": 1,
+            "service": "vibe-memory",
+        }), encoding="utf-8")
+        self.paths.launcher.parent.mkdir(parents=True)
+        self.paths.launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        self.paths.launcher.chmod(0o700)
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "python_error")
+        self.assertIn("3.10", result["runtime"]["error"])
+
     def test_install_delegates_runtime_plist_and_hooks_without_launchctl(self) -> None:
         runtime = self.paths.install_root / "current"
         launcher = self.paths.launcher
@@ -112,6 +163,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_runtime_config", return_value="{}\n") as render_config, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime_config", return_value={"changed": True}) as install_config, \
+                mock.patch("vibe_memory_cli.vibe_memory_install._install_state_document", return_value={"state": True}) as state_document, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.write_install_state") as write_state, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launcher", return_value="#!/bin/sh\n") as render_launcher, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launcher", return_value={"changed": True, "path": "launcher"}) as install_launcher, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
@@ -143,6 +196,14 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable="/opt/homebrew/bin/python3",
         )
+        state_document.assert_called_once_with(
+            current_version="1.0.0",
+            previous_version=None,
+            port=8897,
+            installed_clients=["codex", "claude-code"],
+            python_executable="/opt/homebrew/bin/python3",
+        )
+        write_state.assert_called_once_with(self.paths, {"state": True})
         write.assert_called_once()
         validate_control.assert_called_once()
         self.assertIs(validate_control.call_args.args[0], self.paths)
@@ -286,6 +347,18 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         ])
         self.assertEqual(code, 0, stderr)
         self.assertEqual(output["status"], "installed")
+        install_state = json.loads(
+            (self.paths.install_root / "state/install.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(install_state["current_version"], "1.0.0")
+        self.assertIsNone(install_state["previous_version"])
+        self.assertEqual(install_state["port"], 9123)
+        self.assertEqual(install_state["installed_clients"], ["codex", "claude-code"])
+        persisted_config = json.loads(
+            (self.paths.install_root / "config.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(install_state["python_executable"], persisted_config["python_executable"])
+        self.assertEqual(install_state["python_version"], persisted_config["python_version"])
         runtime_config = self.paths.install_root / "config.json"
         persisted = json.loads(runtime_config.read_text(encoding="utf-8"))
         self.assertEqual(persisted["app_version"], "1.0.0")
@@ -589,7 +662,8 @@ class InstallScriptContractTest(unittest.TestCase):
         self.assertIn('VIBE_MEMORY_PYTHON', text)
         self.assertIn('command -v python3', text)
         self.assertIn('sys.version_info >= (3, 10)', text)
-        self.assertIn('exec "$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py"', text)
+        self.assertIn('"$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py"', text)
+        self.assertIn('"$HOME/.local/bin/vibe-memory" doctor --json', text)
         self.assertNotIn('exec /usr/bin/python3', text)
         self.assertTrue(os.access(script, os.X_OK))
         completed = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, check=False)
