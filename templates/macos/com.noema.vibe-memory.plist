@@ -6,7 +6,7 @@
   <string>com.noema.vibe-memory</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
+    <string>${PYTHON}</string>
     <string>${RUNTIME}/scripts/memory_review_server.py</string>
   </array>
   <key>EnvironmentVariables</key>

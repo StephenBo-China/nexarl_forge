@@ -13,6 +13,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import vibe_memory_paths
+import vibe_memory_install
 
 
 class RuntimePathsTest(unittest.TestCase):
@@ -27,8 +28,28 @@ class RuntimePathsTest(unittest.TestCase):
         self.assertEqual(paths.ui_design_home, home / ".codex/ui_design")
         self.assertEqual(paths.worktree_manager, home / ".codex/worktree_manager")
         self.assertEqual(paths.worktree_root, home / "Projects/worktrees")
+        self.assertEqual(paths.launcher, home / ".local/bin/vibe-memory")
+        self.assertEqual(
+            paths.launch_agent,
+            home / "Library/LaunchAgents/com.noema.vibe-memory.plist",
+        )
         with self.assertRaises(AttributeError):
             paths.personal_memory = home
+
+    def test_discover_python_rejects_39_and_selects_first_310_candidate(self) -> None:
+        probes = {
+            "/usr/bin/python3": (3, 9),
+            "/opt/homebrew/bin/python3": (3, 11),
+        }
+
+        self.assertEqual(
+            vibe_memory_install.discover_python(lambda path: probes.get(path)),
+            "/opt/homebrew/bin/python3",
+        )
+
+    def test_discover_python_fails_safely_when_no_310_candidate_exists(self) -> None:
+        with self.assertRaisesRegex(vibe_memory_install.InstallError, "3\\.10"):
+            vibe_memory_install.discover_python(lambda _path: (3, 9))
 
     def test_release_manifest_is_supported_on_macos(self) -> None:
         manifest = vibe_memory_paths.read_release_manifest(ROOT / "release.json")

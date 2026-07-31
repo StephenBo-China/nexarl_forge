@@ -100,10 +100,43 @@ def health_ok(paths: vibe_memory_paths.RuntimePaths, timeout: float = 0.6) -> bo
 def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str, object]]:
     runtime = paths.install_root / "current"
     runtime_cli = runtime / "scripts" / "vibe_memory_cli.py"
-    runtime_ok = runtime.is_symlink() and runtime_cli.is_file()
+    launcher = paths.launcher
+    current_ok = runtime.is_symlink() and runtime_cli.is_file()
+    launcher_present = False
+    try:
+        launcher_metadata = launcher.stat(follow_symlinks=False)
+        launcher_present = True
+        launcher_ok = (
+            stat.S_ISREG(launcher_metadata.st_mode)
+            and not launcher.is_symlink()
+            and bool(launcher_metadata.st_mode & stat.S_IXUSR)
+            and stat.S_IMODE(launcher_metadata.st_mode) == 0o700
+            and os.access(launcher, os.X_OK)
+        )
+    except FileNotFoundError:
+        launcher_ok = False
+    try:
+        runtime_config = vibe_memory_install.read_runtime_config(paths)
+        interpreter_ok = isinstance(runtime_config.get("python_executable"), str)
+    except (OSError, ValueError, vibe_memory_install.InstallError):
+        interpreter_ok = False
+    if launcher_ok:
+        try:
+            launcher_ok = launcher.read_text(encoding="utf-8") == vibe_memory_install.render_launcher(paths)
+        except (OSError, ValueError, vibe_memory_install.InstallError):
+            launcher_ok = False
+    if not current_ok:
+        runtime_status = "missing"
+    elif not launcher_ok:
+        runtime_status = "launcher_invalid" if launcher_present else "launcher_missing"
+    elif not interpreter_ok:
+        runtime_status = "python_invalid"
+    else:
+        runtime_status = "current"
+    runtime_ok = runtime_status == "current"
     home = _home(paths)
-    codex = vibe_memory_hooks.status(home / ".codex/hooks.json", "codex", runtime)
-    claude = vibe_memory_hooks.status(home / ".claude/settings.json", "claude-code", runtime)
+    codex = vibe_memory_hooks.status(home / ".codex/hooks.json", "codex", launcher)
+    claude = vibe_memory_hooks.status(home / ".claude/settings.json", "claude-code", launcher)
     personal = paths.personal_memory
     data_files = (
         personal / "long.md",
@@ -116,8 +149,9 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
     return {
         "runtime": {
             "ok": runtime_ok,
-            "status": "current" if runtime_ok else "missing",
+            "status": runtime_status,
             "path": str(runtime),
+            "launcher": str(launcher),
             "action": None if runtime_ok else "run install",
         },
         "codex_hooks": {
@@ -220,18 +254,25 @@ def _restore_current(path: pathlib.Path, before: str | None, installed_version: 
 def install_command(args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
     runtime = paths.install_root / "current"
+    launcher = paths.launcher
     home = _home(paths)
     hook_targets = [(home / ".codex/hooks.json", "codex", "codex")]
     if args.with_claude_hooks:
         hook_targets.append((home / ".claude/settings.json", "claude-code", "claude"))
-    launch_agent = home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+    launch_agent = paths.launch_agent
     runtime_config_path = paths.install_root / "config.json"
     try:
+        python_executable = vibe_memory_install.discover_python()
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
-        plist = vibe_memory_install.render_launch_agent(paths, port=args.port)
-        vibe_memory_install.render_runtime_config(args.port, validated["version"])
+        plist = vibe_memory_install.render_launch_agent(
+            paths, port=args.port, python_executable=python_executable
+        )
+        vibe_memory_install.render_runtime_config(
+            args.port, validated["version"], python_executable=python_executable
+        )
+        vibe_memory_install.render_launcher(paths, python_executable=python_executable)
         for target, agent, _name in hook_targets:
-            vibe_memory_hooks.preview(target, agent, runtime)
+            vibe_memory_hooks.preview(target, agent, launcher)
         snapshots = {target: _snapshot_managed_file(target) for target, _agent, _name in hook_targets}
         hook_backups = {
             target: _hook_backup_artifacts(target)
@@ -239,6 +280,7 @@ def install_command(args: argparse.Namespace) -> int:
         }
         snapshots[launch_agent] = _snapshot_managed_file(launch_agent)
         snapshots[runtime_config_path] = _snapshot_managed_file(runtime_config_path)
+        snapshots[launcher] = _snapshot_managed_file(launcher)
         current_before = _snapshot_current(runtime)
     except Exception:
         _json({"status": "failed", "phase": "preflight", "error": "installation preflight failed"})
@@ -253,7 +295,14 @@ def install_command(args: argparse.Namespace) -> int:
         data = vibe_memory_install.prepare_data(paths)
         rollback_paths.add(runtime_config_path)
         runtime_config = vibe_memory_install.install_runtime_config(
-            paths, port=args.port, app_version=installed["version"]
+            paths,
+            port=args.port,
+            app_version=installed["version"],
+            python_executable=python_executable,
+        )
+        rollback_paths.add(launcher)
+        launcher_result = vibe_memory_install.install_launcher(
+            paths, python_executable=python_executable
         )
         control_plane = vibe_memory_migration.validate_control_plane(
             paths, _registry_snapshot(paths)
@@ -265,11 +314,12 @@ def install_command(args: argparse.Namespace) -> int:
         for target, agent, name in hook_targets:
             rollback_paths.add(target)
             attempted_hook_targets.add(target)
-            hooks[name] = vibe_memory_hooks.repair(target, agent, runtime)
+            hooks[name] = vibe_memory_hooks.repair(target, agent, launcher)
         _json({
             "status": "installed",
             "runtime": installed,
             "runtime_config": runtime_config,
+            "launcher": launcher_result,
             "control_plane": control_plane,
             "data": data,
             "launch_agent": plist_result,

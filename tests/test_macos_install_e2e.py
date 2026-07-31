@@ -67,7 +67,7 @@ def _digest_tree(root: pathlib.Path, *, skip: set[str]) -> str:
 def _business_data_digest(home: pathlib.Path) -> str:
     return _digest_tree(
         home,
-        skip={"Library", ".codex/hooks.json", ".claude/settings.json"},
+        skip={"Library", ".local", ".codex/hooks.json", ".claude/settings.json"},
     )
 
 
@@ -87,7 +87,7 @@ class MacOSInstallE2ETest(unittest.TestCase):
             self.assertIn("--agent codex", (home / ".codex/hooks.json").read_text(encoding="utf-8"))
             self.assertFalse((home / ".claude/settings.json").exists())
             self.assertEqual(
-                vibe_memory_hooks.status(home / ".codex/hooks.json", "codex", runtime)["status"],
+                vibe_memory_hooks.status(home / ".codex/hooks.json", "codex", paths.launcher)["status"],
                 "current",
             )
             self.assertEqual(

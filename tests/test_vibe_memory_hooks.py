@@ -19,17 +19,27 @@ import vibe_memory_hooks as hooks
 
 
 class ManagedCommandTest(unittest.TestCase):
+    def test_command_uses_the_stable_launcher_not_usr_bin_python3(self) -> None:
+        launcher = pathlib.Path("/Users/test/.local/bin/vibe-memory")
+
+        self.assertEqual(
+            hooks.command(launcher, "codex", "Stop"),
+            '"/Users/test/.local/bin/vibe-memory" hook --agent codex --event Stop',
+        )
+
     def test_generated_command_executes_in_bin_sh_without_marker_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             runtime = pathlib.Path(value) / 'runtime with "quotes" and \'apostrophe\''
-            script = runtime / "scripts" / "vibe_memory_cli.py"
-            script.parent.mkdir(parents=True)
-            script.write_text(
-                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n", encoding="utf-8"
+            launcher = runtime / ".local/bin/vibe-memory"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text(
+                "#!/usr/bin/env python3\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
             )
+            launcher.chmod(0o700)
 
             result = subprocess.run(
-                ["/bin/sh", "-c", hooks.command(runtime, "claude-code", "PostCompact")],
+                ["/bin/sh", "-c", hooks.command(launcher, "claude-code", "PostCompact")],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -43,19 +53,18 @@ class ManagedCommandTest(unittest.TestCase):
             )
 
     def test_command_covers_both_clients_and_shell_safe_runtime_paths(self) -> None:
-        runtime = '/tmp/Vibe Runtime/with "quotes" and \'apostrophe\''
+        runtime = '/tmp/Vibe Runtime/with "quotes" and \'apostrophe\'/.local/bin/vibe-memory'
 
         for agent in ("codex", "claude-code"):
             for event in hooks.EVENTS:
                 value = hooks.command(runtime, agent, event)
                 executable, *arguments = shlex.split(value.split(" # ", 1)[0])
-                self.assertEqual(executable, "/usr/bin/python3")
+                self.assertEqual(executable, os.path.abspath(runtime))
                 self.assertEqual(arguments, [
-                    str(pathlib.Path(os.path.abspath(runtime)) / "scripts" / "vibe_memory_cli.py"),
                     "hook", "--agent", agent,
                     "--event", event,
                 ])
-                self.assertIn(hooks.MANAGED_SIGNATURE, value)
+                self.assertNotIn("/usr/bin/python3", value)
 
     def test_command_rejects_unknown_agent_or_event(self) -> None:
         with self.assertRaisesRegex(ValueError, "agent"):
@@ -64,37 +73,52 @@ class ManagedCommandTest(unittest.TestCase):
             hooks.command("/runtime", "codex", "PreToolUse")
 
     def test_relative_runtime_is_resolved_and_repeated_merge_is_idempotent(self) -> None:
-        first = hooks.merge_document({"hooks": {}}, "codex", ".")
-        second = hooks.merge_document(first, "codex", ".")
+        launcher = ".local/bin/vibe-memory"
+        first = hooks.merge_document({"hooks": {}}, "codex", launcher)
+        second = hooks.merge_document(first, "codex", launcher)
 
         self.assertEqual(first, second)
         generated = first["hooks"]["Stop"][0]["hooks"][0]["command"]
-        script = shlex.split(generated.split(" # ", 1)[0])[1]
-        self.assertTrue(pathlib.Path(script).is_absolute())
+        executable = shlex.split(generated.split(" # ", 1)[0])[0]
+        self.assertTrue(pathlib.Path(executable).is_absolute())
         self.assertEqual(
-            pathlib.Path(script),
-            pathlib.Path.cwd().resolve() / "scripts" / "vibe_memory_cli.py",
+            pathlib.Path(executable),
+            pathlib.Path.cwd().resolve() / ".local/bin/vibe-memory",
         )
 
     def test_command_keeps_current_symlink_lexically_stable(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            install_root = pathlib.Path(value) / "Vibe Memory"
-            release = install_root / "releases/1.0.0"
-            release.mkdir(parents=True)
-            current = install_root / "current"
-            current.symlink_to("releases/1.0.0")
+            home = pathlib.Path(value) / "home"
+            launcher = home / ".local/bin/vibe-memory"
 
-            generated = hooks.command(current, "codex", "Stop")
-            script = shlex.split(generated.split(" # ", 1)[0])[1]
+            generated = hooks.command(launcher, "codex", "Stop")
+            executable = shlex.split(generated.split(" # ", 1)[0])[0]
 
             self.assertEqual(
-                script,
-                str(current / "scripts/vibe_memory_cli.py"),
+                executable,
+                str(launcher),
             )
-            self.assertNotIn("releases/1.0.0", script)
+            self.assertNotIn("releases/", executable)
 
 
 class MergeDocumentTest(unittest.TestCase):
+    def test_remove_managed_entries_removes_legacy_python_signature_only(self) -> None:
+        legacy = (
+            "/usr/bin/python3 /old/scripts/vibe_memory_cli.py hook "
+            "--agent codex --event Stop # vibe-memory hook --agent"
+        )
+        custom = "/usr/bin/python3 /old/scripts/vibe_memory_cli.py hook --agent codex --event Stop"
+        source = {"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": legacy},
+            {"type": "command", "command": custom},
+        ]}]}}
+
+        cleaned = hooks.remove_managed_entries(source)
+
+        self.assertEqual(cleaned["hooks"]["Stop"], [{"hooks": [{
+            "type": "command", "command": custom,
+        }]}])
+
     def test_prompt_handler_with_managed_command_shape_survives(self) -> None:
         prompt = {
             "type": "prompt",

@@ -90,16 +90,21 @@ def _validate_agent_event(agent: str, event: str) -> None:
 def command(runtime: str | pathlib.Path, agent: str, event: str) -> str:
     """Return a shell-safe managed hook command for one supported event."""
     _validate_agent_event(agent, event)
-    runtime_path = (
-        pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(runtime))))
-        / "scripts"
-        / "vibe_memory_cli.py"
+    launcher = pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(runtime))))
+    escaped = (
+        str(launcher)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("`", "\\`")
     )
-    executable = shlex.quote(str(runtime_path))
-    return (
-        f"/usr/bin/python3 {executable} hook --agent {agent} --event {event} "
-        f"# {MANAGED_SIGNATURE}"
-    )
+    rendered = f'"{escaped}" hook --agent {agent} --event {event}'
+    # New manager call sites pass the exact per-user stable launcher. Keep an
+    # ownership marker for older direct callers that still supply an arbitrary
+    # executable-like path, so cleanup never guesses at a custom command.
+    if launcher.parts[-3:] != (".local", "bin", "vibe-memory"):
+        return f"{rendered} # {MANAGED_SIGNATURE}"
+    return rendered
 
 
 def _require_document(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -118,6 +123,22 @@ def _is_managed_handler(handler: Any) -> bool:
         or not isinstance(handler.get("command"), str)
     ):
         return False
+    try:
+        tokens = shlex.split(handler["command"], comments=False, posix=True)
+    except ValueError:
+        return False
+    if len(tokens) == 6:
+        launcher, action, agent_flag, agent, event_flag, event = tokens
+        launcher_path = pathlib.PurePath(launcher)
+        return (
+            launcher_path.is_absolute()
+            and launcher_path.parts[-3:] == (".local", "bin", "vibe-memory")
+            and action == "hook"
+            and agent_flag == "--agent"
+            and agent in AGENTS
+            and event_flag == "--event"
+            and event in EVENTS
+        )
     marker = f" # {MANAGED_SIGNATURE}"
     if not handler["command"].endswith(marker):
         return False
@@ -126,6 +147,16 @@ def _is_managed_handler(handler: Any) -> bool:
         tokens = shlex.split(command_text, comments=False, posix=True)
     except ValueError:
         return False
+    if len(tokens) == 6:
+        executable, action, agent_flag, agent, event_flag, event = tokens
+        return (
+            pathlib.PurePath(executable).is_absolute()
+            and action == "hook"
+            and agent_flag == "--agent"
+            and agent in AGENTS
+            and event_flag == "--event"
+            and event in EVENTS
+        )
     if len(tokens) != 7:
         return False
     executable, script, action, agent_flag, agent, event_flag, event = tokens

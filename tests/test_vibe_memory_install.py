@@ -70,6 +70,46 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertTrue((paths.install_root / "current").is_symlink())
             self.assertEqual((paths.install_root / "current").resolve(), release.resolve())
 
+    def test_runtime_config_persists_validated_interpreter_and_launcher_uses_current(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+
+            result = vibe_memory_install.install_runtime_config(
+                paths,
+                port=18997,
+                app_version="1.0.0",
+                python_executable=sys.executable,
+            )
+            runtime = vibe_memory_install.read_runtime_config(paths)
+            launcher = vibe_memory_install.render_launcher(paths)
+
+            self.assertEqual(result["python_executable"], os.path.abspath(sys.executable))
+            self.assertEqual(runtime["python_executable"], os.path.abspath(sys.executable))
+            self.assertRegex(runtime["python_version"], r"^3\.(?:1[0-9]|[2-9][0-9])$")
+            self.assertIn(
+                f'exec "{os.path.abspath(sys.executable)}" "$RUNTIME/scripts/vibe_memory_cli.py" "$@"',
+                launcher,
+            )
+            self.assertIn('RUNTIME="$HOME/Library/Application Support/VibeMemory/current"', launcher)
+
+    def test_install_launcher_writes_private_executable_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            vibe_memory_install.install_runtime_config(
+                paths,
+                port=18997,
+                app_version="1.0.0",
+                python_executable=sys.executable,
+            )
+
+            result = vibe_memory_install.install_launcher(paths)
+
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["path"], str(paths.launcher))
+            self.assertEqual(stat.S_IMODE(paths.launcher.stat().st_mode), 0o700)
+            self.assertTrue(os.access(paths.launcher, os.X_OK))
+            self.assertIn("Vibe Memory stable launcher", paths.launcher.read_text(encoding="utf-8"))
+
     def test_install_does_not_require_optional_license(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -1769,14 +1809,18 @@ class RuntimeInstallTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="Vibe & Memory ") as value:
             paths = self.make_paths(pathlib.Path(value))
 
-            text = vibe_memory_install.render_launch_agent(paths, port=8897)
+            text = vibe_memory_install.render_launch_agent(
+                paths,
+                port=8897,
+                python_executable=sys.executable,
+            )
             plist = plistlib.loads(text.encode("utf-8"))
             runtime = str(paths.install_root / "current")
 
             self.assertEqual(plist["Label"], "com.noema.vibe-memory")
             self.assertEqual(
                 plist["ProgramArguments"],
-                ["/usr/bin/python3", runtime + "/scripts/memory_review_server.py"],
+                [os.path.abspath(sys.executable), runtime + "/scripts/memory_review_server.py"],
             )
             self.assertEqual(plist["EnvironmentVariables"], {
                 "MEMORY_REVIEW_HOST": "127.0.0.1",
@@ -1790,6 +1834,7 @@ class RuntimeInstallTest(unittest.TestCase):
 
     def test_template_retains_runtime_and_port_variables(self) -> None:
         template = (ROOT / "templates/macos/com.noema.vibe-memory.plist").read_text(encoding="utf-8")
+        self.assertIn("${PYTHON}", template)
         self.assertIn("${RUNTIME}", template)
         self.assertIn("${PORT}", template)
 
@@ -1954,16 +1999,23 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertIn("custom-hook", text)
             self.assertNotIn("vibe-memory hook", text)
 
-    def test_installed_current_cli_runs_with_system_python_without_clone_path(self) -> None:
+    def test_installed_launcher_runs_without_a_source_cli_path(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
             paths = self.make_paths(root)
             vibe_memory_install.install_runtime(ROOT, paths)
-            cli = paths.install_root / "current/scripts/vibe_memory_cli.py"
+            vibe_memory_install.install_runtime_config(
+                paths,
+                port=8897,
+                app_version="1.0.0",
+                python_executable=sys.executable,
+            )
+            vibe_memory_install.install_launcher(paths)
+            vibe_memory_install.prepare_data(paths)
             environment = os.environ.copy()
             environment.update({"HOME": str(root / "home"), "PYTHONDONTWRITEBYTECODE": "1"})
             completed = subprocess.run(
-                ["/usr/bin/python3", str(cli), "status"],
+                [str(paths.launcher), "status"],
                 env=environment,
                 capture_output=True,
                 text=True,

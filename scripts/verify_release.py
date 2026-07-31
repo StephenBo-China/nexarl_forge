@@ -109,6 +109,7 @@ def _install_smoke(root: pathlib.Path) -> tuple[pathlib.Path, vibe_memory_paths.
     paths = vibe_memory_paths.for_home(home)
     vibe_memory_install.install_runtime(root, paths)
     vibe_memory_install.install_runtime_config(paths, port=18997, app_version="1.0.0")
+    vibe_memory_install.install_launcher(paths)
     vibe_memory_install.prepare_data(paths)
     return home, paths
 
@@ -134,9 +135,8 @@ def _permissions_check(root: pathlib.Path) -> str:
 def _hook_check(root: pathlib.Path, agent: str) -> str:
     try:
         home, paths = _install_smoke(root)
-        runtime = paths.install_root / "current"
         target = home / (".codex/hooks.json" if agent == "codex" else ".claude/settings.json")
-        result = vibe_memory_hooks.repair(target, agent, runtime)
+        result = vibe_memory_hooks.repair(target, agent, paths.launcher)
         if result.get("status") not in {"created", "updated", "current"}:
             return f"failed: unexpected hook status {result}"
         if agent == "codex":

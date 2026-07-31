@@ -77,6 +77,21 @@ class VibeMemorySettingsTest(unittest.TestCase):
         self.assertEqual(runtime["app_version"], "1.0.0")
         self.assertEqual(runtime["port"], 9123)
 
+    def test_save_settings_preserves_persisted_python_metadata(self) -> None:
+        vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+
+        saved = settings.save_settings(self.paths, settings.load_settings(self.paths))
+        runtime = vibe_memory_install.read_runtime_config(self.paths)
+
+        self.assertEqual(saved["service_port"], 9123)
+        self.assertEqual(runtime["python_executable"], str(pathlib.Path(sys.executable).absolute()))
+        self.assertIn("python_version", runtime)
+
     def test_save_rejects_safety_changes_and_unknown_fields(self) -> None:
         for key, value in (
             ("formal_memory_requires_approval", False),

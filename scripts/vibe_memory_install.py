@@ -10,9 +10,10 @@ import plistlib
 import re
 import shutil
 import stat
+import subprocess
 from string import Template
 import sys
-from typing import Any
+from typing import Any, Callable
 import uuid
 from xml.sax.saxutils import escape
 
@@ -31,6 +32,7 @@ _VERSION_PATTERN = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 _PYTHON_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+$")
+MINIMUM_PYTHON = (3, 10)
 RENAME_EXCL = 0x00000004
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _TRUSTED_SYSTEM_ALIASES = {
@@ -76,6 +78,67 @@ class TemporaryCleanupConflict(RuntimeError):
 
 class InstallError(RuntimeError):
     """Raised when an install lifecycle operation safely refuses to continue."""
+
+
+def probe_python(executable: str) -> tuple[int, int] | None:
+    """Return the candidate interpreter's major/minor version without a shell."""
+    try:
+        completed = subprocess.run(
+            [executable, "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\s*", completed.stdout)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
+
+def validate_python(
+    executable: str | os.PathLike[str],
+    probe: Callable[[str], tuple[int, int] | None] = probe_python,
+) -> str:
+    """Validate and canonicalize a persisted Python 3.10+ interpreter path."""
+    if not isinstance(executable, (str, os.PathLike)):
+        raise InstallError("Python 3.10 or newer is required")
+    candidate = os.path.abspath(os.path.expanduser(os.fspath(executable)))
+    version = probe(candidate)
+    if (
+        not isinstance(version, tuple)
+        or len(version) != 2
+        or any(isinstance(item, bool) or not isinstance(item, int) for item in version)
+        or version < MINIMUM_PYTHON
+    ):
+        raise InstallError("Python 3.10 or newer is required")
+    return candidate
+
+
+def discover_python(
+    probe: Callable[[str], tuple[int, int] | None] = probe_python,
+) -> str:
+    """Select the first available Python interpreter meeting the release minimum."""
+    configured = os.environ.get("VIBE_MEMORY_PYTHON")
+    candidates = (
+        configured,
+        shutil.which("python3"),
+        "/opt/homebrew/bin/python3",
+        "/usr/local/bin/python3",
+        "/usr/bin/python3",
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            return validate_python(candidate, probe)
+        except InstallError:
+            continue
+    raise InstallError("Python 3.10 or newer was not found")
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> str:
@@ -1087,7 +1150,14 @@ def _read_launch_agent_template() -> str:
 def _validate_launch_agent(plist: object, runtime: str, port: int) -> None:
     if not isinstance(plist, dict):
         raise ValueError("launch agent template must contain a dictionary")
-    expected_arguments = ["/usr/bin/python3", runtime + "/scripts/memory_review_server.py"]
+    python_executable = plist.get("ProgramArguments", [None])[0] if isinstance(plist, dict) else None
+    if not isinstance(python_executable, str):
+        raise ValueError("launch agent ProgramArguments are invalid")
+    expected_arguments = [python_executable, runtime + "/scripts/memory_review_server.py"]
+    try:
+        validate_python(python_executable)
+    except InstallError as error:
+        raise ValueError("launch agent Python interpreter is invalid") from error
     expected_environment = {
         "MEMORY_REVIEW_HOST": "127.0.0.1",
         "MEMORY_REVIEW_PORT": str(port),
@@ -1102,12 +1172,41 @@ def _validate_launch_agent(plist: object, runtime: str, port: int) -> None:
         raise ValueError("launch agent lifecycle settings are invalid")
 
 
-def render_launch_agent(paths: RuntimePaths, port: int = 8897) -> str:
+def _python_metadata(
+    executable: str | os.PathLike[str],
+    probe: Callable[[str], tuple[int, int] | None] = probe_python,
+) -> tuple[str, str]:
+    validated = validate_python(executable, probe)
+    version = probe(validated)
+    if version is None:
+        raise InstallError("Python 3.10 or newer is required")
+    return validated, f"{version[0]}.{version[1]}"
+
+
+def _runtime_python(paths: RuntimePaths) -> str:
+    try:
+        value = read_runtime_config(paths)
+        persisted = value.get("python_executable")
+        if isinstance(persisted, str):
+            return _python_metadata(persisted)[0]
+    except (InstallError, OSError, ValueError):
+        pass
+    return discover_python()
+
+
+def render_launch_agent(
+    paths: RuntimePaths,
+    port: int = 8897,
+    *,
+    python_executable: str | os.PathLike[str] | None = None,
+) -> str:
     """Render and validate the loopback-only LaunchAgent property list."""
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be an integer from 1 through 65535")
     runtime = str(pathlib.Path(paths.install_root) / "current")
+    python = _python_metadata(python_executable)[0] if python_executable is not None else _runtime_python(paths)
     rendered = Template(_read_launch_agent_template()).substitute(
+        PYTHON=escape(python),
         RUNTIME=escape(runtime),
         PORT=str(port),
     )
@@ -1119,15 +1218,25 @@ def render_launch_agent(paths: RuntimePaths, port: int = 8897) -> str:
     return rendered
 
 
-def render_runtime_config(port: int, app_version: str) -> str:
+def render_runtime_config(
+    port: int,
+    app_version: str,
+    *,
+    python_executable: str | os.PathLike[str] | None = None,
+) -> str:
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("port must be an integer from 1 through 65535")
     if not isinstance(app_version, str) or not _VERSION_PATTERN.fullmatch(app_version):
         raise ValueError("app_version must be a semantic version")
+    executable, python_version = _python_metadata(
+        python_executable if python_executable is not None else discover_python()
+    )
     return json.dumps(
         {
             "app_version": app_version,
             "port": port,
+            "python_executable": executable,
+            "python_version": python_version,
             "schema_version": 1,
             "service": "vibe-memory",
         },
@@ -1136,10 +1245,58 @@ def render_runtime_config(port: int, app_version: str) -> str:
     ) + "\n"
 
 
+def _shell_double_quote(value: str) -> str:
+    """Quote one shell word without embedding an untrusted shell expression."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`") + '"'
+
+
+def render_launcher(
+    paths: RuntimePaths,
+    *,
+    python_executable: str | os.PathLike[str] | None = None,
+) -> str:
+    """Render the user-owned stable CLI launcher for the active runtime."""
+    executable = (
+        _python_metadata(python_executable)[0]
+        if python_executable is not None
+        else _runtime_python(paths)
+    )
+    return "\n".join(
+        (
+            "#!/usr/bin/env bash",
+            "# Vibe Memory stable launcher; generated by the installer.",
+            "set -euo pipefail",
+            'if [ -z "${HOME:-}" ]; then',
+            '  echo "vibe-memory: HOME is required" >&2',
+            "  exit 1",
+            "fi",
+            'RUNTIME="$HOME/Library/Application Support/VibeMemory/current"',
+            f"exec {_shell_double_quote(executable)} \"$RUNTIME/scripts/vibe_memory_cli.py\" \"$@\"",
+            "",
+        )
+    )
+
+
 def install_runtime_config(
-    paths: RuntimePaths, *, port: int, app_version: str
+    paths: RuntimePaths,
+    *,
+    port: int,
+    app_version: str,
+    python_executable: str | os.PathLike[str] | None = None,
 ) -> dict[str, object]:
-    runtime_value = json.loads(render_runtime_config(port, app_version))
+    selected_python = python_executable
+    if selected_python is None:
+        try:
+            selected_python = read_runtime_config(paths).get("python_executable")
+        except (InstallError, OSError, ValueError):
+            selected_python = None
+    runtime_value = json.loads(
+        render_runtime_config(
+            port,
+            app_version,
+            python_executable=selected_python,
+        )
+    )
     content = (json.dumps(runtime_value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     parent = pathlib.Path(paths.install_root)
     _validate_install_ancestor_chain(parent)
@@ -1167,7 +1324,11 @@ def install_runtime_config(
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 pass
             if current == content:
-                return {"changed": False, "path": str(target)}
+                return {
+                    "changed": False,
+                    "path": str(target),
+                    "python_executable": runtime_value["python_executable"],
+                }
         temporary_name = f".{name}.tmp-{uuid.uuid4().hex}"
         descriptor = os.open(
             temporary_name,
@@ -1198,8 +1359,63 @@ def install_runtime_config(
                 os.unlink(temporary_name, dir_fd=parent_fd)
             except FileNotFoundError:
                 pass
+        return {
+            "changed": True,
+            "path": str(target),
+            "python_executable": runtime_value["python_executable"],
+        }
+    finally:
+        os.close(parent_fd)
+
+
+def install_launcher(
+    paths: RuntimePaths,
+    *,
+    python_executable: str | os.PathLike[str] | None = None,
+) -> dict[str, object]:
+    """Atomically install the private, stable user CLI launcher."""
+    target = pathlib.Path(paths.launcher)
+    content = render_launcher(paths, python_executable=python_executable).encode("utf-8")
+    _validate_install_ancestor_chain(target.parent)
+    parent_fd = _open_or_create_directory_chain(_canonical_install_path(target.parent))
+    temporary_name = f".{target.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        if _entry_exists(parent_fd, target.name):
+            current = _read_regular_file_at(parent_fd, target.name, target)
+            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise InstallError("launcher target must be a regular file")
+            if current == content and stat.S_IMODE(metadata.st_mode) == 0o700:
+                return {"changed": False, "path": str(target)}
+        descriptor = os.open(
+            temporary_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o700,
+            dir_fd=parent_fd,
+        )
+        try:
+            offset = 0
+            while offset < len(content):
+                written = os.write(descriptor, content[offset:])
+                if written <= 0:
+                    raise OSError("short launcher write")
+                offset += written
+            os.fchmod(descriptor, 0o700)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _entry_exists(parent_fd, target.name):
+            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise InstallError("launcher target must be a regular file")
+        os.replace(temporary_name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
         return {"changed": True, "path": str(target)}
     finally:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
         os.close(parent_fd)
 
 
@@ -1215,13 +1431,37 @@ def read_runtime_config(paths: RuntimePaths) -> dict[str, object]:
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("runtime config must contain an object")
-    runtime_keys = {"app_version", "port", "schema_version", "service"}
+    runtime_keys = {
+        "app_version",
+        "port",
+        "python_executable",
+        "python_version",
+        "schema_version",
+        "service",
+    }
     runtime_value = {key: value.get(key) for key in runtime_keys}
-    expected = render_runtime_config(
-        runtime_value.get("port"), runtime_value.get("app_version")
+    legacy_runtime = runtime_value["python_executable"] is None and runtime_value["python_version"] is None
+    if (runtime_value["python_executable"] is None) != (runtime_value["python_version"] is None):
+        raise ValueError("runtime config has an invalid Python interpreter structure")
+    expected = json.loads(
+        render_runtime_config(
+            runtime_value.get("port"),
+            runtime_value.get("app_version"),
+            python_executable=(
+                runtime_value["python_executable"] if not legacy_runtime else discover_python()
+            ),
+        )
     )
-    normalized = json.loads(expected)
-    if runtime_value != normalized:
+    normalized = {
+        key: expected[key]
+        for key in runtime_keys
+        if key in expected and (key not in {"python_executable", "python_version"} or not legacy_runtime)
+    }
+    compared = {
+        key: runtime_value[key]
+        for key in normalized
+    }
+    if compared != normalized:
         raise ValueError("runtime config has an invalid structure")
     extra = set(value).difference(runtime_keys)
     if extra:
@@ -1242,13 +1482,12 @@ def read_runtime_config(paths: RuntimePaths) -> dict[str, object]:
 
 def install_launch_agent(paths: RuntimePaths, content: str) -> dict[str, object]:
     """Atomically install the managed LaunchAgent without following symlinks."""
-    home = pathlib.Path(paths.personal_memory).parents[1]
-    parent = home / "Library" / "LaunchAgents"
+    target = pathlib.Path(paths.launch_agent)
+    parent = target.parent
     _validate_install_ancestor_chain(parent)
     canonical_parent = _canonical_install_path(parent)
     parent_fd = _open_or_create_directory_chain(canonical_parent)
     name = "com.noema.vibe-memory.plist"
-    target = parent / name
     encoded = content.encode("utf-8")
     try:
         if _entry_exists(parent_fd, name):
@@ -1530,7 +1769,11 @@ def _install_state_document(
     previous_version: str | None,
     port: int,
     installed_clients: list[str],
+    python_executable: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
+    executable, python_version = _python_metadata(
+        python_executable if python_executable is not None else discover_python()
+    )
     return {
         "schema_version": 1,
         "current_version": current_version,
@@ -1538,6 +1781,8 @@ def _install_state_document(
         "hook_protocol_version": 1,
         "data_schema_version": 1,
         "port": port,
+        "python_executable": executable,
+        "python_version": python_version,
         "installed_clients": installed_clients,
     }
 
@@ -1555,10 +1800,17 @@ def update(
     runtime_config = pathlib.Path(paths.install_root) / "config.json"
     config_before = _snapshot_regular_file(runtime_config)
     selected_port = _runtime_port(paths, port)
+    selected_python = _runtime_python(paths)
     try:
         installed = install_runtime(source_root, paths, activate=False)
         new_version = installed["version"]
-        install_runtime_config(paths, port=selected_port, app_version=new_version)
+        install_runtime_config(
+            paths,
+            port=selected_port,
+            app_version=new_version,
+            python_executable=selected_python,
+        )
+        install_launcher(paths, python_executable=selected_python)
         control_plane = _validate_control_plane(paths, validation)
         _activate_managed_version(paths, new_version)
         clients = installed_clients
@@ -1578,6 +1830,7 @@ def update(
                 previous_version=previous_version,
                 port=selected_port,
                 installed_clients=clients,
+                python_executable=selected_python,
             ),
         )
         return {
@@ -1616,6 +1869,7 @@ def rollback(paths: RuntimePaths) -> dict[str, Any]:
             previous_version=current_version if isinstance(current_version, str) else None,
             port=port,
             installed_clients=clients,
+            python_executable=state.get("python_executable") if isinstance(state.get("python_executable"), str) else _runtime_python(paths),
         ),
     )
     return {
@@ -1651,13 +1905,15 @@ def repair(paths: RuntimePaths) -> dict[str, Any]:
     if not runtime.is_symlink():
         raise InstallError("current runtime is not installed")
     port = int(read_runtime_config(paths)["port"])
+    launcher = install_launcher(paths)
     launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port))
     hook_results = {}
     for path, agent, label in (_hook_target_for_client(paths, client) for client in _installed_clients(paths)):
-        hook_results[label] = vibe_memory_hooks.repair(path, agent, runtime)
+        hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)
     return {
         "status": "repaired",
         "launch_agent": launch_agent,
+        "launcher": launcher,
         "hooks": hook_results,
         "data_retained": True,
     }
@@ -1670,6 +1926,18 @@ def _is_managed_launch_agent(path: pathlib.Path) -> bool:
         raise InstallError(f"managed LaunchAgent must not be a symlink: {path}")
     text = path.read_text(encoding="utf-8")
     return "com.noema.vibe-memory" in text and "memory_review_server.py" in text
+
+
+def _is_managed_launcher(path: pathlib.Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_symlink():
+        raise InstallError(f"managed launcher must not be a symlink: {path}")
+    if not path.is_file():
+        raise InstallError(f"managed launcher must be a regular file: {path}")
+    return "Vibe Memory stable launcher; generated by the installer." in path.read_text(
+        encoding="utf-8"
+    )
 
 
 def _unlink_regular_file(path: pathlib.Path) -> bool:
@@ -1717,10 +1985,14 @@ def uninstall(
         path, _agent, label = _hook_target_for_client(paths, client)
         hook_results[label] = vibe_memory_hooks.uninstall(path)
     home = pathlib.Path(paths.personal_memory).parents[1]
-    launch_agent = home / "Library" / "LaunchAgents" / "com.noema.vibe-memory.plist"
+    launch_agent = pathlib.Path(paths.launch_agent)
     if _is_managed_launch_agent(launch_agent):
         launch_agent.unlink()
         removed.append(str(launch_agent))
+    launcher = pathlib.Path(paths.launcher)
+    if _is_managed_launcher(launcher):
+        launcher.unlink()
+        removed.append(str(launcher))
     current = pathlib.Path(paths.install_root) / "current"
     if os.path.lexists(current):
         if not current.is_symlink():

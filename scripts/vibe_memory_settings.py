@@ -30,7 +30,13 @@ _SETTING_KEYS = (
     "service_host",
     "service_port",
 )
-_RUNTIME_KEYS = {"app_version", "port", "service"}
+_RUNTIME_KEYS = {
+    "app_version",
+    "port",
+    "python_executable",
+    "python_version",
+    "service",
+}
 _SECTION = re.compile(r"(?ms)^##[ \t]+([^\n]+)\n.*?(?=^##[ \t]+|\Z)")
 _EXPIRY = re.compile(r"(?m)^expires_on:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$")
 
@@ -270,7 +276,6 @@ def reconcile_hooks(
 ) -> dict[str, dict[str, object]]:
     settings = validate_settings(value)
     home = _home(paths)
-    runtime = pathlib.Path(paths.install_root) / "current"
     targets = (
         ("codex", home / ".codex" / "hooks.json", "codex", "codex_hooks_enabled"),
         (
@@ -283,7 +288,7 @@ def reconcile_hooks(
     result: dict[str, dict[str, object]] = {}
     for name, target, agent, key in targets:
         result[name] = (
-            vibe_memory_hooks.repair(target, agent, runtime)
+            vibe_memory_hooks.repair(target, agent, paths.launcher)
             if settings[key]
             else _disable_hook(target)
         )
@@ -294,7 +299,7 @@ def reconcile_launch_agent(
     paths: RuntimePaths, value: Mapping[str, object]
 ) -> dict[str, object]:
     settings = validate_settings(value)
-    target = _home(paths) / "Library" / "LaunchAgents" / "com.noema.vibe-memory.plist"
+    target = pathlib.Path(paths.launch_agent)
     if settings["start_at_login"]:
         content = vibe_memory_install.render_launch_agent(
             paths, port=int(settings["service_port"])

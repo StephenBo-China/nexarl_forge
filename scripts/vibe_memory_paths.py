@@ -16,6 +16,8 @@ class RuntimePaths:
     ui_design_home: pathlib.Path
     worktree_manager: pathlib.Path
     worktree_root: pathlib.Path
+    launcher: pathlib.Path
+    launch_agent: pathlib.Path
 
 
 def for_home(home: pathlib.Path | None = None) -> RuntimePaths:
@@ -29,6 +31,13 @@ def for_home(home: pathlib.Path | None = None) -> RuntimePaths:
         ui_design_home=codex_home / "ui_design",
         worktree_manager=codex_home / "worktree_manager",
         worktree_root=resolved_home / "Projects" / "worktrees",
+        launcher=resolved_home / ".local" / "bin" / "vibe-memory",
+        launch_agent=(
+            resolved_home
+            / "Library"
+            / "LaunchAgents"
+            / "com.noema.vibe-memory.plist"
+        ),
     )
 
 
