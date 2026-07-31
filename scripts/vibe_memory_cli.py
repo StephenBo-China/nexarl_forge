@@ -101,11 +101,10 @@ def _persisted_python_status(
     paths: vibe_memory_paths.RuntimePaths,
 ) -> tuple[str | None, str | None]:
     """Return the recorded interpreter or a doctor-safe Python diagnostic."""
-    config_path = paths.install_root / "config.json"
     try:
-        value = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return None, "python: persisted runtime configuration is unreadable"
+        value = vibe_memory_install._read_runtime_config_document(paths)
+    except (OSError, UnicodeDecodeError, ValueError, OverflowError, vibe_memory_install.InstallError):
+        return None, "python: persisted runtime configuration is invalid"
     if not isinstance(value, dict):
         return None, "python: persisted runtime configuration is invalid"
     executable = value.get("python_executable")
@@ -117,13 +116,16 @@ def _persisted_python_status(
     parts = version.split(".")
     if len(parts) != 2 or not all(part.isdigit() for part in parts):
         return None, "python: persisted interpreter version is invalid"
-    recorded = (int(parts[0]), int(parts[1]))
+    try:
+        recorded = (int(parts[0]), int(parts[1]))
+    except (ValueError, OverflowError):
+        return None, "python: persisted interpreter version is invalid"
     if recorded < vibe_memory_install.MINIMUM_PYTHON:
         return None, "python: persisted interpreter must be Python 3.10 or newer"
     try:
         validated = vibe_memory_install.validate_python(executable)
         actual = vibe_memory_install.probe_python(validated)
-    except vibe_memory_install.InstallError:
+    except (OSError, ValueError, OverflowError, vibe_memory_install.InstallError):
         return None, "python: persisted interpreter is unavailable or below Python 3.10"
     if actual != recorded:
         return None, "python: persisted interpreter version does not match the executable"
@@ -302,6 +304,7 @@ def install_command(args: argparse.Namespace) -> int:
     launch_agent = paths.launch_agent
     runtime_config_path = paths.install_root / "config.json"
     install_state_path = vibe_memory_install.install_state_path(paths)
+    existing_install_state: dict[str, object] = {}
     try:
         python_executable = vibe_memory_install.discover_python()
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
@@ -314,6 +317,7 @@ def install_command(args: argparse.Namespace) -> int:
         vibe_memory_install.render_launcher(paths, python_executable=python_executable)
         for target, agent, _name in hook_targets:
             vibe_memory_hooks.preview(target, agent, launcher)
+        existing_install_state = vibe_memory_install.read_install_state(paths)
         snapshots = {target: _snapshot_managed_file(target) for target, _agent, _name in hook_targets}
         hook_backups = {
             target: _hook_backup_artifacts(target)
@@ -357,13 +361,17 @@ def install_command(args: argparse.Namespace) -> int:
             rollback_paths.add(target)
             attempted_hook_targets.add(target)
             hooks[name] = vibe_memory_hooks.repair(target, agent, launcher)
-        clients = ["codex"] + (["claude-code"] if args.with_claude_hooks else [])
+        existing_clients = existing_install_state.get("installed_clients", [])
+        clients = ["codex"]
+        if args.with_claude_hooks or "claude-code" in existing_clients:
+            clients.append("claude-code")
+        previous_version = existing_install_state.get("previous_version")
         rollback_paths.add(install_state_path)
         vibe_memory_install.write_install_state(
             paths,
             vibe_memory_install._install_state_document(
                 current_version=installed["version"],
-                previous_version=None,
+                previous_version=previous_version if isinstance(previous_version, str) else None,
                 port=args.port,
                 installed_clients=clients,
                 python_executable=python_executable,

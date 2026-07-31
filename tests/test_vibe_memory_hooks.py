@@ -102,6 +102,14 @@ class ManagedCommandTest(unittest.TestCase):
 
 
 class MergeDocumentTest(unittest.TestCase):
+    def test_remove_managed_entries_preserves_arbitrary_stable_launcher_suffix(self) -> None:
+        custom = '"/tmp/.local/bin/vibe-memory" hook --agent codex --event Stop'
+        source = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": custom}]}]}}
+
+        cleaned = hooks.remove_managed_entries(source)
+
+        self.assertEqual(cleaned, source)
+
     def test_remove_managed_entries_removes_legacy_python_signature_only(self) -> None:
         legacy = (
             "/usr/bin/python3 /old/scripts/vibe_memory_cli.py hook "

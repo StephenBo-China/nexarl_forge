@@ -116,7 +116,19 @@ def _require_document(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     return value, hooks
 
 
-def _is_managed_handler(handler: Any) -> bool:
+def _launcher_path(runtime: str | pathlib.Path | None = None) -> pathlib.Path:
+    value = (
+        pathlib.Path.home() / ".local" / "bin" / "vibe-memory"
+        if runtime is None
+        else pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(runtime))))
+    )
+    return pathlib.Path(os.path.abspath(os.fspath(value)))
+
+
+def _is_managed_handler(
+    handler: Any,
+    runtime: str | pathlib.Path | None = None,
+) -> bool:
     if (
         not isinstance(handler, dict)
         or handler.get("type") != "command"
@@ -132,7 +144,7 @@ def _is_managed_handler(handler: Any) -> bool:
         launcher_path = pathlib.PurePath(launcher)
         return (
             launcher_path.is_absolute()
-            and launcher_path.parts[-3:] == (".local", "bin", "vibe-memory")
+            and launcher_path == pathlib.PurePath(_launcher_path(runtime))
             and action == "hook"
             and agent_flag == "--agent"
             and agent in AGENTS
@@ -171,7 +183,10 @@ def _is_managed_handler(handler: Any) -> bool:
     )
 
 
-def remove_managed_entries(value: Any) -> dict[str, Any]:
+def remove_managed_entries(
+    value: Any,
+    runtime: str | pathlib.Path | None = None,
+) -> dict[str, Any]:
     """Return a copy without managed handler commands in managed hook events."""
     copied = copy.deepcopy(value)
     _, hook_events = _require_document(copied)
@@ -187,13 +202,13 @@ def remove_managed_entries(value: Any) -> dict[str, Any]:
                 retained_groups.append(group)
                 continue
             managed_handlers = [
-                handler for handler in group["hooks"] if _is_managed_handler(handler)
+                handler for handler in group["hooks"] if _is_managed_handler(handler, runtime)
             ]
             if not managed_handlers:
                 retained_groups.append(group)
                 continue
             retained_handlers = [
-                handler for handler in group["hooks"] if not _is_managed_handler(handler)
+                handler for handler in group["hooks"] if not _is_managed_handler(handler, runtime)
             ]
             if not retained_handlers:
                 continue
@@ -226,7 +241,7 @@ def merge_document(value: Any, agent: str, runtime: str | pathlib.Path) -> dict[
         copied["hooks"] = {}
     elif not isinstance(copied["hooks"], dict):
         raise ValueError("hook configuration hooks must be an object")
-    copied = remove_managed_entries(copied)
+    copied = remove_managed_entries(copied, runtime)
     _, hook_events = _require_document(copied)
     for event in EVENTS:
         groups = hook_events.get(event)

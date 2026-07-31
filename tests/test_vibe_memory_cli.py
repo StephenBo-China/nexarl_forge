@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import stat
 import subprocess
@@ -151,6 +152,80 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertFalse(result["runtime"]["ok"])
         self.assertEqual(result["runtime"]["status"], "python_error")
         self.assertIn("3.10", result["runtime"]["error"])
+
+    def test_doctor_reports_malformed_persisted_python_version_without_crashing(self) -> None:
+        release = self.paths.install_root / "releases/1.0.0/scripts"
+        release.mkdir(parents=True)
+        (release / "vibe_memory_cli.py").write_text("# cli\n", encoding="utf-8")
+        (self.paths.install_root / "current").symlink_to("releases/1.0.0")
+        config_path = self.paths.install_root / "config.json"
+        config_path.write_text(json.dumps({
+            "app_version": "1.0.0",
+            "port": 9123,
+            "python_executable": sys.executable,
+            "python_version": ("9" * 5000) + ".10",
+            "schema_version": 1,
+            "service": "vibe-memory",
+        }), encoding="utf-8")
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "python_error")
+        self.assertIn("python", result["runtime"]["error"])
+
+    def test_doctor_reports_invalid_persisted_python_executable_without_crashing(self) -> None:
+        release = self.paths.install_root / "releases/1.0.0/scripts"
+        release.mkdir(parents=True)
+        (release / "vibe_memory_cli.py").write_text("# cli\n", encoding="utf-8")
+        (self.paths.install_root / "current").symlink_to("releases/1.0.0")
+        config_path = self.paths.install_root / "config.json"
+        config_path.write_text(json.dumps({
+            "app_version": "1.0.0",
+            "port": 9123,
+            "python_executable": sys.executable + "\x00",
+            "python_version": "3.11",
+            "schema_version": 1,
+            "service": "vibe-memory",
+        }), encoding="utf-8")
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "python_error")
+        self.assertIn("python", result["runtime"]["error"])
+
+    def test_doctor_rejects_symlinked_runtime_config_before_probing_python(self) -> None:
+        release = self.paths.install_root / "releases/1.0.0/scripts"
+        release.mkdir(parents=True)
+        (release / "vibe_memory_cli.py").write_text("# cli\n", encoding="utf-8")
+        (self.paths.install_root / "current").symlink_to("releases/1.0.0")
+        marker = pathlib.Path(self.temporary.name) / "probed"
+        executable = pathlib.Path(self.temporary.name) / "probe-python"
+        executable.write_text(
+            "#!/bin/sh\n"
+            f"printf x > {shlex.quote(str(marker))}\n"
+            "printf '3.11\\n'\n",
+            encoding="utf-8",
+        )
+        executable.chmod(0o700)
+        target = pathlib.Path(self.temporary.name) / "runtime-config.json"
+        target.write_text(json.dumps({
+            "app_version": "1.0.0",
+            "port": 9123,
+            "python_executable": str(executable),
+            "python_version": "3.11",
+            "schema_version": 1,
+            "service": "vibe-memory",
+        }), encoding="utf-8")
+        config_path = self.paths.install_root / "config.json"
+        config_path.symlink_to(target)
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "python_error")
+        self.assertFalse(marker.exists())
 
     def test_install_delegates_runtime_plist_and_hooks_without_launchctl(self) -> None:
         runtime = self.paths.install_root / "current"
@@ -397,6 +472,23 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(repeated["hooks"]["codex"]["status"], "current")
         self.assertEqual(repeated["hooks"]["claude"]["status"], "current")
         self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_reinstall_preserves_existing_rollback_state_and_clients(self) -> None:
+        code, _output, stderr = self.invoke([
+            "install", "--source-root", str(ROOT), "--with-claude-hooks",
+        ])
+        self.assertEqual(code, 0, stderr)
+        state_path = self.paths.install_root / "state/install.json"
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state["previous_version"] = "0.9.0"
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+
+        code, _output, stderr = self.invoke(["install", "--source-root", str(ROOT)])
+
+        self.assertEqual(code, 0, stderr)
+        repeated = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(repeated["previous_version"], "0.9.0")
+        self.assertEqual(repeated["installed_clients"], ["codex", "claude-code"])
 
     def test_installed_launcher_survives_source_tree_removal(self) -> None:
         source = pathlib.Path(self.temporary.name) / "portable-source"

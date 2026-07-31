@@ -110,6 +110,124 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertTrue(os.access(paths.launcher, os.X_OK))
             self.assertIn("Vibe Memory stable launcher", paths.launcher.read_text(encoding="utf-8"))
 
+    def test_install_launcher_preserves_non_manager_owned_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            paths.launcher.parent.mkdir(parents=True)
+            paths.launcher.write_text("#!/bin/sh\necho custom\n", encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(
+                paths.launcher.read_text(encoding="utf-8"),
+                "#!/bin/sh\necho custom\n",
+            )
+
+    def test_install_launcher_rejects_marker_without_manager_protocol(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            paths.launcher.parent.mkdir(parents=True)
+            custom = (
+                f"{vibe_memory_install.LAUNCHER_MARKER}\n"
+                'RUNTIME="$HOME/Library/Application Support/VibeMemory/current"\n'
+                "exec echo custom\n"
+            )
+            paths.launcher.write_text(custom, encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
+
+    def test_atomic_install_state_write_handles_short_os_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state = vibe_memory_install._install_state_document(
+                current_version="1.0.0",
+                previous_version=None,
+                port=8897,
+                installed_clients=["codex"],
+                python_executable=sys.executable,
+            )
+            real_write = vibe_memory_install.os.write
+
+            def short_write(descriptor: int, content: bytes) -> int:
+                return real_write(descriptor, content[:1])
+
+            with mock.patch.object(vibe_memory_install.os, "write", side_effect=short_write):
+                vibe_memory_install.write_install_state(paths, state)
+
+            self.assertEqual(vibe_memory_install.read_install_state(paths), state)
+
+    def test_read_install_state_rejects_symlinked_file(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state_path = vibe_memory_install.install_state_path(paths)
+            state_path.parent.mkdir(parents=True)
+            outside = pathlib.Path(value) / "outside-state.json"
+            outside.write_text("{}", encoding="utf-8")
+            state_path.symlink_to(outside)
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.read_install_state(paths)
+
+            self.assertEqual(outside.read_text(encoding="utf-8"), "{}")
+
+    def test_read_install_state_rejects_invalid_client_structure(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state_path = vibe_memory_install.install_state_path(paths)
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "current_version": "1.0.0",
+                "previous_version": None,
+                "hook_protocol_version": 1,
+                "data_schema_version": 1,
+                "port": 8897,
+                "installed_clients": "codex",
+            }), encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.read_install_state(paths)
+
+    def test_read_install_state_rejects_unhashable_client(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state_path = vibe_memory_install.install_state_path(paths)
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps({
+                "schema_version": 1,
+                "current_version": "1.0.0",
+                "previous_version": None,
+                "hook_protocol_version": 1,
+                "data_schema_version": 1,
+                "port": 8897,
+                "installed_clients": ["codex", []],
+            }), encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.read_install_state(paths)
+
+    def test_read_install_state_rejects_boolean_schema_version(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state = vibe_memory_install._install_state_document(
+                current_version="1.0.0",
+                previous_version=None,
+                port=8897,
+                installed_clients=["codex"],
+                python_executable=sys.executable,
+            )
+            state["schema_version"] = True
+            state_path = vibe_memory_install.install_state_path(paths)
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.read_install_state(paths)
+
     def test_install_does_not_require_optional_license(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
