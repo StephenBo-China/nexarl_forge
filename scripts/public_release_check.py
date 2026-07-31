@@ -60,7 +60,7 @@ def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
         yield from sorted(
             path
             for path in docs.iterdir()
-            if path.suffix == ".md" and (path.is_symlink() or path.is_file())
+            if _is_top_level_doc_candidate(path)
         )
 
     scripts = root / "scripts"
@@ -74,6 +74,10 @@ def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
         yield templates
     elif templates.is_dir():
         yield from _iter_release_tree(templates)
+
+
+def _is_top_level_doc_candidate(path: pathlib.Path) -> bool:
+    return path.suffix == ".md" and (path.is_symlink() or path.is_file())
 
 
 def _iter_release_tree(directory: pathlib.Path, *, suffix: str | None = None) -> Iterable[pathlib.Path]:

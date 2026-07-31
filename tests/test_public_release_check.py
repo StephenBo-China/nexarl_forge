@@ -20,6 +20,35 @@ import verify_release
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_docs_scan_preserves_markdown_boundary_for_symlinks_and_nested_plans(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "public-tree"
+            docs = root / "docs"
+            docs.mkdir(parents=True)
+            external = base / "external"
+            external.mkdir()
+            (external / "note.txt").write_text(
+                "Path: /Users/example\n", encoding="utf-8"
+            )
+            (external / "guide.md").write_text(
+                "Path: /Users/example\n", encoding="utf-8"
+            )
+            (docs / "note.txt").symlink_to(external / "note.txt")
+            (docs / "guide.md").symlink_to(external / "guide.md")
+            nested = docs / "nested" / "plans"
+            nested.mkdir(parents=True)
+            (nested / "secret.md").write_text(
+                "token = 'unique-nested-secret'\n", encoding="utf-8"
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            [(violation["path"], violation["pattern"]) for violation in violations],
+            [("docs/guide.md", "release_asset_symlink")],
+        )
+
     def test_scan_tree_rejects_external_release_file_symlink_without_reading_target(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)
