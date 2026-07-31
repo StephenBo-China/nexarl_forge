@@ -9,6 +9,9 @@ __pycache__/
 .ruff_cache/
 
 # Local runtime state; may include memory candidate content
+.codex/hooks.json
+.claude/settings.json
+.loop/config.json
 codex/memory_review_queue.json
 codex/memory_review_state.json
 codex/memory_review_server.log
@@ -34,6 +37,12 @@ coverage.xml
 # Generated memory context packets
 codex/codex_context_packet.md
 codex/shared_memory_context_packet.md
+codex/codex_long_memory.md
+codex/codex_short_memory.md
+codex/memory_proposals.md
+
+# Managed UI design and release state
+codex/ui_design/
 
 # Hook upgrade audit backups
 .codex/hooks/*.bak.*

@@ -57,7 +57,7 @@ pending and approved memory before writing.
 Write a distilled candidate with:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT=/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_review.py propose \
+MEMORY_REVIEW_PROJECT_ROOT=$(pwd) python3 scripts/memory_review.py propose \
   --scope personal|project --target long|short --category CATEGORY \
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```

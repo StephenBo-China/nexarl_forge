@@ -62,7 +62,7 @@ UI Skill 是 Codex 或 Claude Code 可加载的设计工作流或知识包。审
 默认中心仓库路径：
 
 ```text
-/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform
+<vibe_coding_manage_platform 仓库路径>
 ```
 
 ### 3.3 全局数据
@@ -95,7 +95,7 @@ UI Skill 是 Codex 或 Claude Code 可加载的设计工作流或知识包。审
 从中心仓库启动，并指定当前要审核的项目：
 
 ```bash
-/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/start_memory_review.sh <目标项目路径>
+<vibe_coding_manage_platform 仓库路径>/scripts/start_memory_review.sh <目标项目路径>
 ```
 
 默认地址：
@@ -115,7 +115,7 @@ curl -sS http://127.0.0.1:8897/health
 ### 4.2 注册并初始化项目
 
 ```bash
-cd /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform
+cd <vibe_coding_manage_platform 仓库路径>
 python3 scripts/memory_project.py register <目标项目路径>
 python3 scripts/memory_project.py init <目标项目路径>
 ```
@@ -423,8 +423,8 @@ Bootstrap 只创建待审核草稿，不自动批准或发布。UI UX Pro Max �
 四种来源需要填写的内容如下：
 
 - **编辑器**：粘贴完整 `SKILL.md`，frontmatter 至少包含非空的 `name` 和 `description`。
-- **本地目录**：输入本机绝对目录路径，例如 `/Users/name/skills/my-ui-skill`；目录内必须包含 `SKILL.md`。
-- **ZIP**：输入本机 ZIP 文件绝对路径，例如 `/Users/name/skills/my-ui-skill.zip`。
+- **本地目录**：输入本机绝对目录路径，例如 `~/skills/my-ui-skill`；目录内必须包含 `SKILL.md`。
+- **ZIP**：输入本机 ZIP 文件绝对路径，例如 `~/skills/my-ui-skill.zip`。
 - **GitHub**：填写 `owner/repository`、仓库内 Skill 路径和 40 位完整 Git 提交哈希。不能使用 `main`、分支名或浮动标签代替固定 revision。
 
 本地目录和 ZIP 均由本机审核台直接读取，不会上传文件。网页导入只执行静态校验并创建草稿，**不会自动批准、发布或执行 Skill 包内脚本**。完成导入后，仍需按 11.4 和 11.5 节查看校验报告、审核摘要、批准并发布。

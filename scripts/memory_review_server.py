@@ -886,7 +886,7 @@ def page() -> str:
         <button onclick="loadMemory()">刷新已生效记忆</button>
       </div>
       <div id="projectToolbar" class="project-toolbar">
-        <input id="projectPath" placeholder="输入本机项目仓库路径，例如 /Users/.../my_repo">
+        <input id="projectPath" placeholder="输入本机项目仓库路径，例如 ~/projects/my_repo">
         <input id="loopPort" placeholder="Loop staging 端口，留空用推荐值">
         <button onclick="registerProjectFromInput()">注册</button>
         <button onclick="initProjectFromInput()">初始化记忆</button>
@@ -1690,14 +1690,14 @@ function sourceFieldsMarkup() {
   if (uiSkillWizard.sourceType === 'local') {
     return `<div class="skill-field">
       <label for="uiSkillLocalPath">本地 Skill 目录绝对路径 *</label>
-      <input id="uiSkillLocalPath" value="${esc(fields.localPath)}" oninput="setUISkillWizardField('localPath', this.value)"${wizardErrorLink('localPath')} placeholder="/Users/.../my-ui-skill">
+      <input id="uiSkillLocalPath" value="${esc(fields.localPath)}" oninput="setUISkillWizardField('localPath', this.value)"${wizardErrorLink('localPath')} placeholder="~/skills/my-ui-skill">
       <div class="skill-field-help">目录内必须包含 SKILL.md；文件不会上传。</div>${wizardError('localPath')}
     </div>`;
   }
   if (uiSkillWizard.sourceType === 'zip') {
     return `<div class="skill-field">
       <label for="uiSkillZipPath">本地 ZIP 绝对路径 *</label>
-      <input id="uiSkillZipPath" value="${esc(fields.zipPath)}" oninput="setUISkillWizardField('zipPath', this.value)"${wizardErrorLink('zipPath')} placeholder="/Users/.../my-ui-skill.zip">
+      <input id="uiSkillZipPath" value="${esc(fields.zipPath)}" oninput="setUISkillWizardField('zipPath', this.value)"${wizardErrorLink('zipPath')} placeholder="~/skills/my-ui-skill.zip">
       <div class="skill-field-help">审核台读取本机 ZIP 并执行路径安全与体积校验；文件不会上传。</div>${wizardError('zipPath')}
     </div>`;
   }
@@ -1991,7 +1991,7 @@ function renderMemoryStrategy() {
         <section class="doc-section">
           <h3>中心审核台</h3>
           <ul>
-            <li>代码仓库：<code>/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform</code></li>
+            <li>代码仓库：<code>&lt;repo-root&gt;</code></li>
             <li>本机地址：<code>http://127.0.0.1:8897/</code></li>
             <li>项目注册表：<code>~/.codex/memory_review/projects.json</code></li>
             <li>审核台只允许本机访问，负责查看候选、审批、编辑、删除、项目切换和初始化。</li>
@@ -2091,12 +2091,12 @@ function renderMemoryStrategy() {
       </section>
       <section class="doc-section">
         <h3>CLI 等价命令</h3>
-        <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py register /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init-loop /path/to/repo --port 8082
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py upgrade-loop /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py list
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py use /path/to/repo</pre>
+        <pre>python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py register /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py init /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py init-loop /path/to/repo --port 8082
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py upgrade-loop /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py list
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py use /path/to/repo</pre>
       </section>
     </div>
   `;
@@ -2268,22 +2268,22 @@ scripts/deploy_staging.sh</pre>
 
       <section class="doc-section">
         <h3>Worktree 常用命令</h3>
-        <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py start /path/to/repo \
+        <pre>python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py start /path/to/repo \
   --task &lt;slug&gt; --conversation &lt;conversation-id&gt;
 
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py status /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py finish /path/to/repo --task &lt;slug&gt;
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py status /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py finish /path/to/repo --task &lt;slug&gt;
 
 # 仅在用户明确批准合并主分支后：
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py release /path/to/repo \
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py release /path/to/repo \
   --task &lt;slug&gt; --approved --test-command "python3 -m pytest -q tests"
 
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py sync-canonical /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py deploy-staging /path/to/repo \
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py sync-canonical /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py deploy-staging /path/to/repo \
   --task &lt;slug&gt; --approved --command "./scripts/deploy_staging.sh" \
   --deployed-commit-command "./scripts/deployed_commit.sh"
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py verify /path/to/repo --task &lt;slug&gt;
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py cleanup /path/to/repo --task &lt;slug&gt; --approved</pre>
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py verify /path/to/repo --task &lt;slug&gt;
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py cleanup /path/to/repo --task &lt;slug&gt; --approved</pre>
         <p>运行状态和锁保存在 <code>~/.codex/worktree_manager/</code>，不提交到项目仓库。清理只允许删除已经进入远端主分支且工作目录干净的本地 worktree；删除远端功能分支仍需单独授权。</p>
       </section>
 
@@ -2351,7 +2351,7 @@ python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/work
         <h3>noema_ai_box 当前配置</h3>
         <ul>
           <li>项目配置：<code>.loop/config.json</code></li>
-          <li>远程 staging：<code>root@8.210.155.175</code></li>
+          <li>远程 staging：<code>root@&lt;staging-host&gt;</code></li>
           <li>staging 端口：<code>8081</code></li>
           <li>staging 地址：<code>http://8.210.155.175:8081</code></li>
           <li>staging 数据库：<code>noema_ai_box_loop_staging</code></li>

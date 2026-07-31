@@ -193,20 +193,20 @@ For `noema_ai_box`, start the service from this repository and point it at the
 target project:
 
 ```bash
-scripts/start_memory_review.sh /Users/stephenbo/Noema/Projects/noema_ai_box
+scripts/start_memory_review.sh <target-project-path>
 ```
 
 Equivalent explicit command:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT=/Users/stephenbo/Noema/Projects/noema_ai_box \
+MEMORY_REVIEW_PROJECT_ROOT=<target-project-path> \
   python3 scripts/memory_review_queue.py ensure-server
 ```
 
 From another project directory, you can also run:
 
 ```bash
-/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/start_memory_review.sh "$(pwd)"
+<path-to-vibe_coding_manage_platform>/scripts/start_memory_review.sh "$(pwd)"
 ```
 
 Open:
@@ -483,7 +483,7 @@ If a project has Codex hooks, point the hook command to this repository's
 scripts or copy these scripts into the project. A typical project hook can run:
 
 ```bash
-python3 /path/to/vibe_coding_manage_platform/scripts/memory_review_queue.py ensure-server
+python3 <path-to-vibe_coding_manage_platform>/scripts/memory_review_queue.py ensure-server
 ```
 
 ## How To Use With Another Project
@@ -515,7 +515,7 @@ Prefer replacing those hooks with a call to this central repository:
 
 ```bash
 MEMORY_REVIEW_PROJECT_ROOT=/path/to/project \
-  python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_review_queue.py ensure-server
+  python3 <path-to-vibe_coding_manage_platform>/scripts/memory_review_queue.py ensure-server
 ```
 
 Each project still owns its own project memory files:
