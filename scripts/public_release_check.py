@@ -100,13 +100,18 @@ def _tracked_client_assets(root: pathlib.Path) -> list[pathlib.Path] | None:
 
 
 def _client_assets_without_git(root: pathlib.Path) -> list[pathlib.Path]:
-    return [
-        path
-        for directory in (root / ".claude", root / ".codex")
-        if directory.is_dir()
-        for path in sorted(directory.rglob("*"))
-        if path.is_file() or path.is_symlink()
-    ]
+    candidates: list[pathlib.Path] = []
+    for directory in (root / ".claude", root / ".codex"):
+        if directory.is_symlink():
+            candidates.append(directory)
+            continue
+        if directory.is_dir():
+            candidates.extend(
+                path
+                for path in sorted(directory.rglob("*"))
+                if path.is_file() or path.is_symlink()
+            )
+    return candidates
 
 
 def _is_local_client_runtime_config(path: pathlib.Path, root: pathlib.Path) -> bool:

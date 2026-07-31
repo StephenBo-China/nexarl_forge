@@ -180,6 +180,30 @@ class PublicReleaseCheckTest(unittest.TestCase):
             ],
         )
 
+    def test_scan_tree_reports_symlinked_client_root_without_following_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "public-tree"
+            external = base / "external-client"
+            external.mkdir(parents=True)
+            (external / "legacy.md").write_text("Path: /Users/example\n", encoding="utf-8")
+            root.mkdir()
+            client_root = root / ".claude"
+            client_root.symlink_to(external, target_is_directory=True)
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            violations,
+            [
+                {
+                    "path": str(root.resolve() / ".claude"),
+                    "pattern": "client_asset_symlink",
+                    "match": "symlink client asset is not allowed",
+                }
+            ],
+        )
+
     def test_active_release_files_contain_no_personal_absolute_path(self) -> None:
         violations = public_release_check.scan_tree(ROOT)
         self.assertEqual(violations, [])
