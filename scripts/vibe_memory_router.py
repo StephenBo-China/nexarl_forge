@@ -21,6 +21,7 @@ from typing import Any, Mapping
 import memory_project
 import memory_review_queue
 import vibe_memory_paths
+import vibe_memory_settings
 from ui_design_store import atomic_write_json
 from vibe_memory_events import NormalizedEvent, normalize_event
 
@@ -236,6 +237,7 @@ def build_context(
     event: NormalizedEvent,
     project_root: pathlib.Path | None,
     pending: Mapping[str, int],
+    automatic_candidate_checks: bool = True,
 ) -> str:
     """Build one policy packet for registered projects or personal-only events."""
     personal_root = pathlib.Path.home() / ".codex" / "personal_memory"
@@ -302,6 +304,19 @@ def build_context(
         ]
     )
     command = " ".join(shlex.quote(part) for part in command_parts)
+    candidate_reminder = ""
+    if automatic_candidate_checks:
+        candidate_reminder = f"""- The active conversation model may create at most two distilled candidates.
+- Personal categories: {personal_categories}.{project_category_line}
+- Never capture raw prompts, secrets, filesystem paths, one-off tasks,
+  screenshots, URLs, credentials, tokens, or uncertain assumptions.
+- Hooks provide metadata and policy context only; they do not summarize prompts
+  or call another model.
+
+Candidate CLI:
+
+    {command}
+"""
     return f"""# Shared Memory Context
 
 - source agent: {_markdown_escape(event.agent)}
@@ -319,16 +334,7 @@ def build_context(
   after explicit approval of the exact candidate content.
 - Write candidates only to the proposals files; never write directly to
   approved long or short memory.
-- The active conversation model may create at most two distilled candidates.
-- Personal categories: {personal_categories}.{project_category_line}
-- Never capture raw prompts, secrets, filesystem paths, one-off tasks,
-  screenshots, URLs, credentials, tokens, or uncertain assumptions.
-- Hooks provide metadata and policy context only; they do not summarize prompts
-  or call another model.
-
-Candidate CLI:
-
-    {command}
+{candidate_reminder}
 """
 
 
@@ -780,6 +786,13 @@ def handle_event(
     if reservation is None:
         return {"status": "duplicate"}
     try:
+        paths = vibe_memory_paths.for_home()
+        settings = vibe_memory_settings.load_settings(paths)
+        if normalized.event == "SessionStart":
+            vibe_memory_settings.prune_personal_short(
+                pathlib.Path(paths.personal_memory) / "short.md",
+                retention_days=int(settings["personal_short_retention_days"]),
+            )
         project_root = resolve_registered_project(normalized.cwd, _registry_projects())
         counts: Mapping[str, int]
         if project_root is None:
@@ -787,7 +800,12 @@ def handle_event(
         else:
             counts = _refresh_review_queue(project_root)
 
-        context = build_context(normalized, project_root, counts)
+        context = build_context(
+            normalized,
+            project_root,
+            counts,
+            automatic_candidate_checks=bool(settings["automatic_candidate_checks"]),
+        )
         if project_root is not None:
             _write_context_packets(project_root, context)
         if not store.commit(normalized, reservation):

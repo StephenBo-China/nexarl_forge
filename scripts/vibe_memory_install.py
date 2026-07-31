@@ -1127,7 +1127,8 @@ def render_runtime_config(port: int, app_version: str) -> str:
 def install_runtime_config(
     paths: RuntimePaths, *, port: int, app_version: str
 ) -> dict[str, object]:
-    content = render_runtime_config(port, app_version).encode("utf-8")
+    runtime_value = json.loads(render_runtime_config(port, app_version))
+    content = (json.dumps(runtime_value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     parent = pathlib.Path(paths.install_root)
     _validate_install_ancestor_chain(parent)
     parent_fd = _open_or_create_directory_chain(_canonical_install_path(parent))
@@ -1136,6 +1137,23 @@ def install_runtime_config(
     try:
         if _entry_exists(parent_fd, name):
             current = _read_regular_file_at(parent_fd, name, target)
+            try:
+                current_value = json.loads(current.decode("utf-8"))
+                import vibe_memory_settings
+
+                settings_keys = set(vibe_memory_settings.default_settings())
+                if isinstance(current_value, dict) and settings_keys.issubset(current_value):
+                    preserved_settings = {
+                        key: current_value[key] for key in settings_keys
+                    }
+                    vibe_memory_settings.validate_settings(preserved_settings)
+                    preserved_settings["service_port"] = port
+                    combined = {**runtime_value, **preserved_settings}
+                    content = (
+                        json.dumps(combined, indent=2, sort_keys=True) + "\n"
+                    ).encode("utf-8")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                pass
             if current == content:
                 return {"changed": False, "path": str(target)}
         temporary_name = f".{name}.tmp-{uuid.uuid4().hex}"
@@ -1185,10 +1203,28 @@ def read_runtime_config(paths: RuntimePaths) -> dict[str, object]:
     value = json.loads(raw.decode("utf-8"))
     if not isinstance(value, dict):
         raise ValueError("runtime config must contain an object")
-    expected = render_runtime_config(value.get("port"), value.get("app_version"))
+    runtime_keys = {"app_version", "port", "schema_version", "service"}
+    runtime_value = {key: value.get(key) for key in runtime_keys}
+    expected = render_runtime_config(
+        runtime_value.get("port"), runtime_value.get("app_version")
+    )
     normalized = json.loads(expected)
-    if value != normalized:
+    if runtime_value != normalized:
         raise ValueError("runtime config has an invalid structure")
+    extra = set(value).difference(runtime_keys)
+    if extra:
+        import vibe_memory_settings
+
+        settings_keys = set(vibe_memory_settings.default_settings())
+        if extra != settings_keys.difference({"schema_version"}):
+            raise ValueError("runtime config has an invalid structure")
+        settings_value = {
+            key: value[key] if key in value else value["schema_version"]
+            for key in settings_keys
+        }
+        vibe_memory_settings.validate_settings(settings_value)
+        if settings_value["service_port"] != runtime_value["port"]:
+            raise ValueError("runtime config ports do not match")
     return value
 
 

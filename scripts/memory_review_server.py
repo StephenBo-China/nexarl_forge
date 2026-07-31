@@ -21,6 +21,7 @@ import ui_design_preferences
 import ui_skill_publisher
 import ui_skill_registry
 import vibe_memory_paths
+import vibe_memory_settings
 
 
 HOST = review.REVIEW_HOST
@@ -35,6 +36,53 @@ def health_payload() -> dict[str, object]:
         "app_version": manifest["app_version"],
         "data_schema_version": manifest["data_schema_version"],
     }
+
+
+def settings_payload() -> dict[str, object]:
+    return vibe_memory_settings.load_settings(vibe_memory_paths.for_home())
+
+
+def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
+    allowed = {
+        "codex_hooks_enabled",
+        "claude_hooks_enabled",
+        "automatic_candidate_checks",
+        "personal_short_retention_days",
+        "start_at_login",
+        "service_port",
+        "workspace",
+        "formal_memory_requires_approval",
+        "service_host",
+    }
+    unknown = set(body).difference(allowed)
+    if unknown:
+        raise ValueError(f"unknown first-run settings: {', '.join(sorted(unknown))}")
+    if body.get("formal_memory_requires_approval", True) is not True:
+        raise ValueError("formal_memory_requires_approval must remain true")
+    if body.get("service_host", "127.0.0.1") != "127.0.0.1":
+        raise ValueError("service_host must remain 127.0.0.1")
+    workspace = body.get("workspace")
+    if workspace is not None and not isinstance(workspace, str):
+        raise ValueError("workspace must be a path string")
+    paths = vibe_memory_paths.for_home()
+    value = vibe_memory_settings.load_settings(paths)
+    for key in (
+        "codex_hooks_enabled",
+        "claude_hooks_enabled",
+        "automatic_candidate_checks",
+        "personal_short_retention_days",
+        "start_at_login",
+        "service_port",
+    ):
+        if key in body:
+            value[key] = body[key]
+    value["first_run_complete"] = True
+    saved = vibe_memory_settings.save_settings(paths, value)
+    vibe_memory_settings.reconcile_hooks(paths, saved)
+    vibe_memory_settings.reconcile_launch_agent(paths, saved)
+    if isinstance(workspace, str) and workspace.strip():
+        memory_project.register_project(workspace)
+    return saved
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -2440,6 +2488,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self.send_json(health_payload())
             return
+        if parsed.path == "/api/settings":
+            self.send_json(settings_payload())
+            return
         if parsed.path == "/api/queue":
             self.send_json(review.load_queue(refresh=True))
             return
@@ -2464,6 +2515,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path in UI_DESIGN_POST_ROUTES:
                 self.send_json(ui_design_post(parsed.path, self.read_json()))
+                return
+            if parsed.path == "/api/settings/first-run":
+                self.send_json(save_first_run_settings(self.read_json()))
                 return
             if parsed.path == "/api/projects/register":
                 body = self.read_json()

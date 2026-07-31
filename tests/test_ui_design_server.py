@@ -19,6 +19,8 @@ import memory_review
 import ui_design_gate as gate
 import ui_design_preferences as preferences
 import ui_skill_registry as registry
+import vibe_memory_paths
+import vibe_memory_settings
 
 
 class UIDesignServerTest(unittest.TestCase):
@@ -51,6 +53,90 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(payload["app_version"], "1.0.0")
         self.assertEqual(payload["data_schema_version"], 1)
         self.assertIs(payload["ok"], True)
+
+    def settings_request(
+        self, method: str, path: str, body: dict[str, object] | None = None
+    ) -> tuple[int, dict[str, object]]:
+        handler = object.__new__(server.Handler)
+        handler.path = path
+        handler.read_json = mock.Mock(return_value=body or {})
+        handler.send_json = mock.Mock()
+        if method == "GET":
+            handler.do_GET()
+        else:
+            handler.do_POST()
+        payload = handler.send_json.call_args.args[0]
+        status = handler.send_json.call_args.kwargs.get("status", 200)
+        return status, payload
+
+    def test_settings_api_loads_defaults_and_rejects_disabling_approval(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "settings-home")
+        with mock.patch.object(
+            server.vibe_memory_paths, "for_home", return_value=paths
+        ):
+            status, payload = self.settings_request("GET", "/api/settings")
+            rejected_status, rejected = self.settings_request(
+                "POST",
+                "/api/settings/first-run",
+                {"formal_memory_requires_approval": False},
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, vibe_memory_settings.default_settings())
+        self.assertEqual(rejected_status, 400)
+        self.assertIn("formal_memory_requires_approval", rejected["error"])
+
+    def test_first_run_saves_choices_reconciles_and_registers_only_explicit_workspace(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "settings-home")
+        workspace = self.temp / "chosen-workspace"
+        workspace.mkdir()
+        body = {
+            "codex_hooks_enabled": False,
+            "claude_hooks_enabled": True,
+            "automatic_candidate_checks": False,
+            "personal_short_retention_days": 14,
+            "start_at_login": False,
+            "service_port": 9123,
+            "workspace": str(workspace),
+        }
+        with mock.patch.object(
+            server.vibe_memory_paths, "for_home", return_value=paths
+        ), mock.patch.object(
+            server.vibe_memory_settings, "reconcile_hooks"
+        ) as hooks, mock.patch.object(
+            server.vibe_memory_settings, "reconcile_launch_agent"
+        ) as launch, mock.patch.object(
+            server.memory_project, "register_project", return_value={"projects": []}
+        ) as register:
+            status, payload = self.settings_request(
+                "POST", "/api/settings/first-run", body
+            )
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["first_run_complete"])
+        self.assertFalse(payload["automatic_candidate_checks"])
+        hooks.assert_called_once_with(paths, payload)
+        launch.assert_called_once_with(paths, payload)
+        register.assert_called_once_with(str(workspace))
+
+        persisted = vibe_memory_settings.load_settings(paths)
+        self.assertEqual(persisted, payload)
+
+    def test_first_run_without_workspace_never_registers_application_clone(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "settings-home")
+        with mock.patch.object(
+            server.vibe_memory_paths, "for_home", return_value=paths
+        ), mock.patch.object(
+            server.vibe_memory_settings, "reconcile_hooks"
+        ), mock.patch.object(
+            server.vibe_memory_settings, "reconcile_launch_agent"
+        ), mock.patch.object(server.memory_project, "register_project") as register:
+            status, _payload = self.settings_request(
+                "POST", "/api/settings/first-run", {}
+            )
+
+        self.assertEqual(status, 200)
+        register.assert_not_called()
 
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(
