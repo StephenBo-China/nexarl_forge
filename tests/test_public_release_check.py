@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import errno
+import io
+import json
 import pathlib
 import subprocess
 import sys
@@ -16,6 +20,130 @@ import verify_release
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_scan_tree_rejects_external_release_file_symlink_without_reading_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "public-tree"
+            root.mkdir()
+            external = base / "external-readme.md"
+            external.write_text("Path: /Users/example\n", encoding="utf-8")
+            (root / "README.md").symlink_to(external)
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            [(violation["path"], violation["pattern"]) for violation in violations],
+            [("README.md", "release_asset_symlink")],
+        )
+
+    def test_scan_tree_rejects_release_directory_symlinks_without_recursing(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = pathlib.Path(temporary)
+            root = base / "public-tree"
+            root.mkdir()
+            expected: list[tuple[str, str]] = []
+            for directory_name in ("scripts", "templates"):
+                directory = root / directory_name
+                directory.mkdir()
+                external = base / f"external-{directory_name}"
+                external.mkdir()
+                (external / "leaked.py").write_text(
+                    "token = 'unique-external-secret'\n", encoding="utf-8"
+                )
+                (directory / "external").symlink_to(external, target_is_directory=True)
+                expected.append((f"{directory_name}/external", "release_asset_symlink"))
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            [(violation["path"], violation["pattern"]) for violation in violations],
+            expected,
+        )
+
+    def test_scan_tree_rejects_broken_release_file_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            link = root / "README.md"
+            link.symlink_to(root / "missing-readme.md")
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            [(violation["path"], violation["pattern"]) for violation in violations],
+            [("README.md", "release_asset_symlink")],
+        )
+
+    def test_unreadable_violation_redacts_absolute_error_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            blocked = root / "docs" / "blocked.md"
+            blocked.parent.mkdir(parents=True)
+            blocked.write_text("documentation\n", encoding="utf-8")
+            original_read_text = pathlib.Path.read_text
+
+            def read_text_with_permission_error(
+                path: pathlib.Path, *args: object, **kwargs: object
+            ) -> str:
+                if path == blocked.resolve():
+                    raise PermissionError(errno.EACCES, "denied", str(blocked))
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(
+                pathlib.Path,
+                "read_text",
+                new=read_text_with_permission_error,
+            ):
+                violations = public_release_check.scan_tree(root)
+
+        serialized = json.dumps(violations, ensure_ascii=False)
+        self.assertNotIn(str(root), serialized)
+        self.assertEqual(violations[0]["path"], "docs/blocked.md")
+        self.assertEqual(violations[0]["pattern"], "unreadable")
+        self.assertEqual(violations[0]["match"], "PermissionError")
+
+    def test_scan_tree_redacts_credential_and_verification_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            readme = root / "README.md"
+            readme.write_text(
+                "token = 'unique-credential-secret'\nverification_code = 123456\n",
+                encoding="utf-8",
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        by_pattern = {violation["pattern"]: violation for violation in violations}
+        self.assertEqual(by_pattern["credential_assignment"]["match"], "[redacted]")
+        self.assertEqual(
+            by_pattern["verification_code_assignment"]["match"], "[redacted]"
+        )
+
+    def test_public_release_cli_omits_match_and_absolute_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            secret = "unique-cli-credential-secret"
+            (root / "README.md").write_text(
+                f"token = '{secret}'\n", encoding="utf-8"
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = public_release_check.main(["--tree", str(root)])
+
+        rendered = output.getvalue()
+        self.assertEqual(status, 1)
+        self.assertNotIn(secret, rendered)
+        self.assertNotIn(str(root), rendered)
+        self.assertNotIn('"match"', rendered)
+        self.assertEqual(
+            json.loads(rendered),
+            {
+                "status": "failed",
+                "violations": [
+                    {"path": "README.md", "pattern": "credential_assignment"}
+                ],
+            },
+        )
+
     def test_evaluate_checks_wires_public_tree_status_helper(self) -> None:
         status = "failed: README.md [personal_path]"
         patches = {

@@ -21,7 +21,6 @@ _ROOT_FILES = (
     "release.json",
     "install.sh",
 )
-_DOC_FILES = ("docs/*.md",)
 _LOCAL_CLIENT_RUNTIME_CONFIGS = frozenset({".codex/hooks.json", ".claude/settings.json"})
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("personal_path", re.compile(r"/U" + r"sers/")),
@@ -49,16 +48,43 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
     for name in _ROOT_FILES:
         candidate = root / name
-        if candidate.is_file():
+        if candidate.is_symlink() or candidate.is_file():
             yield candidate
-    for pattern in _DOC_FILES:
-        yield from sorted(path for path in root.glob(pattern) if path.is_file())
+
+    docs = root / "docs"
+    if docs.is_symlink():
+        yield docs
+    elif docs.is_dir():
+        # Keep the historical docs boundary: only top-level Markdown files are
+        # release candidates; nested plans/specs remain out of scope.
+        yield from sorted(
+            path
+            for path in docs.iterdir()
+            if path.suffix == ".md" and (path.is_symlink() or path.is_file())
+        )
+
     scripts = root / "scripts"
-    if scripts.is_dir():
-        yield from sorted(path for path in scripts.rglob("*.py") if path.is_file())
+    if scripts.is_symlink():
+        yield scripts
+    elif scripts.is_dir():
+        yield from _iter_release_tree(scripts, suffix=".py")
+
     templates = root / "templates"
-    if templates.is_dir():
-        yield from sorted(path for path in templates.rglob("*") if path.is_file())
+    if templates.is_symlink():
+        yield templates
+    elif templates.is_dir():
+        yield from _iter_release_tree(templates)
+
+
+def _iter_release_tree(directory: pathlib.Path, *, suffix: str | None = None) -> Iterable[pathlib.Path]:
+    """Walk release assets without following directory symlinks."""
+    for path in sorted(directory.iterdir()):
+        if path.is_symlink():
+            yield path
+        elif path.is_dir():
+            yield from _iter_release_tree(path, suffix=suffix)
+        elif suffix is None or path.suffix == suffix:
+            yield path
 
 
 def _client_asset_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
@@ -132,11 +158,57 @@ def _display_path(path: pathlib.Path, root: pathlib.Path) -> str:
         return f"<outside-root>/{name}"
 
 
+def _release_asset_safety_violation(
+    path: pathlib.Path, root: pathlib.Path
+) -> dict[str, str] | None:
+    try:
+        lexical = pathlib.Path(os.path.abspath(os.fspath(path)))
+        relative = lexical.relative_to(root)
+    except (OSError, ValueError):
+        return {
+            "path": _display_path(path, root),
+            "pattern": "release_asset_outside_root",
+            "match": "release asset is outside the scanned root",
+        }
+
+    current = root
+    try:
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                return {
+                    "path": _display_path(path, root),
+                    "pattern": "release_asset_symlink",
+                    "match": "symlink release asset is not allowed",
+                }
+        resolved = path.resolve(strict=True)
+        resolved.relative_to(root)
+    except ValueError:
+        return {
+            "path": _display_path(path, root),
+            "pattern": "release_asset_outside_root",
+            "match": "release asset is outside the scanned root",
+        }
+    except OSError:
+        return {
+            "path": _display_path(path, root),
+            "pattern": "release_asset_unreadable",
+            "match": "release asset could not be safely resolved",
+        }
+    return None
+
+
 def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        return [{"path": _display_path(path, root), "pattern": "unreadable", "match": str(error)}]
+        return [
+            {
+                "path": _display_path(path, root),
+                "pattern": "unreadable",
+                "match": type(error).__name__,
+            }
+        ]
     violations: list[dict[str, str]] = []
     for name, pattern in _PATTERNS:
         match = pattern.search(text)
@@ -145,7 +217,11 @@ def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
                 {
                     "path": _display_path(path, root),
                     "pattern": name,
-                    "match": match.group(0),
+                    "match": (
+                        "[redacted]"
+                        if name in {"credential_assignment", "verification_code_assignment"}
+                        else match.group(0)
+                    ),
                 }
             )
     return violations
@@ -163,11 +239,28 @@ def _scan_client_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str,
     return _scan_text(path, root)
 
 
+def _scan_release_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
+    safety_violation = _release_asset_safety_violation(path, root)
+    if safety_violation:
+        return [safety_violation]
+    return _scan_text(path, root)
+
+
+def _safe_cli_path(value: object, root: pathlib.Path) -> str:
+    try:
+        candidate = pathlib.Path(str(value))
+    except (TypeError, ValueError):
+        return "<unknown-path>"
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    return _display_path(candidate, root)
+
+
 def scan_tree(root: pathlib.Path | str) -> list[dict[str, str]]:
     base = pathlib.Path(root).expanduser().resolve()
     violations: list[dict[str, str]] = []
     for path in _file_candidates(base):
-        violations.extend(_scan_text(path, base))
+        violations.extend(_scan_release_asset(path, base))
     for path in _client_asset_candidates(base):
         violations.extend(_scan_client_asset(path, base))
     return violations
@@ -177,9 +270,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tree", default=".")
     args = parser.parse_args(argv)
-    violations = scan_tree(pathlib.Path(args.tree))
+    base = pathlib.Path(args.tree).expanduser().resolve()
+    violations = scan_tree(base)
     if violations:
-        print(json.dumps({"status": "failed", "violations": violations}, ensure_ascii=False, indent=2))
+        safe_violations = [
+            {
+                "path": _safe_cli_path(violation.get("path", "<unknown-path>"), base),
+                "pattern": violation.get("pattern", "unknown"),
+            }
+            for violation in violations
+        ]
+        print(json.dumps({"status": "failed", "violations": safe_violations}, ensure_ascii=False, indent=2))
         return 1
     print("public release tree check: ok")
     return 0
