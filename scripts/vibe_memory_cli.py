@@ -183,6 +183,10 @@ def _restore_managed_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None
         temporary.unlink(missing_ok=True)
 
 
+def _hook_backup_artifacts(path: pathlib.Path) -> set[pathlib.Path]:
+    return set(path.parent.glob(f"{path.name}.bak.*"))
+
+
 def _snapshot_current(path: pathlib.Path) -> str | None:
     try:
         metadata = path.lstat()
@@ -228,6 +232,10 @@ def install_command(args: argparse.Namespace) -> int:
         for target, agent, _name in hook_targets:
             vibe_memory_hooks.preview(target, agent, runtime)
         snapshots = {target: _snapshot_managed_file(target) for target, _agent, _name in hook_targets}
+        hook_backups = {
+            target: _hook_backup_artifacts(target)
+            for target, _agent, _name in hook_targets
+        }
         snapshots[launch_agent] = _snapshot_managed_file(launch_agent)
         snapshots[runtime_config_path] = _snapshot_managed_file(runtime_config_path)
         current_before = _snapshot_current(runtime)
@@ -237,27 +245,26 @@ def install_command(args: argparse.Namespace) -> int:
 
     data: dict[str, object] | None = None
     hooks: dict[str, dict[str, object]] = {}
-    changed_paths: set[pathlib.Path] = set()
+    rollback_paths: set[pathlib.Path] = set()
+    attempted_hook_targets: set[pathlib.Path] = set()
     try:
         installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
         data = vibe_memory_install.prepare_data(paths)
+        rollback_paths.add(runtime_config_path)
         runtime_config = vibe_memory_install.install_runtime_config(
             paths, port=args.port, app_version=installed["version"]
         )
-        if runtime_config["changed"]:
-            changed_paths.add(runtime_config_path)
+        rollback_paths.add(launch_agent)
         plist_result = vibe_memory_install.install_launch_agent(paths, plist)
-        if plist_result["changed"]:
-            changed_paths.add(launch_agent)
         for target, agent, name in hook_targets:
+            rollback_paths.add(target)
+            attempted_hook_targets.add(target)
             hooks[name] = vibe_memory_hooks.repair(target, agent, runtime)
-            if hooks[name]["changed"]:
-                changed_paths.add(target)
         _json({"status": "installed", "runtime": installed, "runtime_config": runtime_config, "data": data, "launch_agent": plist_result, "hooks": hooks})
         return 0
     except Exception:
         rollback_errors = []
-        for target in changed_paths:
+        for target in rollback_paths:
             try:
                 _restore_managed_file(target, snapshots[target])
             except Exception:
@@ -267,17 +274,15 @@ def install_command(args: argparse.Namespace) -> int:
         except Exception:
             rollback_errors.append(str(runtime))
         if not rollback_errors:
-            for result in hooks.values():
-                backup = result.get("backup")
-                if not isinstance(backup, str) or not backup:
-                    continue
-                artifact = pathlib.Path(backup)
-                try:
-                    if artifact.is_symlink() or not artifact.is_file():
-                        raise ValueError("hook backup changed type during rollback")
-                    artifact.unlink()
-                except Exception:
-                    rollback_errors.append(str(artifact))
+            for target in attempted_hook_targets:
+                artifacts = _hook_backup_artifacts(target) - hook_backups[target]
+                for artifact in artifacts:
+                    try:
+                        if artifact.is_symlink() or not artifact.is_file():
+                            raise ValueError("hook backup changed type during rollback")
+                        artifact.unlink()
+                    except Exception:
+                        rollback_errors.append(str(artifact))
         _json({
             "status": "failed",
             "phase": "commit",

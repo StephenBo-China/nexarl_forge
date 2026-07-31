@@ -163,6 +163,57 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertFalse(list(codex.parent.glob("hooks.json.bak.*")))
         self.assertFalse(list(claude.parent.glob("settings.json.bak.*")))
 
+    def test_install_rolls_back_launch_agent_when_replace_then_raise_hides_result(self) -> None:
+        plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_text("old plist\n", encoding="utf-8")
+        real_install = vibe_memory_cli.vibe_memory_install.install_launch_agent
+
+        def replace_then_raise(*arguments: object, **keywords: object) -> object:
+            real_install(*arguments, **keywords)
+            raise OSError("injected post-replace launch agent failure")
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent",
+            side_effect=replace_then_raise,
+        ):
+            code, output, stderr = self.invoke([
+                "install", "--source-root", str(ROOT)
+            ])
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["phase"], "commit")
+        self.assertTrue(output["rollback"]["ok"])
+        self.assertEqual(plist.read_text(encoding="utf-8"), "old plist\n")
+        self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
+        self.assertFalse((self.paths.install_root / "config.json").exists())
+
+    def test_install_rolls_back_hook_and_backup_when_replace_then_raise_hides_result(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        codex.parent.mkdir(parents=True)
+        codex.write_text('{"custom":"codex"}\n', encoding="utf-8")
+        real_repair = vibe_memory_cli.vibe_memory_hooks.repair
+
+        def replace_then_raise(*arguments: object, **keywords: object) -> object:
+            real_repair(*arguments, **keywords)
+            raise OSError("injected post-replace hook failure")
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair",
+            side_effect=replace_then_raise,
+        ):
+            code, output, stderr = self.invoke([
+                "install", "--source-root", str(ROOT)
+            ])
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["phase"], "commit")
+        self.assertTrue(output["rollback"]["ok"])
+        self.assertEqual(codex.read_text(encoding="utf-8"), '{"custom":"codex"}\n')
+        self.assertFalse(list(codex.parent.glob("hooks.json.bak.*")))
+        self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
+        self.assertFalse((self.paths.install_root / "config.json").exists())
+
     def test_real_install_keeps_codex_and_claude_hooks_on_current_symlink(self) -> None:
         code, output, stderr = self.invoke([
             "install", "--source-root", str(ROOT), "--with-claude-hooks", "--port", "9123"
@@ -243,7 +294,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             self.paths, port=9123, app_version="1.0.0"
         )
         redirect = urllib.error.HTTPError(
-            "http://127.0.0.1:9123/health", 302, "Found", {}, None
+            "http://127.0.0.1:9123/health", 302, "Found", {}, io.BytesIO()
         )
         opener = mock.Mock()
         opener.open.side_effect = redirect
