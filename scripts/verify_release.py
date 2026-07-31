@@ -61,6 +61,17 @@ def _command_status(command: list[str], *, cwd: pathlib.Path | None = None, env:
     return f"failed: {detail[:240]}"
 
 
+def _public_tree_status(base: pathlib.Path | str) -> str:
+    """Summarize the public-tree gate without exposing matched secret text."""
+    violations = public_release_check.scan_tree(base)
+    if not violations:
+        return "ok"
+    first = violations[0]
+    path = str(first.get("path") or "<unknown-path>")
+    pattern = str(first.get("pattern") or "unknown")
+    return f"failed: {path} [{pattern}]"
+
+
 def _compile_python() -> str:
     try:
         for path in sorted((ROOT / "scripts").glob("*.py")):
@@ -210,7 +221,7 @@ def evaluate_checks(root: pathlib.Path | str) -> dict[str, str]:
         "python": _compile_python(),
         "unit_tests": _command_status([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], cwd=base),
         "install_e2e": _command_status([sys.executable, "-m", "unittest", "tests.test_macos_install_e2e", "-v"], cwd=base),
-        "public_tree": "ok" if not public_release_check.scan_tree(base) else "failed: public release tree has violations",
+        "public_tree": _public_tree_status(base),
         "plist": "ok",
         "loopback": "ok",
         "permissions": _permissions_check(base),

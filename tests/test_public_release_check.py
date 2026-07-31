@@ -16,6 +16,35 @@ import verify_release
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_scan_tree_reports_root_relative_path_for_public_file_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            guide = root / "docs" / "guide.md"
+            guide.parent.mkdir(parents=True)
+            guide.write_text("Example home: /Users/example\n", encoding="utf-8")
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertIn(
+            {
+                "path": "docs/guide.md",
+                "pattern": "personal_path",
+                "match": "/Users/",
+            },
+            violations,
+        )
+
+    def test_public_tree_status_exposes_first_relative_path_and_pattern(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            guide = root / "docs" / "guide.md"
+            guide.parent.mkdir(parents=True)
+            guide.write_text("Example home: /Users/example\n", encoding="utf-8")
+
+            status = verify_release._public_tree_status(root)
+
+        self.assertEqual(status, "failed: docs/guide.md [personal_path]")
+
     def test_scan_tree_checks_legacy_codex_assets_without_git_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -27,7 +56,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": str(legacy_hook.resolve()),
+                "path": ".codex/hooks/legacy.py",
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -53,7 +82,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": str(legacy_hook.resolve()),
+                "path": ".codex/hooks/legacy.py",
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -73,7 +102,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": str(legacy_hook.resolve()),
+                "path": ".codex/hooks/legacy.py",
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -96,7 +125,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": str(legacy_rule.resolve()),
+                "path": ".claude/rules/legacy.md",
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -119,7 +148,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": str(rule.resolve()),
+                "path": ".claude/rules/记忆\nrule.md",
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -153,7 +182,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             violations,
             [
                 {
-                    "path": str(root.resolve() / ".claude" / "rules" / "external.md"),
+                    "path": ".claude/rules/external.md",
                     "pattern": "client_asset_symlink",
                     "match": "symlink client asset is not allowed",
                 }
@@ -173,7 +202,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             violations,
             [
                 {
-                    "path": str(root.resolve() / ".codex" / "hooks" / "broken.py"),
+                    "path": ".codex/hooks/broken.py",
                     "pattern": "client_asset_symlink",
                     "match": "symlink client asset is not allowed",
                 }
@@ -197,7 +226,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             violations,
             [
                 {
-                    "path": str(root.resolve() / ".claude"),
+                    "path": ".claude",
                     "pattern": "client_asset_symlink",
                     "match": "symlink client asset is not allowed",
                 }

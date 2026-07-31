@@ -118,18 +118,32 @@ def _is_local_client_runtime_config(path: pathlib.Path, root: pathlib.Path) -> b
     return path.relative_to(root).as_posix() in _LOCAL_CLIENT_RUNTIME_CONFIGS
 
 
-def _scan_text(path: pathlib.Path) -> list[dict[str, str]]:
+def _display_path(path: pathlib.Path, root: pathlib.Path) -> str:
+    """Return a root-relative POSIX path without exposing local absolutes."""
+    try:
+        # ``absolute`` normalizes ``..`` lexically without following symlinks,
+        # so client-asset symlink diagnostics still point at the link itself.
+        absolute = pathlib.Path(os.path.abspath(os.fspath(path)))
+        return absolute.relative_to(root).as_posix()
+    except (OSError, ValueError):
+        # A path outside the scanned tree must fail closed without leaking the
+        # caller's local root or home directory.
+        name = pathlib.Path(path).name or "unknown"
+        return f"<outside-root>/{name}"
+
+
+def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as error:
-        return [{"path": str(path), "pattern": "unreadable", "match": str(error)}]
+        return [{"path": _display_path(path, root), "pattern": "unreadable", "match": str(error)}]
     violations: list[dict[str, str]] = []
     for name, pattern in _PATTERNS:
         match = pattern.search(text)
         if match:
             violations.append(
                 {
-                    "path": str(path),
+                    "path": _display_path(path, root),
                     "pattern": name,
                     "match": match.group(0),
                 }
@@ -137,25 +151,25 @@ def _scan_text(path: pathlib.Path) -> list[dict[str, str]]:
     return violations
 
 
-def _scan_client_asset(path: pathlib.Path) -> list[dict[str, str]]:
+def _scan_client_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
     if path.is_symlink():
         return [
             {
-                "path": str(path),
+                "path": _display_path(path, root),
                 "pattern": "client_asset_symlink",
                 "match": "symlink client asset is not allowed",
             }
         ]
-    return _scan_text(path)
+    return _scan_text(path, root)
 
 
 def scan_tree(root: pathlib.Path | str) -> list[dict[str, str]]:
     base = pathlib.Path(root).expanduser().resolve()
     violations: list[dict[str, str]] = []
     for path in _file_candidates(base):
-        violations.extend(_scan_text(path))
+        violations.extend(_scan_text(path, base))
     for path in _client_asset_candidates(base):
-        violations.extend(_scan_client_asset(path))
+        violations.extend(_scan_client_asset(path, base))
     return violations
 
 
