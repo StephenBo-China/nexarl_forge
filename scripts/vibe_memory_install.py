@@ -1290,6 +1290,29 @@ def _is_manager_launcher(content: bytes) -> bool:
     )
 
 
+def _launcher_snapshot(
+    parent_fd: int,
+    target: pathlib.Path,
+) -> tuple[tuple[int, int], bytes, int] | None:
+    """Return a no-follow launcher snapshot for a final promotion comparison."""
+    if not _entry_exists(parent_fd, target.name):
+        return None
+    try:
+        before = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise InstallError("launcher target changed while reading") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise InstallError("launcher target must be a regular file")
+    current = _read_regular_file_at(parent_fd, target.name, target)
+    try:
+        after = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise InstallError("launcher target changed while reading") from error
+    if not stat.S_ISREG(after.st_mode) or _identity(after) != _identity(before):
+        raise InstallError("launcher target changed while reading")
+    return _identity(after), current, stat.S_IMODE(after.st_mode)
+
+
 def install_runtime_config(
     paths: RuntimePaths,
     *,
@@ -1393,14 +1416,12 @@ def install_launcher(
     parent_fd = _open_or_create_directory_chain(_canonical_install_path(target.parent))
     temporary_name = f".{target.name}.tmp-{uuid.uuid4().hex}"
     try:
-        if _entry_exists(parent_fd, target.name):
-            current = _read_regular_file_at(parent_fd, target.name, target)
-            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise InstallError("launcher target must be a regular file")
+        initial = _launcher_snapshot(parent_fd, target)
+        if initial is not None:
+            _initial_identity, current, current_mode = initial
             if not _is_manager_launcher(current):
                 raise InstallError("launcher target is not manager-owned")
-            if current == content and stat.S_IMODE(metadata.st_mode) == 0o700:
+            if current == content and current_mode == 0o700:
                 return {"changed": False, "path": str(target)}
         descriptor = os.open(
             temporary_name,
@@ -1419,10 +1440,18 @@ def install_launcher(
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        if _entry_exists(parent_fd, target.name):
-            metadata = os.stat(target.name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise InstallError("launcher target must be a regular file")
+        final = _launcher_snapshot(parent_fd, target)
+        if initial is None:
+            if final is not None:
+                raise InstallError("launcher target appeared during installation")
+        else:
+            if (
+                final is None
+                or final[0] != initial[0]
+                or final[1] != initial[1]
+                or not _is_manager_launcher(final[1])
+            ):
+                raise InstallError("launcher target changed during installation")
         os.replace(temporary_name, target.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
         os.fsync(parent_fd)
         return {"changed": True, "path": str(target)}

@@ -140,6 +140,50 @@ class RuntimeInstallTest(unittest.TestCase):
 
             self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
 
+    def test_install_launcher_preserves_custom_replacement_after_initial_ownership_check(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+            paths.launcher.chmod(0o600)
+            custom = "#!/bin/sh\necho replaced\n"
+            real_fchmod = vibe_memory_install.os.fchmod
+            injected: list[bool] = []
+
+            def replace_launcher(descriptor: int, mode: int) -> None:
+                real_fchmod(descriptor, mode)
+                if not injected:
+                    paths.launcher.write_text(custom, encoding="utf-8")
+                    paths.launcher.chmod(0o700)
+                    injected.append(True)
+
+            with mock.patch.object(vibe_memory_install.os, "fchmod", side_effect=replace_launcher):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(injected, [True])
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
+
+    def test_install_launcher_rejects_custom_file_created_during_first_install(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            custom = "#!/bin/sh\necho concurrent\n"
+            real_fchmod = vibe_memory_install.os.fchmod
+            injected: list[bool] = []
+
+            def create_launcher(descriptor: int, mode: int) -> None:
+                real_fchmod(descriptor, mode)
+                if not injected:
+                    paths.launcher.write_text(custom, encoding="utf-8")
+                    paths.launcher.chmod(0o700)
+                    injected.append(True)
+
+            with mock.patch.object(vibe_memory_install.os, "fchmod", side_effect=create_launcher):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(injected, [True])
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
+
     def test_atomic_install_state_write_handles_short_os_writes(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
