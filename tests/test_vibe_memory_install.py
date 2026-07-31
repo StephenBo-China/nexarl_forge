@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import vibe_memory_install
+import vibe_memory_hooks
 import vibe_memory_paths
 
 
@@ -1854,6 +1855,104 @@ class RuntimeInstallTest(unittest.TestCase):
                 paths.project_registry,
             ):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_failed_update_keeps_previous_current_release(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            old_source = self.make_source(root / "old", {**MANIFEST, "app_version": "1.0.0"})
+            new_source = self.make_source(root / "new", {**MANIFEST, "app_version": "1.1.0"})
+            vibe_memory_install.install_runtime(old_source, paths)
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.update(
+                    new_source,
+                    paths,
+                    validation={"control_plane": "error"},
+                )
+
+            self.assertEqual(
+                (paths.install_root / "current").resolve(),
+                (paths.install_root / "releases" / "1.0.0").resolve(),
+            )
+
+    def test_rollback_switches_runtime_without_reverting_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            for version in ("1.0.0", "1.1.0"):
+                (paths.install_root / "releases" / version).mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.1.0")
+            state = paths.install_root / "state" / "install.json"
+            state.parent.mkdir(parents=True)
+            state.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "current_version": "1.1.0",
+                        "previous_version": "1.0.0",
+                        "hook_protocol_version": 1,
+                        "data_schema_version": 1,
+                        "port": 8897,
+                        "installed_clients": ["codex"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            memory = paths.personal_memory / "long.md"
+            memory.parent.mkdir(parents=True)
+            memory.write_text("approved after upgrade\n", encoding="utf-8")
+
+            result = vibe_memory_install.rollback(paths)
+
+            self.assertEqual(result["current_version"], "1.0.0")
+            self.assertTrue(result["data_retained"])
+            self.assertEqual(
+                (paths.install_root / "current").resolve(),
+                (paths.install_root / "releases" / "1.0.0").resolve(),
+            )
+            self.assertEqual(memory.read_text(encoding="utf-8"), "approved after upgrade\n")
+
+    def test_uninstall_removes_only_managed_assets_and_requires_data_deletion_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            home = paths.personal_memory.parents[1]
+            release = paths.install_root / "releases" / "1.0.0"
+            release.mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            memory = paths.personal_memory / "long.md"
+            memory.parent.mkdir(parents=True)
+            memory.write_text("approved memory\n", encoding="utf-8")
+            codex_hooks = home / ".codex" / "hooks.json"
+            codex_hooks.parent.mkdir(parents=True, exist_ok=True)
+            source = {
+                "hooks": {
+                    "SessionStart": [
+                        {"hooks": [{"type": "command", "command": "custom-hook"}]}
+                    ]
+                }
+            }
+            codex_hooks.write_text(
+                json.dumps(vibe_memory_hooks.merge_document(source, "codex", paths.install_root / "current")),
+                encoding="utf-8",
+            )
+            plist = home / "Library" / "LaunchAgents" / "com.noema.vibe-memory.plist"
+            plist.parent.mkdir(parents=True)
+            plist.write_text(vibe_memory_install.render_launch_agent(paths), encoding="utf-8")
+
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.uninstall(paths, remove_data=True)
+
+            result = vibe_memory_install.uninstall(paths, remove_data=False)
+
+            self.assertTrue(result["data_retained"])
+            self.assertTrue(memory.exists())
+            self.assertFalse(os.path.lexists(paths.install_root / "current"))
+            self.assertFalse(plist.exists())
+            text = codex_hooks.read_text(encoding="utf-8")
+            self.assertIn("custom-hook", text)
+            self.assertNotIn("vibe-memory hook", text)
 
     def test_installed_current_cli_runs_with_system_python_without_clone_path(self) -> None:
         with tempfile.TemporaryDirectory() as value:

@@ -403,6 +403,35 @@ def migrate_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def update_command(args: argparse.Namespace) -> int:
+    value = vibe_memory_install.update(pathlib.Path(args.source_root), vibe_memory_paths.for_home())
+    _json(value)
+    return 0
+
+
+def rollback_command(_args: argparse.Namespace) -> int:
+    _json(vibe_memory_install.rollback(vibe_memory_paths.for_home()))
+    return 0
+
+
+def repair_command(_args: argparse.Namespace) -> int:
+    _json(vibe_memory_install.repair(vibe_memory_paths.for_home()))
+    return 0
+
+
+def uninstall_command(args: argparse.Namespace) -> int:
+    if args.remove_data and not args.approved_data_deletion:
+        raise LifecycleError("uninstall --remove-data requires --approved-data-deletion")
+    value = vibe_memory_install.uninstall(
+        vibe_memory_paths.for_home(),
+        remove_data=args.remove_data,
+        approved_data_deletion=args.approved_data_deletion,
+        data_paths=[pathlib.Path(path).expanduser().resolve() for path in args.data_path],
+    )
+    _json(value)
+    return 0
+
+
 def hook_command(args: argparse.Namespace) -> int:
     try:
         router = importlib.import_module("vibe_memory_router")
@@ -483,6 +512,22 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--approved", action="store_true")
     apply.add_argument("project_root", nargs="*")
     migrate.set_defaults(command_handler=migrate_command)
+
+    update = subcommands.add_parser("update", help="Install a new runtime release")
+    update.add_argument("--source-root", required=True)
+    update.set_defaults(command_handler=update_command)
+
+    rollback = subcommands.add_parser("rollback", help="Switch back to the previous runtime")
+    rollback.set_defaults(command_handler=rollback_command)
+
+    repair = subcommands.add_parser("repair", help="Repair managed runtime assets")
+    repair.set_defaults(command_handler=repair_command)
+
+    uninstall = subcommands.add_parser("uninstall", help="Remove the managed runtime")
+    uninstall.add_argument("--remove-data", action="store_true")
+    uninstall.add_argument("--approved-data-deletion", action="store_true")
+    uninstall.add_argument("--data-path", action="append", default=[])
+    uninstall.set_defaults(command_handler=uninstall_command)
     return parser
 
 

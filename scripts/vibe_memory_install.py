@@ -8,6 +8,7 @@ import os
 import pathlib
 import plistlib
 import re
+import shutil
 import stat
 from string import Template
 import sys
@@ -71,6 +72,10 @@ class _AnchoredPath:
 
 class TemporaryCleanupConflict(RuntimeError):
     """Raised when a temporary install entry no longer has its created identity."""
+
+
+class InstallError(RuntimeError):
+    """Raised when an install lifecycle operation safely refuses to continue."""
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> str:
@@ -928,7 +933,12 @@ def _activate_release(install_root: pathlib.Path, install_fd: int, version: str)
             raise FileExistsError("current exists with unknown or different content") from error
 
 
-def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dict[str, str]:
+def install_runtime(
+    source_root: pathlib.Path | str,
+    paths: RuntimePaths,
+    *,
+    activate: bool = True,
+) -> dict[str, str]:
     """Install *source_root* as a private versioned release and activate it."""
     if sys.platform != "darwin":
         raise NotImplementedError("runtime installation requires Darwin atomic rename support")
@@ -946,7 +956,8 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
         destination = _AnchoredPath(releases_fd, version, releases / version)
         if _entry_exists(releases_fd, version):
             _verify_and_make_private_release(destination, expected_entries)
-            _activate_release(install_root, install_fd, version)
+            if activate:
+                _activate_release(install_root, install_fd, version)
             return {"version": version}
 
         while True:
@@ -1049,7 +1060,8 @@ def install_runtime(source_root: pathlib.Path | str, paths: RuntimePaths) -> dic
                 finally:
                     os.close(temporary_fd)
 
-        _activate_release(install_root, install_fd, version)
+        if activate:
+            _activate_release(install_root, install_fd, version)
         return {"version": version}
     finally:
         os.close(releases_fd)
@@ -1330,3 +1342,409 @@ def prepare_data(paths: RuntimePaths) -> dict[str, list[dict[str, str]]]:
         ),
     )
     return {"files": [_ensure_private_data_file(path, content) for path, content in defaults]}
+
+
+def install_state_path(paths: RuntimePaths) -> pathlib.Path:
+    return pathlib.Path(paths.install_root) / "state" / "install.json"
+
+
+def _atomic_write_private_json(path: pathlib.Path, value: dict[str, Any]) -> None:
+    content = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    parent = pathlib.Path(path.parent)
+    _validate_install_ancestor_chain(parent)
+    parent_fd = _open_or_create_directory_chain(_canonical_install_path(parent))
+    temporary_name = f".{path.name}.tmp-{uuid.uuid4().hex}"
+    try:
+        descriptor = os.open(
+            temporary_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        try:
+            os.write(descriptor, content)
+            os.fchmod(descriptor, 0o600)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if _entry_exists(parent_fd, path.name):
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise InstallError(f"managed JSON target must be a regular file: {path}")
+        os.replace(
+            temporary_name,
+            path.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
+
+
+def read_install_state(paths: RuntimePaths) -> dict[str, Any]:
+    path = install_state_path(paths)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise InstallError("install state must be an object")
+    return value
+
+
+def write_install_state(paths: RuntimePaths, value: dict[str, Any]) -> None:
+    _atomic_write_private_json(install_state_path(paths), value)
+
+
+def _current_version(paths: RuntimePaths) -> str | None:
+    current = pathlib.Path(paths.install_root) / "current"
+    try:
+        metadata = current.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISLNK(metadata.st_mode):
+        raise InstallError("current runtime must be a managed symlink")
+    link = os.readlink(current)
+    prefix = "releases/"
+    if not link.startswith(prefix) or pathlib.PurePosixPath(link).name != link[len(prefix):]:
+        raise InstallError("current runtime symlink is not managed")
+    return link[len(prefix):]
+
+
+def _activate_managed_version(paths: RuntimePaths, version: str) -> None:
+    if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
+        raise InstallError("rollback version must be a semantic version")
+    release = pathlib.Path(paths.install_root) / "releases" / version
+    if not release.is_dir() or release.is_symlink():
+        raise InstallError(f"release is not installed: {version}")
+    install_root = pathlib.Path(paths.install_root)
+    _validate_install_ancestor_chain(install_root)
+    install_fd = _open_or_create_directory_chain(_canonical_install_path(install_root))
+    temporary_name = f".current.tmp-{uuid.uuid4().hex}"
+    try:
+        os.symlink(f"releases/{version}", temporary_name, dir_fd=install_fd)
+        if _entry_exists(install_fd, "current"):
+            metadata = os.stat("current", dir_fd=install_fd, follow_symlinks=False)
+            if not stat.S_ISLNK(metadata.st_mode):
+                raise InstallError("current runtime target is not a symlink")
+        os.replace(
+            temporary_name,
+            "current",
+            src_dir_fd=install_fd,
+            dst_dir_fd=install_fd,
+        )
+        os.fsync(install_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=install_fd)
+        except FileNotFoundError:
+            pass
+        os.close(install_fd)
+
+
+def _read_registry_snapshot(paths: RuntimePaths) -> dict[str, object]:
+    try:
+        value = json.loads(paths.project_registry.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"current_project": "", "projects": []}
+    if not isinstance(value, dict):
+        raise InstallError("project registry must be an object")
+    value.setdefault("current_project", "")
+    value.setdefault("projects", [])
+    return value
+
+
+def _validate_control_plane(
+    paths: RuntimePaths,
+    validation: dict[str, str] | None,
+) -> dict[str, str]:
+    if validation is not None:
+        result = dict(validation)
+    else:
+        import vibe_memory_migration
+
+        result = vibe_memory_migration.validate_control_plane(
+            paths,
+            _read_registry_snapshot(paths),
+        )
+    if any(status != "ok" for status in result.values()):
+        raise InstallError("control-plane compatibility validation failed")
+    return result
+
+
+def _runtime_port(paths: RuntimePaths, explicit_port: int | None) -> int:
+    if explicit_port is not None:
+        if isinstance(explicit_port, bool) or not 1 <= explicit_port <= 65535:
+            raise InstallError("port must be an integer from 1 through 65535")
+        return explicit_port
+    try:
+        return int(read_runtime_config(paths)["port"])
+    except Exception:
+        return 8897
+
+
+def _snapshot_regular_file(path: pathlib.Path) -> tuple[bytes, int] | None:
+    if path.is_symlink():
+        raise InstallError(f"managed file must not be a symlink: {path}")
+    try:
+        metadata = path.stat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(metadata.st_mode):
+        raise InstallError(f"managed file must be regular: {path}")
+    return path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+
+
+def _restore_regular_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None) -> None:
+    if path.is_symlink():
+        raise InstallError(f"managed file changed to symlink: {path}")
+    if snapshot is None:
+        try:
+            metadata = path.stat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InstallError(f"managed file changed type: {path}")
+        path.unlink()
+        return
+    content, mode = snapshot
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.restore-{uuid.uuid4().hex}")
+    try:
+        temporary.write_bytes(content)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _install_state_document(
+    *,
+    current_version: str,
+    previous_version: str | None,
+    port: int,
+    installed_clients: list[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "current_version": current_version,
+        "previous_version": previous_version,
+        "hook_protocol_version": 1,
+        "data_schema_version": 1,
+        "port": port,
+        "installed_clients": installed_clients,
+    }
+
+
+def update(
+    source_root: pathlib.Path | str,
+    paths: RuntimePaths,
+    *,
+    port: int | None = None,
+    installed_clients: list[str] | None = None,
+    validation: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Install a new runtime release, validate it, then switch current."""
+    previous_version = _current_version(paths)
+    runtime_config = pathlib.Path(paths.install_root) / "config.json"
+    config_before = _snapshot_regular_file(runtime_config)
+    selected_port = _runtime_port(paths, port)
+    try:
+        installed = install_runtime(source_root, paths, activate=False)
+        new_version = installed["version"]
+        install_runtime_config(paths, port=selected_port, app_version=new_version)
+        control_plane = _validate_control_plane(paths, validation)
+        _activate_managed_version(paths, new_version)
+        clients = installed_clients
+        if clients is None:
+            state = read_install_state(paths)
+            clients = [
+                item
+                for item in state.get("installed_clients", ["codex"])
+                if item in {"codex", "claude-code"}
+            ]
+        if not clients:
+            clients = ["codex"]
+        write_install_state(
+            paths,
+            _install_state_document(
+                current_version=new_version,
+                previous_version=previous_version,
+                port=selected_port,
+                installed_clients=clients,
+            ),
+        )
+        return {
+            "status": "updated",
+            "current_version": new_version,
+            "previous_version": previous_version,
+            "control_plane": control_plane,
+        }
+    except Exception as error:
+        _restore_regular_file(runtime_config, config_before)
+        if previous_version is not None:
+            _activate_managed_version(paths, previous_version)
+        if isinstance(error, InstallError):
+            raise
+        raise InstallError("update failed") from error
+
+
+def rollback(paths: RuntimePaths) -> dict[str, Any]:
+    """Switch current back to the previous runtime without touching memory data."""
+    state = read_install_state(paths)
+    previous_version = state.get("previous_version")
+    if not isinstance(previous_version, str) or not previous_version:
+        raise InstallError("no previous runtime version is recorded")
+    current_version = _current_version(paths) or state.get("current_version")
+    _activate_managed_version(paths, previous_version)
+    port = int(state.get("port", 8897))
+    clients = [
+        item
+        for item in state.get("installed_clients", ["codex"])
+        if item in {"codex", "claude-code"}
+    ] or ["codex"]
+    write_install_state(
+        paths,
+        _install_state_document(
+            current_version=previous_version,
+            previous_version=current_version if isinstance(current_version, str) else None,
+            port=port,
+            installed_clients=clients,
+        ),
+    )
+    return {
+        "status": "rolled_back",
+        "current_version": previous_version,
+        "previous_version": current_version,
+        "data_retained": True,
+    }
+
+
+def _installed_clients(paths: RuntimePaths) -> list[str]:
+    state = read_install_state(paths)
+    clients = [
+        item
+        for item in state.get("installed_clients", ["codex"])
+        if item in {"codex", "claude-code"}
+    ]
+    return clients or ["codex"]
+
+
+def _hook_target_for_client(paths: RuntimePaths, client: str) -> tuple[pathlib.Path, str, str]:
+    home = pathlib.Path(paths.personal_memory).parents[1]
+    if client == "claude-code":
+        return home / ".claude" / "settings.json", "claude-code", "claude"
+    return home / ".codex" / "hooks.json", "codex", "codex"
+
+
+def repair(paths: RuntimePaths) -> dict[str, Any]:
+    """Re-render managed LaunchAgent and hook entries for the current runtime."""
+    import vibe_memory_hooks
+
+    runtime = pathlib.Path(paths.install_root) / "current"
+    if not runtime.is_symlink():
+        raise InstallError("current runtime is not installed")
+    port = int(read_runtime_config(paths)["port"])
+    launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port))
+    hook_results = {}
+    for path, agent, label in (_hook_target_for_client(paths, client) for client in _installed_clients(paths)):
+        hook_results[label] = vibe_memory_hooks.repair(path, agent, runtime)
+    return {
+        "status": "repaired",
+        "launch_agent": launch_agent,
+        "hooks": hook_results,
+        "data_retained": True,
+    }
+
+
+def _is_managed_launch_agent(path: pathlib.Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_symlink():
+        raise InstallError(f"managed LaunchAgent must not be a symlink: {path}")
+    text = path.read_text(encoding="utf-8")
+    return "com.noema.vibe-memory" in text and "memory_review_server.py" in text
+
+
+def _unlink_regular_file(path: pathlib.Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_symlink():
+        raise InstallError(f"managed path must not be a symlink: {path}")
+    if not path.is_file():
+        raise InstallError(f"managed path must be a regular file: {path}")
+    path.unlink()
+    return True
+
+
+def _remove_explicit_data_path(path: pathlib.Path, allowed: set[pathlib.Path]) -> None:
+    resolved = path.expanduser().resolve()
+    if resolved not in allowed:
+        raise InstallError(f"data deletion path is not an approved managed path: {resolved}")
+    if not resolved.exists():
+        return
+    if resolved.is_symlink():
+        raise InstallError(f"data deletion refuses symlink: {resolved}")
+    if resolved.is_dir():
+        shutil.rmtree(resolved)
+    else:
+        resolved.unlink()
+
+
+def uninstall(
+    paths: RuntimePaths,
+    *,
+    remove_data: bool = False,
+    approved_data_deletion: bool = False,
+    data_paths: list[pathlib.Path] | None = None,
+) -> dict[str, Any]:
+    """Remove only managed runtime assets; retain memory data unless explicitly approved."""
+    if remove_data and (not approved_data_deletion or not data_paths):
+        raise InstallError(
+            "data deletion requires --approved-data-deletion and explicit managed data paths"
+        )
+    import vibe_memory_hooks
+
+    removed: list[str] = []
+    hook_results = {}
+    for client in ("codex", "claude-code"):
+        path, _agent, label = _hook_target_for_client(paths, client)
+        hook_results[label] = vibe_memory_hooks.uninstall(path)
+    home = pathlib.Path(paths.personal_memory).parents[1]
+    launch_agent = home / "Library" / "LaunchAgents" / "com.noema.vibe-memory.plist"
+    if _is_managed_launch_agent(launch_agent):
+        launch_agent.unlink()
+        removed.append(str(launch_agent))
+    current = pathlib.Path(paths.install_root) / "current"
+    if os.path.lexists(current):
+        if not current.is_symlink():
+            raise InstallError("current runtime target is not a managed symlink")
+        current.unlink()
+        removed.append(str(current))
+    for path in (pathlib.Path(paths.install_root) / "config.json", install_state_path(paths)):
+        if _unlink_regular_file(path):
+            removed.append(str(path))
+    deleted_data: list[str] = []
+    if remove_data:
+        allowed = {
+            pathlib.Path(paths.personal_memory).resolve(),
+            pathlib.Path(paths.project_registry).resolve(),
+            pathlib.Path(paths.ui_design_home).resolve(),
+            pathlib.Path(paths.worktree_manager).resolve(),
+        }
+        for raw_path in data_paths or []:
+            _remove_explicit_data_path(pathlib.Path(raw_path), allowed)
+            deleted_data.append(str(pathlib.Path(raw_path).expanduser().resolve()))
+    return {
+        "status": "uninstalled",
+        "removed": removed,
+        "hooks": hook_results,
+        "data_retained": not remove_data,
+        "deleted_data": deleted_data,
+    }

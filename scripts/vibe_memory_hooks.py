@@ -988,3 +988,48 @@ def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
         finally:
             if source_descriptor is not None:
                 os.close(source_descriptor)
+
+
+def uninstall(path: str | pathlib.Path) -> dict[str, Any]:
+    """Remove Vibe Memory managed hook entries while preserving custom handlers."""
+    target = pathlib.Path(path)
+    _reject_symlink(target)
+    if not target.exists():
+        return {
+            "changed": False,
+            "path": str(target),
+            "backup": None,
+            "status": "missing",
+        }
+    lock_path = target.with_name(f".{target.name}.vibe-memory.lock")
+    with exclusive_lock(lock_path):
+        _reject_symlink(target)
+        source_descriptor = _open_source_descriptor(target)
+        if source_descriptor is None:
+            return {
+                "changed": False,
+                "path": str(target),
+                "backup": None,
+                "status": "missing",
+            }
+        try:
+            source = _descriptor_bytes(source_descriptor)
+            current = _parse_document_bytes(target, source)
+            updated = remove_managed_entries(current)
+            if current == updated:
+                return {
+                    "changed": False,
+                    "path": str(target),
+                    "backup": None,
+                    "status": "current",
+                }
+            result = write_with_backup(
+                target,
+                updated,
+                expected_source=source,
+                _source_descriptor=source_descriptor,
+            )
+            result["status"] = "updated" if result["changed"] else "current"
+            return result
+        finally:
+            os.close(source_descriptor)

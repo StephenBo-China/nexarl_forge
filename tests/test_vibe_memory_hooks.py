@@ -233,6 +233,41 @@ class MergeDocumentTest(unittest.TestCase):
             {"type": "command", "command": hooks.command("/old", "codex", "Stop")},
         ])
 
+    def test_uninstall_removes_managed_entries_and_preserves_custom_handlers(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            path = pathlib.Path(value) / "hooks.json"
+            source = {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "matcher": "all",
+                            "hooks": [{"type": "command", "command": "custom-stop"}],
+                        }
+                    ]
+                }
+            }
+            path.write_text(
+                json.dumps(hooks.merge_document(source, "codex", "/runtime")),
+                encoding="utf-8",
+            )
+
+            result = hooks.uninstall(path)
+
+            cleaned = json.loads(path.read_text(encoding="utf-8"))
+            self.assertTrue(result["changed"])
+            self.assertIsNotNone(result["backup"])
+            self.assertTrue(pathlib.Path(result["backup"]).exists())
+            self.assertIn("custom-stop", path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                any(
+                    hooks.MANAGED_SIGNATURE in handler.get("command", "")
+                    for groups in cleaned["hooks"].values()
+                    for group in groups
+                    for handler in group.get("hooks", [])
+                    if isinstance(handler, dict)
+                )
+            )
+
 
 class DocumentIOTest(unittest.TestCase):
     @unittest.skipUnless(sys.platform == "darwin", "Darwin rename flags only")

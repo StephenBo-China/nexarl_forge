@@ -418,6 +418,55 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(output, expected)
         apply.assert_called_once_with([project.resolve()])
 
+    def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.update",
+            return_value={"status": "updated"},
+        ) as update:
+            code, output, _ = self.invoke(["update", "--source-root", "/next"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "updated")
+        update.assert_called_once_with(pathlib.Path("/next"), self.paths)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.rollback",
+            return_value={"status": "rolled_back"},
+        ) as rollback:
+            code, output, _ = self.invoke(["rollback"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "rolled_back")
+        rollback.assert_called_once_with(self.paths)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.repair",
+            return_value={"status": "repaired"},
+        ) as repair:
+            code, output, _ = self.invoke(["repair"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "repaired")
+        repair.assert_called_once_with(self.paths)
+
+        with mock.patch("vibe_memory_cli.vibe_memory_install.uninstall") as uninstall:
+            code, output, stderr = self.invoke(["uninstall", "--remove-data"])
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertIn("--approved-data-deletion", stderr)
+        uninstall.assert_not_called()
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.uninstall",
+            return_value={"status": "uninstalled"},
+        ) as uninstall:
+            code, output, _ = self.invoke(["uninstall"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["status"], "uninstalled")
+        uninstall.assert_called_once_with(
+            self.paths,
+            remove_data=False,
+            approved_data_deletion=False,
+            data_paths=[],
+        )
+
 
 class InstallScriptContractTest(unittest.TestCase):
     def test_install_script_exact_contract_and_is_executable(self) -> None:
