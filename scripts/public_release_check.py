@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import subprocess
@@ -58,7 +59,6 @@ def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
     templates = root / "templates"
     if templates.is_dir():
         yield from sorted(path for path in templates.rglob("*") if path.is_file())
-    yield from _client_asset_candidates(root)
 
 
 def _client_asset_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
@@ -68,15 +68,35 @@ def _client_asset_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
 
 
 def _tracked_client_assets(root: pathlib.Path) -> list[pathlib.Path] | None:
-    result = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "--", ".claude", ".codex"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        top_level = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            check=False,
+        )
+        if top_level.returncode:
+            return None
+        discovered_root = pathlib.Path(os.fsdecode(top_level.stdout.rstrip(b"\n"))).resolve()
+        if discovered_root != root:
+            return None
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z", "--", ".claude", ".codex"],
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return None
     if result.returncode:
         return None
-    return [root / path for path in result.stdout.splitlines() if (root / path).is_file()]
+    return [
+        root / os.fsdecode(path)
+        for path in result.stdout.split(b"\0")
+        if path
+        and (
+            (root / os.fsdecode(path)).is_file()
+            or (root / os.fsdecode(path)).is_symlink()
+        )
+    ]
 
 
 def _client_assets_without_git(root: pathlib.Path) -> list[pathlib.Path]:
@@ -85,7 +105,7 @@ def _client_assets_without_git(root: pathlib.Path) -> list[pathlib.Path]:
         for directory in (root / ".claude", root / ".codex")
         if directory.is_dir()
         for path in sorted(directory.rglob("*"))
-        if path.is_file()
+        if path.is_file() or path.is_symlink()
     ]
 
 
@@ -112,11 +132,25 @@ def _scan_text(path: pathlib.Path) -> list[dict[str, str]]:
     return violations
 
 
+def _scan_client_asset(path: pathlib.Path) -> list[dict[str, str]]:
+    if path.is_symlink():
+        return [
+            {
+                "path": str(path),
+                "pattern": "client_asset_symlink",
+                "match": "symlink client asset is not allowed",
+            }
+        ]
+    return _scan_text(path)
+
+
 def scan_tree(root: pathlib.Path | str) -> list[dict[str, str]]:
     base = pathlib.Path(root).expanduser().resolve()
     violations: list[dict[str, str]] = []
     for path in _file_candidates(base):
         violations.extend(_scan_text(path))
+    for path in _client_asset_candidates(base):
+        violations.extend(_scan_client_asset(path))
     return violations
 
 
