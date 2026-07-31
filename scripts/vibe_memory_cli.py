@@ -23,6 +23,7 @@ try:
     import memory_review_queue
     import vibe_memory_hooks
     import vibe_memory_install
+    import vibe_memory_migration
     import vibe_memory_paths
 except ImportError:
     pass
@@ -353,6 +354,25 @@ def memory_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _migration_project_roots(args: argparse.Namespace) -> list[pathlib.Path]:
+    raw_roots = getattr(args, "project_root", None) or []
+    if not raw_roots:
+        return [memory_project.current_project().resolve()]
+    return [pathlib.Path(root).expanduser().resolve() for root in raw_roots]
+
+
+def migrate_command(args: argparse.Namespace) -> int:
+    roots = _migration_project_roots(args)
+    if args.migrate_command == "preview":
+        value = vibe_memory_migration.preview_legacy_hooks(roots)
+    else:
+        if not args.approved:
+            raise LifecycleError("migrate apply requires --approved")
+        value = vibe_memory_migration.apply_legacy_hooks(roots)
+    _json(value)
+    return 0
+
+
 def hook_command(args: argparse.Namespace) -> int:
     try:
         router = importlib.import_module("vibe_memory_router")
@@ -424,6 +444,15 @@ def build_parser() -> argparse.ArgumentParser:
     approve.add_argument("--target", choices=("project_long", "personal_long", "personal_short"))
     approve.add_argument("--content-file")
     memory.set_defaults(command_handler=memory_command)
+
+    migrate = subcommands.add_parser("migrate", help="Preview or apply safe legacy migrations")
+    migrate_sub = migrate.add_subparsers(dest="migrate_command", required=True)
+    preview = migrate_sub.add_parser("preview", help="Preview legacy project hook migration")
+    preview.add_argument("project_root", nargs="*")
+    apply = migrate_sub.add_parser("apply", help="Apply approved legacy project hook migration")
+    apply.add_argument("--approved", action="store_true")
+    apply.add_argument("project_root", nargs="*")
+    migrate.set_defaults(command_handler=migrate_command)
     return parser
 
 

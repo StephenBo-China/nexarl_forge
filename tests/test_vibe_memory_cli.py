@@ -378,6 +378,43 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         approve.assert_called_once_with("candidate-1", target="personal_long", content=None)
         self.assertEqual(output["status"], "approved")
 
+    def test_migrate_preview_delegates_to_legacy_hook_migration(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+        expected = [{"root": str(project.resolve()), "managed_entries": 5, "custom_entries": 1}]
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.preview_legacy_hooks",
+            return_value=expected,
+        ) as preview:
+            code, output, _ = self.invoke(["migrate", "preview", str(project)])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, expected)
+        preview.assert_called_once_with([project.resolve()])
+
+    def test_migrate_apply_requires_explicit_approval_and_then_delegates(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+
+        code, output, stderr = self.invoke(["migrate", "apply", str(project)])
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertIn("--approved", stderr)
+
+        expected = [{"root": str(project.resolve()), "backups": ["backup"]}]
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.apply_legacy_hooks",
+            return_value=expected,
+        ) as apply:
+            code, output, _ = self.invoke([
+                "migrate", "apply", "--approved", str(project)
+            ])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, expected)
+        apply.assert_called_once_with([project.resolve()])
+
 
 class InstallScriptContractTest(unittest.TestCase):
     def test_install_script_exact_contract_and_is_executable(self) -> None:

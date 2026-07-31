@@ -24,6 +24,7 @@ import vibe_memory_migration as migration
 class LegacyFixture:
     paths: vibe_memory_paths.RuntimePaths
     registry: dict[str, object]
+    project_roots: tuple[pathlib.Path, ...]
 
 
 def _write_text(path: pathlib.Path, text: str) -> None:
@@ -34,6 +35,19 @@ def _write_text(path: pathlib.Path, text: str) -> None:
 def _write_json(path: pathlib.Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _snapshot_tree(root: pathlib.Path) -> list[tuple[str, str, object]]:
+    items: list[tuple[str, str, object]] = []
+    for path in sorted(root.rglob("*"), key=lambda item: str(item.relative_to(root))):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            items.append((relative, "symlink", os.readlink(path)))
+        elif path.is_dir():
+            items.append((relative, "dir", ""))
+        else:
+            items.append((relative, "file", path.read_bytes()))
+    return items
 
 
 def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
@@ -157,31 +171,11 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
             )
             _write_json(
                 root / ".codex" / "hooks.json",
-                {
-                    "schema_version": 1,
-                    "hooks": {
-                        "SessionStart": [
-                            {"hooks": [{"type": "command", "command": "shared_memory_hook.py"}]}
-                        ],
-                        "Stop": [
-                            {"hooks": [{"type": "command", "command": "ui_design_gate_hook.py"}]}
-                        ],
-                    },
-                },
+                json.loads(memory_project.codex_hooks_json()),
             )
             _write_json(
                 root / ".claude" / "settings.json",
-                {
-                    "schema_version": 1,
-                    "hooks": {
-                        "SessionStart": [
-                            {"hooks": [{"type": "command", "command": "shared_memory_hook.py"}]}
-                        ],
-                        "Stop": [
-                            {"hooks": [{"type": "command", "command": "ui_design_gate_hook.py"}]}
-                        ],
-                    },
-                },
+                json.loads(memory_project.claude_settings_json()),
             )
             _write_text(root / ".codex" / "hooks" / "shared_memory_hook.py", "# legacy codex hook\n")
             _write_text(root / ".claude" / "hooks" / "shared_memory_hook.py", "# legacy claude hook\n")
@@ -231,7 +225,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
     finally:
         memory_project.REGISTRY_PATH = original_registry
         memory_project.DEFAULT_WORKTREE_ROOT = original_worktree_root
-    return LegacyFixture(paths=paths, registry=registry)
+    return LegacyFixture(paths=paths, registry=registry, project_roots=(project_root, second_root))
 
 
 class VibeMemoryMigrationTest(unittest.TestCase):
@@ -256,6 +250,45 @@ class VibeMemoryMigrationTest(unittest.TestCase):
         )
         self.assertEqual(result["projects"]["registered"], 2)
         self.assertEqual(result["ui_skills"]["published"], 1)
+
+    def test_preview_legacy_hooks_is_read_only_and_reports_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            before = _snapshot_tree(project)
+
+            preview = migration.preview_legacy_hooks([project])
+
+            self.assertEqual(_snapshot_tree(project), before)
+            self.assertEqual(len(preview), 1)
+            self.assertEqual(preview[0]["managed_entries"], 5)
+            self.assertEqual(preview[0]["custom_entries"], 1)
+            resolved = project.resolve()
+            self.assertIn(str(resolved / ".codex/hooks.json"), preview[0]["targets"])
+            self.assertIn(str(resolved / ".claude/settings.json"), preview[0]["targets"])
+            self.assertIn(str(resolved / ".codex/hooks/shared_memory_hook.py"), preview[0]["targets"])
+            self.assertIn(str(resolved / ".claude/hooks/shared_memory_hook.py"), preview[0]["targets"])
+
+    def test_apply_legacy_hooks_preserves_ui_gate_and_backs_up_managed_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+
+            result = migration.apply_legacy_hooks([project])
+
+            codex_hooks = (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
+            claude_hooks = (project / ".claude" / "settings.json").read_text(encoding="utf-8")
+            self.assertNotIn("shared_memory_hook.py", codex_hooks)
+            self.assertNotIn("shared_memory_hook.py", claude_hooks)
+            self.assertIn("ui_design_gate_hook.py", codex_hooks)
+            self.assertIn("ui_design_gate_hook.py", claude_hooks)
+            self.assertFalse((project / ".codex" / "hooks" / "shared_memory_hook.py").exists())
+            self.assertFalse((project / ".claude" / "hooks" / "shared_memory_hook.py").exists())
+            self.assertTrue((project / ".codex" / "hooks" / "ui_design_gate_hook.py").exists())
+            self.assertTrue((project / ".claude" / "hooks" / "ui_design_gate_hook.py").exists())
+            self.assertTrue(result[0]["backups"])
+            self.assertEqual(result[0]["managed_entries"], 5)
+            self.assertEqual(result[0]["custom_entries"], 1)
 
 
 if __name__ == "__main__":
