@@ -885,3 +885,24 @@ def inventory(paths: RuntimePaths, registry: Mapping[str, object]) -> dict[str, 
         "worktrees": inspect_worktrees(paths.worktree_manager),
         "legacy_hooks": inspect_legacy_hooks(project_roots),
     }
+
+
+def _control_plane_area_status(value: object) -> str:
+    if not isinstance(value, dict):
+        return "error"
+    errors = value.get("errors", [])
+    if isinstance(errors, list) and errors:
+        return "error"
+    return "ok"
+
+
+def validate_control_plane(
+    paths: RuntimePaths,
+    registry: Mapping[str, object],
+) -> dict[str, str]:
+    """Validate that the installed runtime can read every control-plane area."""
+    snapshot = inventory(paths, registry)
+    return {
+        area: _control_plane_area_status(value)
+        for area, value in snapshot.items()
+    }

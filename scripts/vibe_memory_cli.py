@@ -255,13 +255,26 @@ def install_command(args: argparse.Namespace) -> int:
         runtime_config = vibe_memory_install.install_runtime_config(
             paths, port=args.port, app_version=installed["version"]
         )
+        control_plane = vibe_memory_migration.validate_control_plane(
+            paths, _registry_snapshot(paths)
+        )
+        if any(status != "ok" for status in control_plane.values()):
+            raise ValueError("control-plane compatibility validation failed")
         rollback_paths.add(launch_agent)
         plist_result = vibe_memory_install.install_launch_agent(paths, plist)
         for target, agent, name in hook_targets:
             rollback_paths.add(target)
             attempted_hook_targets.add(target)
             hooks[name] = vibe_memory_hooks.repair(target, agent, runtime)
-        _json({"status": "installed", "runtime": installed, "runtime_config": runtime_config, "data": data, "launch_agent": plist_result, "hooks": hooks})
+        _json({
+            "status": "installed",
+            "runtime": installed,
+            "runtime_config": runtime_config,
+            "control_plane": control_plane,
+            "data": data,
+            "launch_agent": plist_result,
+            "hooks": hooks,
+        })
         return 0
     except Exception:
         rollback_errors = []
@@ -359,6 +372,23 @@ def _migration_project_roots(args: argparse.Namespace) -> list[pathlib.Path]:
     if not raw_roots:
         return [memory_project.current_project().resolve()]
     return [pathlib.Path(root).expanduser().resolve() for root in raw_roots]
+
+
+def _registry_snapshot(paths: vibe_memory_paths.RuntimePaths) -> dict[str, object]:
+    try:
+        raw = paths.project_registry.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"current_project": "", "projects": []}
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("project registry must be an object")
+    if not isinstance(value.get("current_project", ""), str) or not isinstance(
+        value.get("projects", []), list
+    ):
+        raise ValueError("project registry has an invalid structure")
+    value.setdefault("current_project", "")
+    value.setdefault("projects", [])
+    return value
 
 
 def migrate_command(args: argparse.Namespace) -> int:

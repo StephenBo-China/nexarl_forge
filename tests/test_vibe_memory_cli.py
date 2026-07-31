@@ -70,6 +70,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 mock.patch("vibe_memory_cli.vibe_memory_install.prepare_data", return_value={"files": []}) as prepare, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
+                mock.patch("vibe_memory_cli.vibe_memory_migration.validate_control_plane", return_value={"projects": "ok"}) as validate_control, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.preview", return_value={"status": "missing"}) as preview, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created", "changed": True}, {"status": "created", "changed": True}]) as repair, \
                 mock.patch("vibe_memory_cli.subprocess.run") as run:
@@ -80,6 +81,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         prepare.assert_called_once_with(self.paths)
         render.assert_called_once_with(self.paths, port=8897)
         write.assert_called_once()
+        validate_control.assert_called_once()
+        self.assertIs(validate_control.call_args.args[0], self.paths)
         self.assertEqual(repair.call_args_list, [
             mock.call(self.home / ".codex/hooks.json", "codex", runtime),
             mock.call(self.home / ".claude/settings.json", "claude-code", runtime),

@@ -24,8 +24,23 @@ import vibe_memory_paths
 import vibe_memory_settings
 
 
-HOST = review.REVIEW_HOST
-PORT = review.REVIEW_PORT
+def server_address(environ: dict[str, str] | None = None) -> tuple[str, int]:
+    values = os.environ if environ is None else environ
+    host = values.get("MEMORY_REVIEW_HOST", review.REVIEW_HOST)
+    port_raw = values.get("MEMORY_REVIEW_PORT", str(review.REVIEW_PORT))
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("memory review server port must be an integer") from error
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("memory review server must bind to loopback")
+    return host, port
+
+
+HOST, PORT = server_address()
+review.REVIEW_HOST = HOST
+review.REVIEW_PORT = PORT
+review.REVIEW_URL = f"http://[{HOST}]:{PORT}" if HOST == "::1" else f"http://{HOST}:{PORT}"
 
 
 def health_payload() -> dict[str, object]:
