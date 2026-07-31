@@ -6,6 +6,7 @@ import argparse
 import json
 import pathlib
 import re
+import subprocess
 import sys
 from collections.abc import Iterable
 
@@ -20,6 +21,7 @@ _ROOT_FILES = (
     "install.sh",
 )
 _DOC_FILES = ("docs/*.md",)
+_LOCAL_CLIENT_RUNTIME_CONFIGS = frozenset({".codex/hooks.json", ".claude/settings.json"})
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("personal_path", re.compile(r"/U" + r"sers/")),
     (
@@ -56,6 +58,39 @@ def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
     templates = root / "templates"
     if templates.is_dir():
         yield from sorted(path for path in templates.rglob("*") if path.is_file())
+    yield from _client_asset_candidates(root)
+
+
+def _client_asset_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
+    tracked = _tracked_client_assets(root)
+    candidates = tracked if tracked is not None else _client_assets_without_git(root)
+    yield from (path for path in candidates if not _is_local_client_runtime_config(path, root))
+
+
+def _tracked_client_assets(root: pathlib.Path) -> list[pathlib.Path] | None:
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--", ".claude", ".codex"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        return None
+    return [root / path for path in result.stdout.splitlines() if (root / path).is_file()]
+
+
+def _client_assets_without_git(root: pathlib.Path) -> list[pathlib.Path]:
+    return [
+        path
+        for directory in (root / ".claude", root / ".codex")
+        if directory.is_dir()
+        for path in sorted(directory.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def _is_local_client_runtime_config(path: pathlib.Path, root: pathlib.Path) -> bool:
+    return path.relative_to(root).as_posix() in _LOCAL_CLIENT_RUNTIME_CONFIGS
 
 
 def _scan_text(path: pathlib.Path) -> list[dict[str, str]]:

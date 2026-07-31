@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import pathlib
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -13,6 +15,58 @@ import verify_release
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_scan_tree_checks_legacy_codex_assets_without_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            legacy_hook = root / ".codex" / "hooks" / "legacy.py"
+            legacy_hook.parent.mkdir(parents=True)
+            legacy_hook.write_text("HOME = '/Users/example'\n", encoding="utf-8")
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertIn(
+            {
+                "path": str(legacy_hook.resolve()),
+                "pattern": "personal_path",
+                "match": "/Users/",
+            },
+            violations,
+        )
+
+    def test_scan_tree_checks_tracked_claude_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            legacy_rule = root / ".claude" / "rules" / "legacy.md"
+            legacy_rule.parent.mkdir(parents=True)
+            legacy_rule.write_text("Path: /Users/example\n", encoding="utf-8")
+            subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "add", str(legacy_rule.relative_to(root))],
+                check=True,
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertIn(
+            {
+                "path": str(legacy_rule.resolve()),
+                "pattern": "personal_path",
+                "match": "/Users/",
+            },
+            violations,
+        )
+
+    def test_scan_tree_ignores_local_client_runtime_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for path in (root / ".codex" / "hooks.json", root / ".claude" / "settings.json"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("path = '/Users/example'\n", encoding="utf-8")
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(violations, [])
+
     def test_active_release_files_contain_no_personal_absolute_path(self) -> None:
         violations = public_release_check.scan_tree(ROOT)
         self.assertEqual(violations, [])

@@ -11,6 +11,11 @@ __pycache__/
 # Local runtime state; may include memory candidate content
 .codex/hooks.json
 .claude/settings.json
+# Legacy per-project client hooks are local-only.  VibeMemory installs and
+# manages the supported hooks from its global runtime instead.
+.codex/hooks/shared_memory_hook.py
+.claude/hooks/shared_memory_hook.py
+.claude/rules/shared-memory.md
 .loop/config.json
 codex/memory_review_queue.json
 codex/memory_review_state.json
