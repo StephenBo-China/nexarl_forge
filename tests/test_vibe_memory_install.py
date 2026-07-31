@@ -184,6 +184,124 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertEqual(injected, [True])
             self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
 
+    def test_install_launcher_preserves_custom_replacement_after_final_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+            paths.launcher.chmod(0o600)
+            custom = "#!/bin/sh\necho final-snapshot replacement\n"
+            real_snapshot = vibe_memory_install._launcher_snapshot
+            real_renameat = vibe_memory_install._darwin_renameat
+            calls: list[int] = []
+
+            def snapshot_then_replace(
+                parent_fd: int,
+                target: pathlib.Path,
+            ) -> tuple[tuple[int, int], bytes, int] | None:
+                result = real_snapshot(parent_fd, target)
+                calls.append(1)
+                if len(calls) == 2:
+                    paths.launcher.write_text(custom, encoding="utf-8")
+                    paths.launcher.chmod(0o700)
+                return result
+
+            def simulated_renameat(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+                flags: int,
+            ) -> None:
+                self.assertEqual(source_parent_fd, destination_parent_fd)
+                parent = paths.launcher.parent
+                source = parent / source_name
+                destination = parent / destination_name
+                if flags == getattr(vibe_memory_install, "RENAME_SWAP", 0x2):
+                    displaced = parent / f".{destination_name}.displaced"
+                    source.rename(displaced)
+                    destination.rename(source)
+                    displaced.rename(destination)
+                    return
+                if flags == vibe_memory_install.RENAME_EXCL:
+                    if destination.exists() or destination.is_symlink():
+                        raise FileExistsError(destination_name)
+                    source.rename(destination)
+                    return
+                real_renameat(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                    flags,
+                )
+
+            with mock.patch.object(vibe_memory_install.sys, "platform", "darwin"), mock.patch.object(
+                vibe_memory_install,
+                "_launcher_snapshot",
+                side_effect=snapshot_then_replace,
+            ), mock.patch.object(
+                vibe_memory_install,
+                "_darwin_renameat",
+                side_effect=simulated_renameat,
+            ):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(calls, [1, 1, 1])
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
+
+    def test_install_launcher_rejects_custom_file_created_after_absent_final_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            custom = "#!/bin/sh\necho absent-final-snapshot replacement\n"
+            real_snapshot = vibe_memory_install._launcher_snapshot
+            real_renameat = vibe_memory_install._darwin_renameat
+            calls: list[int] = []
+
+            def snapshot_then_create(
+                parent_fd: int,
+                target: pathlib.Path,
+            ) -> tuple[tuple[int, int], bytes, int] | None:
+                result = real_snapshot(parent_fd, target)
+                calls.append(1)
+                if len(calls) == 2:
+                    paths.launcher.write_text(custom, encoding="utf-8")
+                    paths.launcher.chmod(0o700)
+                return result
+
+            def exclusive_renameat(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+                flags: int,
+            ) -> None:
+                self.assertEqual(source_parent_fd, destination_parent_fd)
+                self.assertEqual(flags, vibe_memory_install.RENAME_EXCL)
+                parent = paths.launcher.parent
+                source = parent / source_name
+                destination = parent / destination_name
+                if destination.exists() or destination.is_symlink():
+                    raise FileExistsError(destination_name)
+                source.rename(destination)
+
+            with mock.patch.object(vibe_memory_install.sys, "platform", "darwin"), mock.patch.object(
+                vibe_memory_install,
+                "_launcher_snapshot",
+                side_effect=snapshot_then_create,
+            ), mock.patch.object(
+                vibe_memory_install,
+                "_darwin_renameat",
+                side_effect=exclusive_renameat,
+            ):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+
+            self.assertEqual(calls, [1, 1])
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), custom)
+
     def test_atomic_install_state_write_handles_short_os_writes(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
