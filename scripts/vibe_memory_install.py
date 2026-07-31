@@ -1320,6 +1320,14 @@ def _cleanup_launcher_temporary(
     created_identity: tuple[int, int, int],
 ) -> None:
     """Remove only a temporary launcher entry that still has our identity."""
+    try:
+        metadata = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise InstallError("launcher temporary entry could not be inspected") from error
+    if _temporary_identity(metadata) != created_identity:
+        raise InstallError("launcher temporary entry changed during cleanup")
     if sys.platform == "darwin":
         _cleanup_owned_temporary(
             parent_fd,
@@ -1330,17 +1338,71 @@ def _cleanup_launcher_temporary(
         )
         return
     try:
-        metadata = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return
-    except OSError as error:
-        raise InstallError("launcher temporary entry could not be inspected") from error
-    if _temporary_identity(metadata) != created_identity:
-        raise InstallError("launcher temporary entry changed during cleanup")
-    try:
         os.unlink(temporary_name, dir_fd=parent_fd)
     except FileNotFoundError:
         return
+
+
+def _snapshot_launcher_safely(
+    parent_fd: int,
+    target: pathlib.Path,
+) -> tuple[tuple[int, int], bytes, int] | None:
+    try:
+        return _launcher_snapshot(parent_fd, target)
+    except (InstallError, OSError):
+        return None
+
+
+def _launcher_matches_promoted_temporary(
+    snapshot: tuple[tuple[int, int], bytes, int] | None,
+    expected_content: bytes,
+    temporary_identity: tuple[int, int, int],
+) -> bool:
+    return (
+        snapshot is not None
+        and snapshot[0] == temporary_identity[:2]
+        and snapshot[1] == expected_content
+        and snapshot[2] == 0o700
+        and _is_manager_launcher(snapshot[1])
+    )
+
+
+def _quarantine_unknown_launcher_entry(parent_fd: int, name: str) -> None:
+    """Move an unknown launcher entry out of its active name without deleting it."""
+    while True:
+        quarantine_name = f".launcher-unknown-{uuid.uuid4().hex}"
+        try:
+            _darwin_renameat(
+                parent_fd,
+                name,
+                parent_fd,
+                quarantine_name,
+                RENAME_EXCL,
+            )
+            return
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise InstallError("unknown launcher entry could not be quarantined") from error
+
+
+def _rollback_absent_launcher_promotion(
+    parent_fd: int,
+    target: pathlib.Path,
+    temporary_identity: tuple[int, int, int],
+) -> None:
+    """Restore an absent launcher target without deleting an unknown promotion."""
+    promoted = _snapshot_launcher_safely(parent_fd, target)
+    if promoted is not None and promoted[0] == temporary_identity[:2]:
+        _cleanup_launcher_temporary(parent_fd, target.name, temporary_identity)
+        return
+    if promoted is not None:
+        _quarantine_unknown_launcher_entry(parent_fd, target.name)
+        return
+    if _entry_exists(parent_fd, target.name):
+        _quarantine_unknown_launcher_entry(parent_fd, target.name)
 
 
 def _promote_launcher(
@@ -1348,6 +1410,8 @@ def _promote_launcher(
     target: pathlib.Path,
     temporary_name: str,
     initial: tuple[tuple[int, int], bytes, int] | None,
+    expected_content: bytes,
+    temporary_identity: tuple[int, int, int],
 ) -> tuple[int, int, int] | None:
     """Publish a prepared launcher without replacing an unknown target."""
     temporary = _AnchoredPath(parent_fd, temporary_name, target.parent / temporary_name)
@@ -1366,6 +1430,18 @@ def _promote_launcher(
             _atomic_rename_exclusive(temporary, destination)
         except FileExistsError as error:
             raise InstallError("launcher target appeared during installation") from error
+        promoted = _snapshot_launcher_safely(parent_fd, target)
+        if not _launcher_matches_promoted_temporary(
+            promoted,
+            expected_content,
+            temporary_identity,
+        ):
+            _rollback_absent_launcher_promotion(
+                parent_fd,
+                target,
+                temporary_identity,
+            )
+            raise InstallError("launcher temporary entry changed during promotion")
         return None
 
     try:
@@ -1378,19 +1454,20 @@ def _promote_launcher(
         )
     except OSError as error:
         raise InstallError("launcher target changed during installation") from error
-    snapshot_error: Exception | None = None
-    try:
-        displaced = _launcher_snapshot(parent_fd, temporary.display_path)
-    except (InstallError, OSError) as error:
-        displaced = None
-        snapshot_error = error
+    promoted = _snapshot_launcher_safely(parent_fd, target)
+    displaced = _snapshot_launcher_safely(parent_fd, temporary.display_path)
     displaced_identity = (
         (displaced[0][0], displaced[0][1], stat.S_IFREG)
         if displaced is not None
         else None
     )
     if (
-        displaced is not None
+        _launcher_matches_promoted_temporary(
+            promoted,
+            expected_content,
+            temporary_identity,
+        )
+        and displaced is not None
         and displaced[0] == initial[0]
         and displaced[1] == initial[1]
         and _is_manager_launcher(displaced[1])
@@ -1407,8 +1484,16 @@ def _promote_launcher(
         )
     except OSError as error:
         raise InstallError("launcher target changed and could not be restored") from error
-    if snapshot_error is not None:
-        raise InstallError("launcher target changed during installation") from snapshot_error
+    restored = _snapshot_launcher_safely(parent_fd, target)
+    if restored is None or restored[0] != initial[0]:
+        raise InstallError("launcher target changed and could not be restored")
+    temporary_after_rollback = _snapshot_launcher_safely(parent_fd, temporary.display_path)
+    if not _launcher_matches_promoted_temporary(
+        temporary_after_rollback,
+        expected_content,
+        temporary_identity,
+    ):
+        _quarantine_unknown_launcher_entry(parent_fd, temporary_name)
     raise InstallError("launcher target changed during installation")
 
 
@@ -1558,7 +1643,16 @@ def install_launcher(
                 or not _is_manager_launcher(final[1])
             ):
                 raise InstallError("launcher target changed during installation")
-        displaced_identity = _promote_launcher(parent_fd, target, temporary_name, initial)
+        if temporary_identity is None:
+            raise InstallError("launcher temporary entry has no identity")
+        displaced_identity = _promote_launcher(
+            parent_fd,
+            target,
+            temporary_name,
+            initial,
+            content,
+            temporary_identity,
+        )
         if displaced_identity is not None:
             temporary_identity = displaced_identity
         if sys.platform == "darwin":
