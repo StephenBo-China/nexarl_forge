@@ -16,6 +16,54 @@ import verify_release
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_evaluate_checks_wires_public_tree_status_helper(self) -> None:
+        status = "failed: README.md [personal_path]"
+        patches = {
+            "_command_status": mock.Mock(return_value="ok"),
+            "_compile_python": mock.Mock(return_value="ok"),
+            "_permissions_check": mock.Mock(return_value="ok"),
+            "_hook_check": mock.Mock(return_value="ok"),
+            "_control_plane_check": mock.Mock(return_value="ok"),
+            "_rollback_check": mock.Mock(return_value="ok"),
+            "_uninstall_check": mock.Mock(return_value="ok"),
+            "_public_tree_status": mock.Mock(return_value=status),
+        }
+        with mock.patch.multiple(verify_release, **patches):
+            result = verify_release.evaluate_checks(ROOT)
+
+        self.assertEqual(result["public_tree"], status)
+        patches["_public_tree_status"].assert_called_once_with(ROOT.resolve())
+
+    def test_scan_tree_reports_root_relative_path_for_unreadable_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            blocked = root / "docs" / "blocked.md"
+            blocked.parent.mkdir(parents=True)
+            blocked.write_text("documentation\n", encoding="utf-8")
+            original_read_text = pathlib.Path.read_text
+
+            def read_text_with_permission_error(
+                path: pathlib.Path, *args: object, **kwargs: object
+            ) -> str:
+                if path == blocked.resolve():
+                    raise PermissionError("permission denied")
+                return original_read_text(path, *args, **kwargs)
+
+            with mock.patch.object(
+                pathlib.Path,
+                "read_text",
+                new=read_text_with_permission_error,
+            ):
+                violations = public_release_check.scan_tree(root)
+
+        self.assertIn(
+            {"path": "docs/blocked.md", "pattern": "unreadable"},
+            [
+                {"path": violation["path"], "pattern": violation["pattern"]}
+                for violation in violations
+            ],
+        )
+
     def test_scan_tree_reports_root_relative_path_for_public_file_violation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
