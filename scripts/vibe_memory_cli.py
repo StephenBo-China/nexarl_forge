@@ -650,25 +650,26 @@ def repair_command(_args: argparse.Namespace) -> int:
 
 def start_command(_args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
-    runtime = vibe_memory_install.read_runtime_config(paths)
-    settings = vibe_memory_settings.load_settings(paths)
-    version = runtime.get("app_version")
-    port = runtime.get("port")
-    python_executable = runtime.get("python_executable")
-    if not isinstance(version, str) or not isinstance(port, int) or not isinstance(
-        python_executable, str
-    ):
-        raise LifecycleError("runtime configuration is incomplete")
-    plist = vibe_memory_install.render_launch_agent(
-        paths,
-        port=port,
-        python_executable=python_executable,
-        run_at_load=bool(settings["start_at_login"]),
-    )
-    vibe_memory_install.install_launch_agent(paths, plist)
-    result = vibe_memory_install.activate_launch_agent(
-        paths, expected_version=version
-    )
+    with vibe_memory_settings.lifecycle_lock(paths):
+        runtime = vibe_memory_install.read_runtime_config(paths)
+        settings = vibe_memory_settings.load_settings(paths)
+        version = runtime.get("app_version")
+        port = runtime.get("port")
+        python_executable = runtime.get("python_executable")
+        if not isinstance(version, str) or not isinstance(port, int) or not isinstance(
+            python_executable, str
+        ):
+            raise LifecycleError("runtime configuration is incomplete")
+        plist = vibe_memory_install.render_launch_agent(
+            paths,
+            port=port,
+            python_executable=python_executable,
+            run_at_load=bool(settings["start_at_login"]),
+        )
+        vibe_memory_install.install_launch_agent(paths, plist)
+        result = vibe_memory_install.activate_launch_agent(
+            paths, expected_version=version
+        )
     _json(result)
     return 0
 

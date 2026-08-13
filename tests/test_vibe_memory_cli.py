@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import unittest
@@ -1075,6 +1076,85 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 "start_at_login"
             ]
         )
+
+    def test_start_and_first_run_serialize_settings_plist_and_activation(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        start_reached_install = threading.Event()
+        allow_start_install = threading.Event()
+        first_run_finished = threading.Event()
+        errors: list[BaseException] = []
+
+        def install_plist(_paths: object, content: str) -> dict[str, object]:
+            start_reached_install.set()
+            if not allow_start_install.wait(2):
+                raise AssertionError("timed out waiting for first-run interleave")
+            pathlib.Path(self.paths.launch_agent).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(self.paths.launch_agent).write_text(content, encoding="utf-8")
+            return {"changed": True}
+
+        def run_start() -> None:
+            try:
+                vibe_memory_cli.start_command(argparse.Namespace())
+            except BaseException as error:
+                errors.append(error)
+
+        def run_first_run() -> None:
+            try:
+                vibe_memory_cli.vibe_memory_settings.apply_first_run(
+                    self.paths,
+                    {"start_at_login": True},
+                    manager_source_root=ROOT,
+                    register_workspace=mock.Mock(),
+                )
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                first_run_finished.set()
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent",
+            side_effect=install_plist,
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            return_value={"status": "healthy"},
+        ) as activate, mock.patch.object(
+            vibe_memory_cli.vibe_memory_settings, "reconcile_hooks", return_value={}
+        ), mock.patch.object(
+            vibe_memory_cli, "_json"
+        ):
+            start_thread = threading.Thread(target=run_start)
+            start_thread.start()
+            self.assertTrue(start_reached_install.wait(1))
+            first_run_thread = threading.Thread(target=run_first_run)
+            first_run_thread.start()
+            self.assertFalse(first_run_finished.wait(0.05))
+            allow_start_install.set()
+            start_thread.join(2)
+            first_run_thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(first_run_finished.is_set())
+        self.assertEqual(activate.call_count, 2)
+        settings = vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)
+        lifecycle = plistlib.loads(self.paths.launch_agent.read_bytes())
+        self.assertEqual(settings["start_at_login"], lifecycle["RunAtLoad"])
+        self.assertEqual(settings["start_at_login"], lifecycle["KeepAlive"])
 
     def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
         with mock.patch(
