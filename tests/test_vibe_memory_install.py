@@ -2600,6 +2600,38 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(vibe_memory_install.read_runtime_config(paths)["app_version"], "1.1.0")
             self.assertIn("/current/scripts/memory_review_server.py", paths.launch_agent.read_text(encoding="utf-8"))
 
+    def test_update_preserves_explicit_empty_clients_without_repairing_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(
+                root, {**MANIFEST, "app_version": "1.1.0"}
+            )
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(
+                paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+            )
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0", previous_version=None, port=9123,
+                    installed_clients=[], python_executable=sys.executable,
+                ),
+            )
+            with mock.patch(
+                "vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}
+            ), mock.patch("vibe_memory_install.smoke_managed_hooks", return_value={}) as smoke, \
+                    mock.patch("vibe_memory_hooks.repair") as repair:
+                vibe_memory_install.update(
+                    source, paths, installed_clients=[], validation={"control": "ok"}
+                )
+            self.assertEqual(
+                vibe_memory_install.read_install_state(paths)["installed_clients"], []
+            )
+            repair.assert_not_called()
+            smoke.assert_called_once_with(paths, [])
+
     def test_update_health_failure_removes_new_release_and_restores_old_service(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)

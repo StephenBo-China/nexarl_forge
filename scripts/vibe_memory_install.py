@@ -2427,7 +2427,7 @@ def update(
     previous_version = _current_version(paths)
     runtime_config = pathlib.Path(paths.install_root) / "config.json"
     state_path = install_state_path(paths)
-    clients = installed_clients or _installed_clients(paths)
+    clients = _installed_clients(paths) if installed_clients is None else list(installed_clients)
     managed_paths = [runtime_config, pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), state_path]
     managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
@@ -2454,8 +2454,6 @@ def update(
         install_launcher(paths, python_executable=selected_python)
         control_plane = _validate_control_plane(paths, validation)
         _activate_managed_version(paths, new_version)
-        if not clients:
-            clients = ["codex"]
         install_launch_agent(
             paths,
             render_launch_agent(paths, port=selected_port, python_executable=selected_python),
