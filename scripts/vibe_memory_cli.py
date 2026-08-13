@@ -576,7 +576,10 @@ def memory_command(args: argparse.Namespace) -> int:
 
 
 def _migration_project_roots(args: argparse.Namespace) -> list[pathlib.Path]:
-    raw_roots = getattr(args, "project_root", None) or []
+    raw_roots = [
+        *(getattr(args, "project_root", None) or []),
+        *(getattr(args, "project_root_option", None) or []),
+    ]
     if not raw_roots:
         raise LifecycleError("migrate requires at least one explicit project root")
     # Preserve the selected path identity so migration can reject a symlink
@@ -755,9 +758,11 @@ def build_parser() -> argparse.ArgumentParser:
     migrate_sub = migrate.add_subparsers(dest="migrate_command", required=True)
     preview = migrate_sub.add_parser("preview", help="Preview legacy project hook migration")
     preview.add_argument("project_root", nargs="*")
+    preview.add_argument("--project-root", dest="project_root_option", action="append")
     apply = migrate_sub.add_parser("apply", help="Apply approved legacy project hook migration")
     apply.add_argument("--approved", action="store_true")
     apply.add_argument("project_root", nargs="*")
+    apply.add_argument("--project-root", dest="project_root_option", action="append")
     migrate.set_defaults(command_handler=migrate_command)
 
     update = subcommands.add_parser("update", help="Install a new runtime release")

@@ -453,6 +453,8 @@ def _snapshot_directory_fd(
 ) -> dict[str, tuple[str, bytes | None]]:
     entries: dict[str, tuple[str, bytes | None]] = {}
     for name in os.listdir(directory_fd):
+        if name == "__pycache__" or name.endswith(".pyc"):
+            continue
         relative = prefix / name
         display_path = display_root / relative
         try:
@@ -1387,8 +1389,10 @@ def _validate_launch_agent(plist: object, runtime: str, port: int) -> None:
     except InstallError as error:
         raise ValueError("launch agent Python interpreter is invalid") from error
     expected_environment = {
+        "HOME": str(pathlib.Path(runtime).parents[3]),
         "MEMORY_REVIEW_HOST": "127.0.0.1",
         "MEMORY_REVIEW_PORT": str(port),
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
     if plist.get("Label") != "com.noema.vibe-memory":
         raise ValueError("launch agent Label is invalid")
@@ -1436,6 +1440,7 @@ def render_launch_agent(
     rendered = Template(_read_launch_agent_template()).substitute(
         PYTHON=escape(python),
         RUNTIME=escape(runtime),
+        HOME=escape(str(pathlib.Path(paths.personal_memory).parents[1])),
         PORT=str(port),
     )
     try:
@@ -1498,6 +1503,7 @@ def render_launcher(
             '  echo "vibe-memory: HOME is required" >&2',
             "  exit 1",
             "fi",
+            "export PYTHONDONTWRITEBYTECODE=1",
             'RUNTIME="$HOME/Library/Application Support/VibeMemory/current"',
             f"exec {_shell_double_quote(executable)} \"$RUNTIME/scripts/vibe_memory_cli.py\" \"$@\"",
             "",

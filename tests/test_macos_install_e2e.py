@@ -20,6 +20,7 @@ import memory_review_server
 import vibe_memory_install
 import vibe_memory_hooks
 import vibe_memory_paths
+from scripts import verify_release
 from tests.test_installed_control_plane import run_installed_doctor
 from tests.test_vibe_memory_migration import build_complete_legacy_fixture
 
@@ -75,8 +76,32 @@ def _digest_tree(root: pathlib.Path, *, skip: set[str]) -> str:
 def _business_data_digest(home: pathlib.Path) -> str:
     return _digest_tree(
         home,
-        skip={"Library", ".local", ".codex/hooks.json", ".claude/settings.json"},
+        skip={
+            "Library",
+            ".local",
+            ".codex/hooks.json",
+            ".claude/settings.json",
+            ".codex/ui_design/discovery.json",
+        },
     )
+
+
+def _business_data_files(home: pathlib.Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    skip = {
+        "Library",
+        ".local",
+        ".codex/hooks.json",
+        ".claude/settings.json",
+        ".codex/ui_design/discovery.json",
+    }
+    for path in sorted(home.rglob("*")):
+        relative = path.relative_to(home).as_posix()
+        if any(relative == prefix or relative.startswith(prefix + "/") for prefix in skip):
+            continue
+        if path.is_file() and not path.is_symlink():
+            values[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return values
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS installer contract")
@@ -146,18 +171,30 @@ class MacOSInstallE2ETest(unittest.TestCase):
             self.assertEqual(health["service"], "vibe-memory")
             self.assertEqual(health["app_version"], release["app_version"])
 
+    def test_installed_launcher_serves_console_and_migrates_fixture(self) -> None:
+        result = verify_release._run_installed_release_e2e(ROOT)
+
+        self.assertEqual(result, "ok")
+
     def test_legacy_install_preserves_every_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = pathlib.Path(value)
             fixture = create_legacy_install(base)
             home = fixture.paths.personal_memory.parents[1]
             before = _business_data_digest(home)
+            before_files = _business_data_files(home)
             port = _free_port()
 
             result = _run_install(home, with_claude_hooks=True, port=port)
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(_business_data_digest(home), before)
+            after_files = _business_data_files(home)
+            changed = sorted(
+                path
+                for path in set(before_files) | set(after_files)
+                if before_files.get(path) != after_files.get(path)
+            )
+            self.assertEqual(_business_data_digest(home), before, changed)
             runtime = fixture.paths.install_root / "current"
             doctor = run_installed_doctor(runtime, home)
             self.assertEqual(doctor["runtime"], "ok")

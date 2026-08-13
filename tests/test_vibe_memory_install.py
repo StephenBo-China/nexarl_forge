@@ -70,6 +70,22 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertTrue((paths.install_root / "current").is_symlink())
             self.assertEqual((paths.install_root / "current").resolve(), release.resolve())
 
+    def test_install_excludes_python_bytecode_caches_from_release(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            cache = source / "scripts/__pycache__"
+            cache.mkdir()
+            (cache / "server.cpython-314.pyc").write_bytes(b"derived bytecode")
+            (source / "scripts/ignored.pyc").write_bytes(b"derived bytecode")
+            paths = self.make_paths(root)
+
+            vibe_memory_install.install_runtime(source, paths)
+
+            release = paths.install_root / "releases/1.0.0/scripts"
+            self.assertFalse((release / "__pycache__").exists())
+            self.assertFalse((release / "ignored.pyc").exists())
+
     def test_runtime_config_persists_validated_interpreter_and_launcher_uses_current(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
@@ -109,6 +125,10 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(paths.launcher.stat().st_mode), 0o700)
             self.assertTrue(os.access(paths.launcher, os.X_OK))
             self.assertIn("Vibe Memory stable launcher", paths.launcher.read_text(encoding="utf-8"))
+            self.assertIn(
+                "export PYTHONDONTWRITEBYTECODE=1",
+                paths.launcher.read_text(encoding="utf-8"),
+            )
 
     def test_install_launcher_preserves_non_manager_owned_existing_file(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -2254,8 +2274,10 @@ class RuntimeInstallTest(unittest.TestCase):
                 [os.path.abspath(sys.executable), runtime + "/scripts/memory_review_server.py"],
             )
             self.assertEqual(plist["EnvironmentVariables"], {
+                "HOME": str(pathlib.Path(paths.personal_memory).parents[1]),
                 "MEMORY_REVIEW_HOST": "127.0.0.1",
                 "MEMORY_REVIEW_PORT": "8897",
+                "PYTHONDONTWRITEBYTECODE": "1",
             })
             self.assertIs(plist["KeepAlive"], True)
             self.assertIs(plist["RunAtLoad"], True)
@@ -2268,6 +2290,8 @@ class RuntimeInstallTest(unittest.TestCase):
         self.assertIn("${PYTHON}", template)
         self.assertIn("${RUNTIME}", template)
         self.assertIn("${PORT}", template)
+        self.assertIn("${HOME}", template)
+        self.assertIn("PYTHONDONTWRITEBYTECODE", template)
 
     def test_render_launch_agent_rejects_invalid_ports(self) -> None:
         with tempfile.TemporaryDirectory() as value:

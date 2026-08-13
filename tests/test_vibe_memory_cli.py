@@ -915,6 +915,25 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(output, expected)
         apply.assert_called_once_with([project.absolute()], paths=self.paths)
 
+    def test_migrate_accepts_explicit_project_root_option(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+        expected = {
+            "status": "applied",
+            "projects": [{"root": str(project.resolve()), "result": "applied"}],
+        }
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.apply_legacy_hooks",
+            return_value=expected,
+        ) as apply:
+            code, output, stderr = self.invoke([
+                "migrate", "apply", "--approved", "--project-root", str(project)
+            ])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output, expected)
+        apply.assert_called_once_with([project.absolute()], paths=self.paths)
+
     def test_migrate_apply_partial_prints_payload_and_returns_nonzero(self) -> None:
         project = pathlib.Path(self.temporary.name) / "project"
         project.mkdir()

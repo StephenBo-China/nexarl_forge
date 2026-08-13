@@ -11,10 +11,14 @@
   </array>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>HOME</key>
+    <string>${HOME}</string>
     <key>MEMORY_REVIEW_HOST</key>
     <string>127.0.0.1</string>
     <key>MEMORY_REVIEW_PORT</key>
     <string>${PORT}</string>
+    <key>PYTHONDONTWRITEBYTECODE</key>
+    <string>1</string>
   </dict>
   <key>KeepAlive</key>
   <true/>

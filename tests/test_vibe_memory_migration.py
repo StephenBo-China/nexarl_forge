@@ -585,6 +585,7 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             project = fixture.project_roots[0]
 
             envelope = migration.apply_legacy_hooks([project], paths=fixture.paths)
+            json.dumps(envelope)
             result = envelope["projects"]
             self.assertEqual(envelope["status"], "applied")
 

@@ -533,7 +533,7 @@ def apply_first_run(
                 lambda: vibe_memory_install._atomic_write_private_json(action_path, service_action),
                 [action_path],
             )
-            if saved["start_at_login"]:
+            if saved["start_at_login"] and launch.get("changed", True) is not False:
                 runtime = vibe_memory_install.read_runtime_config(paths)
                 version = runtime.get("app_version")
                 if not isinstance(version, str):

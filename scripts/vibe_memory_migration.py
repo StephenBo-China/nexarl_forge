@@ -1076,7 +1076,6 @@ def _archive_project_legacy_hooks(
         "backups": backups,
         "changed_paths": changed_paths,
         "removed_handlers": removed_handlers,
-        "written": written,
     }
 
 

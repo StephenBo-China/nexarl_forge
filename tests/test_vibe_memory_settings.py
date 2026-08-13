@@ -347,6 +347,26 @@ keep exactly
                 )
         self.assertFalse(settings.load_settings(self.paths)["first_run_complete"])
 
+    def test_first_run_does_not_restart_unchanged_active_launch_agent(self) -> None:
+        with mock.patch.object(settings, "reconcile_hooks"), mock.patch.object(
+            settings, "reconcile_launch_agent", return_value={"changed": False}
+        ), mock.patch.object(
+            settings.vibe_memory_install, "read_runtime_config", return_value={
+                "app_version": "1.0.0"
+            }
+        ), mock.patch.object(
+            settings.vibe_memory_install, "activate_launch_agent"
+        ) as activate:
+            result = settings.apply_first_run(
+                self.paths,
+                {"start_at_login": True},
+                manager_source_root=ROOT,
+                register_workspace=mock.Mock(),
+            )
+
+        self.assertFalse(result["launch_agent"]["changed"])
+        activate.assert_not_called()
+
     def test_rollback_reports_previous_service_restart_failure_after_restoring_files(self) -> None:
         old = settings.default_settings()
         settings.save_settings(self.paths, old)
