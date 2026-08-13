@@ -65,7 +65,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         with mock.patch("vibe_memory_cli.collect_status", return_value=healthy):
             code, output, _ = self.invoke(["doctor", "--json"])
         self.assertEqual(code, 0)
-        self.assertEqual(set(output), {"runtime", "codex_hooks", "claude_hooks", "service", "data"})
+        self.assertEqual(set(output), {"runtime", "codex_hooks", "claude_hooks", "service", "data", "control_plane"})
         self.assertTrue(all(set(item) >= {"ok", "status"} for item in output.values()))
 
         unhealthy = dict(healthy)
@@ -74,6 +74,17 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             code, output, _ = self.invoke(["doctor", "--json"])
         self.assertEqual(code, 1)
         self.assertFalse(output["service"]["ok"])
+
+    def test_doctor_lists_every_non_ok_control_plane_area(self) -> None:
+        healthy = {name: {"ok": True, "status": "current"} for name in (
+            "runtime", "codex_hooks", "claude_hooks", "service", "data"
+        )}
+        control = {"policy": "error", "ui_skill_deployments": "error", "loop": "ok"}
+        with mock.patch("vibe_memory_cli.collect_status", return_value=healthy), \
+                mock.patch("vibe_memory_cli.vibe_memory_migration.validate_control_plane", return_value=control):
+            code, output, _ = self.invoke(["doctor", "--json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(output["control_plane"]["non_ok_areas"], ["policy", "ui_skill_deployments"])
 
     def test_status_reports_missing_launcher_as_an_actionable_runtime_error(self) -> None:
         release = self.paths.install_root / "releases/1.0.0/scripts"

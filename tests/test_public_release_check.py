@@ -472,6 +472,14 @@ class PublicReleaseCheckTest(unittest.TestCase):
             },
         )
 
+    def test_control_plane_check_names_every_non_ok_area(self) -> None:
+        with mock.patch(
+            "verify_release.vibe_memory_migration.validate_control_plane",
+            return_value={"policy": "error", "loop": "ok", "ui_skill_audit": "error"},
+        ):
+            result = verify_release._control_plane_check(ROOT)
+        self.assertEqual(result, "failed: non-ok areas: policy, ui_skill_audit")
+
 
 if __name__ == "__main__":
     unittest.main()

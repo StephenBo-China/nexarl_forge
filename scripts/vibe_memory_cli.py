@@ -508,8 +508,17 @@ def status_command(_args: argparse.Namespace) -> int:
 
 def doctor_command(_args: argparse.Namespace) -> int:
     result = collect_status(vibe_memory_paths.for_home())
+    paths = vibe_memory_paths.for_home()
+    control = vibe_memory_migration.validate_control_plane(paths, _registry_snapshot(paths))
+    non_ok = sorted(area for area, status in control.items() if status != "ok")
+    result["control_plane"] = {
+        "ok": not non_ok,
+        "status": "ok" if not non_ok else "error",
+        "areas": control,
+        "non_ok_areas": non_ok,
+    }
     _json(result)
-    return 0 if all(result[key]["ok"] for key in DOCTOR_KEYS) else 1
+    return 0 if all(result[key]["ok"] for key in (*DOCTOR_KEYS, "control_plane")) else 1
 
 
 def open_command(_args: argparse.Namespace) -> int:

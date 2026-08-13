@@ -21,6 +21,15 @@ import vibe_memory_paths
 import vibe_memory_migration as migration
 
 
+EXPECTED_AREAS = {
+    "personal_memory", "projects", "memory_review", "policy",
+    "design_preferences", "ui_design_packages", "ui_design_approvals",
+    "ui_design_audit", "ui_skills", "ui_skill_digests",
+    "ui_skill_deployments", "ui_skill_audit", "loop", "worktrees",
+    "active_worktrees", "pending_worktrees", "legacy_hooks",
+}
+
+
 @dataclass(frozen=True)
 class LegacyFixture:
     paths: vibe_memory_paths.RuntimePaths
@@ -151,9 +160,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                 ui_design / "approvals.json",
                 {
                     "schema_version": 1,
-                    "package_approvals": {
-                        "design-1": {"digest": "a" * 64, "status": "approved"}
-                    },
+                    "package_approvals": {},
                     "project_global_approval": {
                         "digest": "b" * 64,
                         "status": "approved",
@@ -197,6 +204,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                     "task-alpha": {
                         "repository": str(project_root),
                         "status": "developing",
+                        "worktree": str(base / "worktrees" / "alpha"),
                     },
                     "task-beta": {
                         "repository": str(second_root),
@@ -205,6 +213,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                 },
             },
         )
+        (base / "worktrees" / "alpha").mkdir(parents=True)
 
         with mock.patch.dict(
             os.environ, {"UI_DESIGN_HOME": str(paths.ui_design_home)}
@@ -241,22 +250,72 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             fixture = build_complete_legacy_fixture(pathlib.Path(value))
             result = migration.inventory(fixture.paths, fixture.registry)
 
-        self.assertEqual(
-            set(result),
-            {
-                "personal_memory",
-                "projects",
-                "memory_review",
-                "design_preferences",
-                "ui_design_approvals",
-                "ui_skills",
-                "loop",
-                "worktrees",
-                "legacy_hooks",
-            },
-        )
+        self.assertEqual(set(result), EXPECTED_AREAS)
+        for area in EXPECTED_AREAS:
+            self.assertIsInstance(result[area]["present"], bool, area)
+            self.assertIsInstance(result[area]["errors"], list, area)
+            self.assertIsInstance(result[area]["records"], list, area)
         self.assertEqual(result["projects"]["registered"], 2)
         self.assertEqual(result["ui_skills"]["published"], 1)
+
+    def test_empty_optional_control_plane_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            result = migration.validate_control_plane(
+                paths, {"schema_version": 1, "projects": [], "current_project": ""}
+            )
+        self.assertEqual(set(result), EXPECTED_AREAS)
+        self.assertTrue(all(status == "ok" for status in result.values()), result)
+
+    def test_dangling_design_approval_and_skill_deployment_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            _write_json(project / "codex/ui_design/approvals.json", {
+                "schema_version": 1,
+                "package_approvals": {"missing": {"status": "approved", "digest": "a" * 64}},
+                "project_global_approval": None,
+            })
+            registry_path = fixture.paths.ui_design_home / "registry.json"
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            registry["deployments"]["dangling"] = {
+                "transaction_id": "dangling", "name": "missing", "version_id": "1.0.0",
+                "digest": "b" * 64, "status": "published",
+            }
+            _write_json(registry_path, registry)
+            result = migration.validate_control_plane(fixture.paths, fixture.registry)
+        self.assertEqual(result["ui_design_approvals"], "error")
+        self.assertEqual(result["ui_skill_deployments"], "error")
+
+    def test_digest_mismatch_and_malformed_canonical_json_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            registry_path = fixture.paths.ui_design_home / "registry.json"
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            package = next(iter(registry["packages"].values()))[0]
+            package["digest"] = "0" * 64
+            _write_json(registry_path, registry)
+            (fixture.project_roots[0] / ".loop/config.json").write_text("{bad", encoding="utf-8")
+            result = migration.validate_control_plane(fixture.paths, fixture.registry)
+        self.assertEqual(result["ui_skill_digests"], "error")
+        self.assertEqual(result["loop"], "error")
+
+    def test_worktree_registry_status_must_reference_existing_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            _write_json(paths.worktree_manager / "tasks.json", {
+                "schema_version": 1,
+                "tasks": {"task": {"status": "verified", "worktree": str(home / "missing")}},
+            })
+            result = migration.validate_control_plane(
+                paths, {"schema_version": 1, "projects": [], "current_project": ""}
+            )
+        self.assertEqual(result["active_worktrees"], "error")
+        self.assertEqual(result["pending_worktrees"], "error")
 
     def test_preview_legacy_hooks_is_read_only_and_reports_targets(self) -> None:
         with tempfile.TemporaryDirectory() as value:

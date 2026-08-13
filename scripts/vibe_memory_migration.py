@@ -19,7 +19,10 @@ from typing import Any
 
 import memory_project
 from memory_review_queue import count_items
+import ui_design_gate
+import ui_design_store
 import ui_design_preferences
+import vibe_memory_settings
 from vibe_memory_paths import RuntimePaths
 
 
@@ -1318,6 +1321,18 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
                 summary = {"path": str(path), "status": "invalid"}
             else:
                 package_approvals += len(packages)
+                package_root = root / "codex/ui_design/design-packages"
+                for task_id, approval in packages.items():
+                    if not isinstance(approval, dict) or not isinstance(approval.get("digest"), str):
+                        errors.append(_issue(path, ValueError(f"invalid package approval {task_id}")))
+                        continue
+                    try:
+                        package = ui_design_gate.get_design_package(root, str(task_id))
+                    except Exception:
+                        errors.append(_issue(package_root / str(task_id), FileNotFoundError("approval references missing design package")))
+                    else:
+                        if package["digest"] != approval["digest"]:
+                            errors.append(_issue(package_root / str(task_id), ValueError("design approval digest mismatch")))
                 project_global = value.get("project_global_approval")
                 if project_global is not None:
                     project_global_approvals += 1
@@ -1586,19 +1601,223 @@ def inspect_legacy_hooks(project_roots: list[pathlib.Path]) -> dict[str, Any]:
     }
 
 
+def _messages(errors: object) -> list[str]:
+    if not isinstance(errors, list):
+        return ["errors must be an array"]
+    return [
+        f"{item.get('path')}: {item.get('error')}" if isinstance(item, dict) else str(item)
+        for item in errors
+    ]
+
+
+def _area(value: dict[str, Any], records: list[dict[str, Any]], present: bool) -> dict[str, Any]:
+    return {**value, "present": present, "errors": _messages(value.get("errors", [])), "records": records}
+
+
+def inspect_policy(paths: RuntimePaths) -> dict[str, Any]:
+    path = paths.install_root / "config.json"
+    value, issue = _read_json(path)
+    errors: list[dict[str, str]] = []
+    records: list[dict[str, Any]] = []
+    if issue:
+        errors.append(issue)
+    elif value is not None:
+        try:
+            settings = vibe_memory_settings.load_settings(paths)
+        except (TypeError, ValueError) as error:
+            errors.append(_issue(path, error))
+        else:
+            records.append({"path": str(path), "schema_version": settings["schema_version"], "formal_memory_requires_approval": settings["formal_memory_requires_approval"]})
+    return _area({"path": str(path), "errors": errors}, records, value is not None and not errors)
+
+
+def inspect_ui_design_packages(project_roots: list[pathlib.Path]) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for root in project_roots:
+        package_root = root / "codex/ui_design/design-packages"
+        if not package_root.exists():
+            continue
+        if not package_root.is_dir():
+            errors.append(_issue(package_root, ValueError("design-packages must be a directory")))
+            continue
+        for item in sorted(package_root.iterdir()):
+            if not item.is_dir():
+                errors.append(_issue(item, ValueError("design package must be a directory")))
+                continue
+            try:
+                package = ui_design_gate.get_design_package(root, item.name)
+            except Exception as error:
+                errors.append(_issue(item, error))
+            else:
+                records.append({"root": str(root), "task_id": item.name, "path": str(item), "digest": package["digest"]})
+    return _area({"projects": len(project_roots), "errors": errors}, records, bool(records))
+
+
+def _inspect_jsonl(paths: list[pathlib.Path], label: str) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    present = False
+    for path in paths:
+        text_value, issue = _read_text(path)
+        if issue:
+            errors.append(issue)
+            continue
+        if text_value is None:
+            continue
+        present = True
+        for number, line in enumerate(text_value.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                errors.append(_issue(path, ValueError(f"{label} line {number}: {error}")))
+                continue
+            if not isinstance(value, dict):
+                errors.append(_issue(path, ValueError(f"{label} line {number} must be an object")))
+            else:
+                records.append({"path": str(path), **value})
+    return _area({"errors": errors}, records, present and not errors)
+
+
+def inspect_ui_design_audit(project_roots: list[pathlib.Path]) -> dict[str, Any]:
+    return _inspect_jsonl([root / "codex/ui_design/audit.jsonl" for root in project_roots], "UI design audit")
+
+
+def _skill_registry(ui_design_home: pathlib.Path) -> tuple[dict[str, Any] | None, list[dict[str, str]]]:
+    path = ui_design_home / "registry.json"
+    value, issue = _read_json(path)
+    errors = [issue] if issue else []
+    if value is None:
+        return None, errors
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
+        errors.append(_issue(path, ValueError("UI skill registry schema_version must be 1")))
+        return None, errors
+    for key in ("drafts", "packages", "deployments", "idempotency"):
+        if not isinstance(value.get(key), dict):
+            errors.append(_issue(path, ValueError(f"{key} must be an object")))
+    return value, errors
+
+
+def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
+    registry, errors = _skill_registry(ui_design_home)
+    records: list[dict[str, Any]] = []
+    if registry:
+        for name, versions in registry["packages"].items():
+            if not isinstance(versions, list):
+                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"packages.{name} must be an array")))
+                continue
+            for record in versions:
+                if not isinstance(record, dict) or not isinstance(record.get("package_path"), str) or not isinstance(record.get("digest"), str):
+                    errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid package record for {name}")))
+                    continue
+                package_path = pathlib.Path(record["package_path"])
+                if not package_path.is_dir():
+                    errors.append(_issue(package_path, FileNotFoundError("referenced UI skill package is missing")))
+                    continue
+                actual = ui_design_store.tree_digest(package_path)
+                if actual != record["digest"]:
+                    errors.append(_issue(package_path, ValueError("UI skill package digest mismatch")))
+                records.append({"name": name, "version_id": record.get("version_id"), "path": str(package_path), "digest": record["digest"], "actual_digest": actual})
+    return _area({"errors": errors}, records, registry is not None and not errors)
+
+
+def inspect_ui_skill_deployments(ui_design_home: pathlib.Path) -> dict[str, Any]:
+    registry, errors = _skill_registry(ui_design_home)
+    records: list[dict[str, Any]] = []
+    packages: set[tuple[object, object]] = set()
+    if registry:
+        for name, versions in registry["packages"].items():
+            if isinstance(versions, list):
+                packages.update((name, item.get("version_id")) for item in versions if isinstance(item, dict))
+        for transaction_id, record in registry["deployments"].items():
+            if not isinstance(record, dict) or record.get("transaction_id") != transaction_id:
+                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid deployment {transaction_id}")))
+                continue
+            if (record.get("name"), record.get("version_id")) not in packages:
+                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"deployment {transaction_id} references missing package")))
+            report = ui_design_home / "deployments" / f"{transaction_id}.json"
+            if not report.is_file():
+                errors.append(_issue(report, FileNotFoundError("referenced deployment report is missing")))
+            records.append({"transaction_id": transaction_id, **record})
+    return _area({"errors": errors}, records, registry is not None and not errors)
+
+
+def inspect_ui_skill_audit(ui_design_home: pathlib.Path) -> dict[str, Any]:
+    return _inspect_jsonl([ui_design_home / "audit.jsonl"], "UI skill audit")
+
+
+_ACTIVE_WORKTREE_STATUSES = {
+    "developing",
+    "ready_for_user_acceptance",
+    "release_failed",
+    "canonical_synced",
+    "master_pushed",
+    "staging_deployed",
+    "verified",
+}
+_PENDING_WORKTREE_STATUSES = _ACTIVE_WORKTREE_STATUSES - {"developing"}
+
+
+def _inspect_worktree_subset(worktree_manager: pathlib.Path, statuses: set[str]) -> dict[str, Any]:
+    path = worktree_manager / "tasks.json"
+    value, issue = _read_json(path)
+    errors: list[dict[str, str]] = [issue] if issue else []
+    records: list[dict[str, Any]] = []
+    if value is not None:
+        if not isinstance(value, dict) or value.get("schema_version") != 1 or not isinstance(value.get("tasks"), dict):
+            errors.append(_issue(path, ValueError("worktree registry schema is invalid")))
+        else:
+            for task_id, record in value["tasks"].items():
+                if not isinstance(record, dict):
+                    errors.append(_issue(path, ValueError(f"task {task_id} must be an object")))
+                    continue
+                if record.get("status") in statuses:
+                    worktree = record.get("worktree")
+                    if not isinstance(worktree, str) or not pathlib.Path(worktree).is_dir():
+                        errors.append(_issue(path, ValueError(f"task {task_id} status {record.get('status')} references missing worktree")))
+                    records.append({"task_id": task_id, **record})
+    return _area({"path": str(path), "errors": errors}, records, value is not None and not errors)
+
+
+def inspect_active_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
+    return _inspect_worktree_subset(worktree_manager, _ACTIVE_WORKTREE_STATUSES)
+
+
+def inspect_pending_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
+    return _inspect_worktree_subset(worktree_manager, _PENDING_WORKTREE_STATUSES)
+
+
 def inventory(paths: RuntimePaths, registry: Mapping[str, object]) -> dict[str, Any]:
     project_roots = valid_project_roots(registry)
-    return {
+    snapshot = {
         "personal_memory": inspect_personal(paths.personal_memory),
         "projects": inspect_projects(project_roots, registry),
         "memory_review": inspect_review_state(project_roots),
+        "policy": inspect_policy(paths),
         "design_preferences": inspect_design_preferences(paths, project_roots),
+        "ui_design_packages": inspect_ui_design_packages(project_roots),
         "ui_design_approvals": inspect_ui_design_approvals(project_roots),
+        "ui_design_audit": inspect_ui_design_audit(project_roots),
         "ui_skills": inspect_ui_skills(paths.ui_design_home),
+        "ui_skill_digests": inspect_ui_skill_digests(paths.ui_design_home),
+        "ui_skill_deployments": inspect_ui_skill_deployments(paths.ui_design_home),
+        "ui_skill_audit": inspect_ui_skill_audit(paths.ui_design_home),
         "loop": inspect_loop(project_roots),
         "worktrees": inspect_worktrees(paths.worktree_manager),
+        "active_worktrees": inspect_active_worktrees(paths.worktree_manager),
+        "pending_worktrees": inspect_pending_worktrees(paths.worktree_manager),
         "legacy_hooks": inspect_legacy_hooks(project_roots),
     }
+    for area, value in snapshot.items():
+        if not isinstance(value, dict):
+            snapshot[area] = {"present": False, "errors": ["inspector returned invalid value"], "records": []}
+            continue
+        value["errors"] = _messages(value.get("errors", []))
+        value.setdefault("records", [])
+        value.setdefault("present", bool(value.get("records")))
+    return snapshot
 
 
 def _control_plane_area_status(value: object) -> str:

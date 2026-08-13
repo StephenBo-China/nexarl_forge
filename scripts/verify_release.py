@@ -161,8 +161,9 @@ def _control_plane_check(root: pathlib.Path) -> str:
                 fixture.paths,
                 json.loads(fixture.paths.project_registry.read_text(encoding="utf-8")),
             )
-            if any(status != "ok" for status in result.values()):
-                return f"failed: {result}"
+            non_ok = sorted(area for area, status in result.items() if status != "ok")
+            if non_ok:
+                return "failed: non-ok areas: " + ", ".join(non_ok)
     except Exception as error:
         return f"failed: {error}"
     return "ok"
