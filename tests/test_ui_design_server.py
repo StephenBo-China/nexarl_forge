@@ -915,6 +915,64 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(registry.package_digest(unmanaged), before_digest)
         self.assertEqual(after_mtimes, before_mtimes)
 
+    def test_user_docs_cover_installed_lifecycle_and_model_distilled_memory(self) -> None:
+        user_docs = (
+            ROOT / "README.md",
+            ROOT / "docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md",
+        )
+        required_commands = (
+            "git clone",
+            "cd vibe_coding_manage_platform",
+            "./install.sh",
+            "./install.sh --with-claude-hooks",
+            "vibe-memory open",
+            "vibe-memory project register /path/to/workspace",
+            "vibe-memory project init /path/to/workspace",
+            "vibe-memory migrate preview --project-root /path/to/workspace",
+            "vibe-memory migrate apply --approved --project-root /path/to/workspace",
+            "vibe-memory doctor",
+            "vibe-memory update --source-root /path/to/local/clone",
+            "vibe-memory rollback",
+            "vibe-memory repair",
+            "vibe-memory hooks status",
+            "vibe-memory hooks repair",
+            "vibe-memory uninstall",
+            "--approved-data-deletion",
+        )
+        required_contracts = (
+            "Python 3.10+",
+            "event metadata",
+            "active Codex or Claude Code model",
+            "registered cwd",
+            "unregistered cwd",
+            "pending",
+            "active",
+            "design preferences",
+            "UI design approval",
+            "UI Skills",
+            "Loop",
+            "policy",
+            "LaunchAgent",
+            "fresh Codex or Claude Code session",
+        )
+        for path in user_docs:
+            text = path.read_text(encoding="utf-8")
+            for command in required_commands:
+                self.assertIn(command, text, f"{path.name} missing {command}")
+            for contract in required_contracts:
+                self.assertIn(contract, text, f"{path.name} missing {contract}")
+
+        release = (ROOT / "docs/RELEASE_CHECKLIST.md").read_text(encoding="utf-8")
+        self.assertIn("13-gate", release)
+        self.assertIn("real Darwin installed-runtime E2E", release)
+        self.assertIn("Claude Code evaluation", release)
+        self.assertIn("release reports", release)
+
+        for path in (*user_docs, ROOT / "docs/RELEASE_CHECKLIST.md"):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("bounded prompt summary", text)
+            self.assertNotIn("/usr/bin/python", text)
+
 
 if __name__ == "__main__":
     unittest.main()
