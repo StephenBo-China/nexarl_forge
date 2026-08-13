@@ -18,15 +18,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import memory_project
+import loop_superpowers
 from memory_review_queue import count_items
 import ui_design_gate
 import ui_design_store
 import ui_design_preferences
+import ui_skill_registry
 import vibe_memory_settings
 from vibe_memory_paths import RuntimePaths
 
 
 _MARKDOWN_SECTION_RE = re.compile(r"(?m)^#{2,6}\s+")
+_MAX_CONTROL_FILE_BYTES = 4 * 1024 * 1024
 _LEGACY_MEMORY_HOOK_RE = re.compile(
     r"(^|[/\\\"'\s])\.(?:codex|claude)[/\\]hooks[/\\]"
     r"shared_memory_hook\.py($|[\"'\s])"
@@ -66,6 +69,8 @@ def _issue(path: pathlib.Path, error: Exception) -> dict[str, str]:
 
 def _read_text(path: pathlib.Path) -> tuple[str | None, dict[str, str] | None]:
     try:
+        if path.stat().st_size > _MAX_CONTROL_FILE_BYTES:
+            return None, _issue(path, ValueError("control-plane file exceeds size limit"))
         return path.read_text(encoding="utf-8"), None
     except FileNotFoundError:
         return None, None
@@ -1206,8 +1211,11 @@ def inspect_review_state(project_roots: list[pathlib.Path]) -> dict[str, Any]:
                         [item for item in items if isinstance(item, dict)]
                     )
                 else:
+                    errors.append(_issue(queue_path, ValueError("memory review queue items must be an array")))
                     queue_counts = {key: 0 for key in total_counts}
             else:
+                if queue_value is not None:
+                    errors.append(_issue(queue_path, ValueError("memory review queue must be an object")))
                 queue_counts = {key: 0 for key in total_counts}
         state_path = root / "codex" / "memory_review_state.json"
         state_value, state_issue = _read_json(state_path)
@@ -1216,8 +1224,14 @@ def inspect_review_state(project_roots: list[pathlib.Path]) -> dict[str, Any]:
             state_items = 0
         elif isinstance(state_value, dict):
             items = state_value.get("items", {})
-            state_items = len(items) if isinstance(items, dict) else 0
+            if isinstance(items, dict):
+                state_items = len(items)
+            else:
+                errors.append(_issue(state_path, ValueError("memory review state items must be an object")))
+                state_items = 0
         else:
+            if state_value is not None:
+                errors.append(_issue(state_path, ValueError("memory review state must be an object")))
             state_items = 0
         total_queue_items += queue_items
         total_state_items += state_items
@@ -1463,6 +1477,18 @@ def inspect_ui_skills(ui_design_home: pathlib.Path) -> dict[str, Any]:
             "idempotency": 0,
             "errors": errors,
         }
+    valid_draft_statuses = set(ui_skill_registry.DRAFT_TRANSITIONS)
+    for transitions in ui_skill_registry.DRAFT_TRANSITIONS.values():
+        valid_draft_statuses.update(transitions)
+    for draft_id, record in drafts.items():
+        if not isinstance(record, dict) or record.get("status") not in valid_draft_statuses:
+            errors.append(_issue(path, ValueError(f"invalid draft status: {draft_id}")))
+    if errors:
+        return {
+            "path": str(path), "status": "invalid", "schema_version": value.get("schema_version"),
+            "drafts": 0, "published": 0, "deployments": 0, "idempotency": 0,
+            "errors": errors,
+        }
     published = 0
     for versions in packages.values():
         if isinstance(versions, list):
@@ -1509,7 +1535,7 @@ def inspect_loop(project_roots: list[pathlib.Path]) -> dict[str, Any]:
             errors.append(_issue(path, ValueError("JSON root must be an object")))
         else:
             schema_version = value.get("schema_version")
-            if isinstance(schema_version, int):
+            if schema_version == loop_superpowers.SCHEMA_VERSION:
                 configured += 1
                 schema_versions[str(schema_version)] = schema_versions.get(str(schema_version), 0) + 1
                 summary = {
@@ -1521,7 +1547,7 @@ def inspect_loop(project_roots: list[pathlib.Path]) -> dict[str, Any]:
             else:
                 summary = {"path": str(path), "status": "invalid", "schema_version": schema_version}
                 errors.append(
-                    _issue(path, ValueError("loop config schema_version must be an integer"))
+                    _issue(path, ValueError(f"loop config schema_version must be {loop_superpowers.SCHEMA_VERSION}"))
                 )
         items.append({"root": str(root), "config": summary})
     return {
@@ -1753,6 +1779,11 @@ def _inspect_jsonl(paths: list[pathlib.Path], label: str) -> dict[str, Any]:
             if not isinstance(value, dict):
                 errors.append(_issue(path, ValueError(f"{label} line {number} must be an object")))
             else:
+                required = {"at", "event", "status"}
+                required.add("task_id" if label == "UI design audit" else "draft_id")
+                if not required.issubset(value):
+                    errors.append(_issue(path, ValueError(f"{label} line {number} missing required fields")))
+                    continue
                 records.append({"path": str(path), **value})
     return _area({"errors": errors}, records, present and not errors)
 
@@ -1773,7 +1804,7 @@ def _skill_registry(ui_design_home: pathlib.Path) -> tuple[dict[str, Any] | None
     for key in ("drafts", "packages", "deployments", "idempotency"):
         if not isinstance(value.get(key), dict):
             errors.append(_issue(path, ValueError(f"{key} must be an object")))
-    return value, errors
+    return (None if errors else value), errors
 
 
 def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
@@ -1789,6 +1820,22 @@ def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
                     errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid package record for {name}")))
                     continue
                 package_path = pathlib.Path(record["package_path"])
+                version_id = record.get("version_id")
+                expected = ui_design_home / "packages" / str(name) / str(version_id)
+                try:
+                    canonical_package = package_path.resolve(strict=True)
+                    canonical_expected = expected.resolve(strict=True)
+                except (OSError, RuntimeError):
+                    canonical_package = None
+                    canonical_expected = None
+                if canonical_package is None or canonical_package != canonical_expected:
+                    errors.append(_issue(package_path, ValueError("UI skill package path is outside canonical package storage")))
+                    continue
+                if any(path.is_symlink() for path in (package_path, *package_path.parents)) or any(
+                    path.is_symlink() for path in package_path.rglob("*")
+                ):
+                    errors.append(_issue(package_path, ValueError("UI skill package symlinks are not allowed")))
+                    continue
                 if not package_path.is_dir():
                     errors.append(_issue(package_path, FileNotFoundError("referenced UI skill package is missing")))
                     continue
@@ -1890,25 +1937,35 @@ def inspect_pending_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
 
 def inventory(paths: RuntimePaths, registry: Mapping[str, object]) -> dict[str, Any]:
     project_roots = valid_project_roots(registry)
-    snapshot = {
-        "personal_memory": inspect_personal(paths.personal_memory),
-        "projects": inspect_projects(project_roots, registry),
-        "memory_review": inspect_review_state(project_roots),
-        "policy": inspect_policy(paths),
-        "design_preferences": inspect_design_preferences(paths, project_roots),
-        "ui_design_packages": inspect_ui_design_packages(project_roots),
-        "ui_design_approvals": inspect_ui_design_approvals(project_roots),
-        "ui_design_audit": inspect_ui_design_audit(project_roots),
-        "ui_skills": inspect_ui_skills(paths.ui_design_home),
-        "ui_skill_digests": inspect_ui_skill_digests(paths.ui_design_home),
-        "ui_skill_deployments": inspect_ui_skill_deployments(paths.ui_design_home),
-        "ui_skill_audit": inspect_ui_skill_audit(paths.ui_design_home),
-        "loop": inspect_loop(project_roots),
-        "worktrees": inspect_worktrees(paths.worktree_manager),
-        "active_worktrees": inspect_active_worktrees(paths.worktree_manager),
-        "pending_worktrees": inspect_pending_worktrees(paths.worktree_manager),
-        "legacy_hooks": inspect_legacy_hooks(project_roots),
-    }
+    specs = (
+        ("personal_memory", inspect_personal, (paths.personal_memory,)),
+        ("projects", inspect_projects, (project_roots, registry)),
+        ("memory_review", inspect_review_state, (project_roots,)),
+        ("policy", inspect_policy, (paths,)),
+        ("design_preferences", inspect_design_preferences, (paths, project_roots)),
+        ("ui_design_packages", inspect_ui_design_packages, (project_roots,)),
+        ("ui_design_approvals", inspect_ui_design_approvals, (project_roots,)),
+        ("ui_design_audit", inspect_ui_design_audit, (project_roots,)),
+        ("ui_skills", inspect_ui_skills, (paths.ui_design_home,)),
+        ("ui_skill_digests", inspect_ui_skill_digests, (paths.ui_design_home,)),
+        ("ui_skill_deployments", inspect_ui_skill_deployments, (paths.ui_design_home,)),
+        ("ui_skill_audit", inspect_ui_skill_audit, (paths.ui_design_home,)),
+        ("loop", inspect_loop, (project_roots,)),
+        ("worktrees", inspect_worktrees, (paths.worktree_manager,)),
+        ("active_worktrees", inspect_active_worktrees, (paths.worktree_manager,)),
+        ("pending_worktrees", inspect_pending_worktrees, (paths.worktree_manager,)),
+        ("legacy_hooks", inspect_legacy_hooks, (project_roots,)),
+    )
+    snapshot: dict[str, Any] = {}
+    for area, inspector, arguments in specs:
+        try:
+            snapshot[area] = inspector(*arguments)
+        except Exception as error:
+            snapshot[area] = {
+                "present": False,
+                "errors": [f"inspection failed: {type(error).__name__}"],
+                "records": [],
+            }
     for area, value in snapshot.items():
         if not isinstance(value, dict):
             snapshot[area] = {"present": False, "errors": ["inspector returned invalid value"], "records": []}

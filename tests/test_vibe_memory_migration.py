@@ -321,6 +321,74 @@ class VibeMemoryMigrationTest(unittest.TestCase):
         self.assertFalse(result["ui_design_audit"]["present"])
         self.assertEqual(result["ui_design_audit"]["errors"], [])
 
+    def test_inventory_isolates_inspector_exceptions(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            with mock.patch("vibe_memory_migration.inspect_ui_skills", side_effect=RuntimeError("secret /outside")):
+                result = migration.inventory(paths, {"schema_version": 1, "projects": [], "current_project": ""})
+        self.assertEqual(result["ui_skills"], {
+            "present": False, "errors": ["inspection failed: RuntimeError"], "records": []
+        })
+        self.assertIn("personal_memory", result)
+
+    def test_skill_registry_structural_errors_do_not_crash_other_skill_areas(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            _write_json(paths.ui_design_home / "registry.json", {
+                "schema_version": 1, "drafts": [], "packages": [], "deployments": [], "idempotency": []
+            })
+            result = migration.validate_control_plane(paths, {"schema_version": 1, "projects": [], "current_project": ""})
+        for area in ("ui_skills", "ui_skill_digests", "ui_skill_deployments"):
+            self.assertEqual(result[area], "error")
+
+    def test_external_or_symlinked_skill_package_is_rejected_without_reading_target(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            outside = pathlib.Path(value) / "secret"
+            outside.mkdir()
+            (outside / "secret.txt").write_text("do-not-read", encoding="utf-8")
+            _write_json(paths.ui_design_home / "registry.json", {
+                "schema_version": 1, "drafts": {}, "deployments": {}, "idempotency": {},
+                "packages": {"sample-ui": [{"version_id": "1.0.0", "package_path": str(outside), "digest": "0" * 64}]},
+            })
+            result = migration.inventory(paths, {"schema_version": 1, "projects": [], "current_project": ""})
+        self.assertTrue(result["ui_skill_digests"]["errors"])
+        self.assertNotIn("do-not-read", json.dumps(result))
+
+    def test_strict_loop_review_audit_and_status_schemas_reject_false_green(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            _write_json(project / ".loop/config.json", {"schema_version": 999})
+            _write_json(project / "codex/memory_review_queue.json", {"items": "bad"})
+            (project / "codex/ui_design/audit.jsonl").write_text("{}\n", encoding="utf-8")
+            registry_path = fixture.paths.ui_design_home / "registry.json"
+            registry = json.loads(registry_path.read_text())
+            next(iter(registry["drafts"].values()))["status"] = "unknown"
+            _write_json(registry_path, registry)
+            result = migration.validate_control_plane(fixture.paths, fixture.registry)
+        self.assertEqual(result["loop"], "error")
+        self.assertEqual(result["memory_review"], "error")
+        self.assertEqual(result["ui_design_audit"], "error")
+        self.assertEqual(result["ui_skills"], "error")
+
+    def test_oversized_control_file_is_area_error_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            paths.ui_design_home.mkdir(parents=True)
+            (paths.ui_design_home / "registry.json").write_bytes(b" " * (4 * 1024 * 1024 + 1))
+            result = migration.validate_control_plane(paths, {"schema_version": 1, "projects": [], "current_project": ""})
+        self.assertEqual(result["ui_skills"], "error")
+        self.assertEqual(result["ui_skill_digests"], "error")
+
     def test_empty_optional_control_plane_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             home = pathlib.Path(value) / "home"
