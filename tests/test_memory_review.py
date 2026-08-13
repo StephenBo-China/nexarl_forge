@@ -25,7 +25,7 @@ import ui_design_preferences as preferences
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
-    def test_init_project_creates_safe_ui_design_defaults(self) -> None:
+    def test_init_project_creates_memory_and_instructions_without_project_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value) / "project"
             root.mkdir()
@@ -38,52 +38,20 @@ class MemoryReviewQualityTest(unittest.TestCase):
             finally:
                 memory_project.REGISTRY_PATH = original_registry
 
-            config = json.loads(
-                (root / "codex/ui_design/config.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(config["gate_mode"], "design_package")
-            self.assertFalse(config["hard_gate_enabled"])
-            self.assertEqual(config["schema_version"], 1)
-            self.assertTrue((root / "codex/ui_design/active-skills.json").exists())
-            self.assertTrue((root / "codex/ui_design/preferences.json").exists())
-            self.assertTrue((root / "codex/ui_design/approvals.json").exists())
-            self.assertTrue(
-                (root / ".codex/hooks/ui_design_gate_hook.py").exists()
-            )
-            self.assertTrue(
-                (root / ".claude/hooks/ui_design_gate_hook.py").exists()
-            )
-            for settings_path in (
-                root / ".codex/hooks.json",
-                root / ".claude/settings.json",
-            ):
-                settings = json.loads(settings_path.read_text(encoding="utf-8"))
-                pre_tool = settings["hooks"]["PreToolUse"]
-                self.assertTrue(
-                    any(
-                        "ui_design_gate_hook.py" in hook["command"]
-                        for entry in pre_tool
-                        for hook in entry["hooks"]
-                    )
-                )
-            context_path = root / "codex/ui_design/effective-context.json"
-            self.assertTrue(context_path.exists())
-            context = json.loads(context_path.read_text(encoding="utf-8"))
-            self.assertEqual(context["gate"]["mode"], "design_package")
-            self.assertEqual(context["active_skills"]["skills"], [])
+            self.assertTrue((root / "codex/codex_long_memory.md").exists())
+            self.assertTrue((root / "codex/codex_short_memory.md").exists())
+            self.assertTrue((root / "codex/ui_design/config.json").exists())
+            self.assertFalse((root / ".codex/hooks.json").exists())
+            self.assertFalse((root / ".claude/settings.json").exists())
             for instructions in (
                 root / "AGENTS.md",
                 root / "CLAUDE.md",
                 root / ".claude/rules/shared-memory.md",
             ):
                 text = instructions.read_text(encoding="utf-8")
-                self.assertIn("codex/ui_design/config.json", text)
-                self.assertIn("codex/ui_design/effective-context.json", text)
-                self.assertIn("codex/ui_design/active-skills.json", text)
-                self.assertIn("codex/ui_design/approvals.json", text)
-                self.assertIn("visible-interface", text)
+                self.assertIn("Agent-Generated Memory Candidates", text)
             self.assertEqual(
-                result["project"]["ui_design_status"], "configuration_required"
+                result["project"]["memory_status"], "initialized"
             )
 
     def test_effective_ui_context_merges_preferences_skills_and_gate_state(self) -> None:

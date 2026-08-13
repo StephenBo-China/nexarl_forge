@@ -110,6 +110,15 @@ class VibeMemoryRouterTest(unittest.TestCase):
 
             self.assertEqual(resolved, actual.resolve())
 
+    def test_resolve_registered_project_ignores_non_directory_registered_root(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            base = pathlib.Path(value)
+            missing = base / "missing"
+
+            self.assertIsNone(
+                resolve_registered_project(missing / "child", [{"root": str(missing)}])
+            )
+
     def test_register_project_allows_non_git_directory_and_makes_it_current(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             base = pathlib.Path(value)

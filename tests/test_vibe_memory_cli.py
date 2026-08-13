@@ -723,11 +723,61 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertTrue(initialized["ok"])
             self.assertTrue((notes / "codex/codex_long_memory.md").exists())
+            self.assertFalse((notes / ".codex/hooks.json").exists())
+            self.assertFalse((notes / ".claude/settings.json").exists())
+            self.assertFalse(
+                (notes / ".codex/hooks/shared_memory_hook.py").exists()
+            )
+            self.assertFalse(
+                (notes / ".claude/hooks/shared_memory_hook.py").exists()
+            )
 
             code, removed, _ = self.invoke(["project", "unregister", str(notes)])
             self.assertEqual(code, 0)
             self.assertEqual(removed["current_project"], "")
             self.assertEqual(removed["projects"], [])
+
+    def test_project_unregister_archives_owned_legacy_hooks_and_preserves_custom_data(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "legacy"
+        project.mkdir()
+        memory = project / "codex/codex_long_memory.md"
+        memory.parent.mkdir()
+        memory.write_text("approved memory\n", encoding="utf-8")
+        script = project / ".codex/hooks/shared_memory_hook.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("# managed legacy hook\n", encoding="utf-8")
+        settings = project / ".codex/hooks.json"
+        settings.write_text(json.dumps({
+            "custom_text": "keep me",
+            "hooks": {
+                "Stop": [
+                    {"hooks": [{
+                        "type": "command",
+                        "command": "python3 .codex/hooks/shared_memory_hook.py stop",
+                    }]},
+                    {"hooks": [{
+                        "type": "command",
+                        "command": "custom-hook --keep",
+                    }]},
+                ]
+            },
+        }), encoding="utf-8")
+
+        with mock.patch.object(
+            vibe_memory_cli.memory_project, "REGISTRY_PATH", self.paths.project_registry
+        ):
+            vibe_memory_cli.memory_project.register_project(project)
+            code, result, _ = self.invoke(["project", "unregister", str(project)])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(result["status"], "unregistered")
+        self.assertTrue(memory.exists())
+        current = settings.read_text(encoding="utf-8")
+        self.assertIn("custom-hook --keep", current)
+        self.assertIn("keep me", current)
+        self.assertNotIn(".codex/hooks/shared_memory_hook.py", current)
+        self.assertFalse(script.exists())
+        self.assertTrue(result["legacy_hook_backups"])
 
     def test_memory_commands_delegate_to_review_apis(self) -> None:
         candidate = {"id": "candidate-1", "status": "pending", "scope": "personal", "target": "personal_long", "risk_flags": [], "summary": "summary", "content": "content"}
@@ -747,6 +797,12 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         project = pathlib.Path(self.temporary.name) / "project"
         project.mkdir()
         expected = [{"root": str(project.resolve()), "managed_entries": 5, "custom_entries": 1}]
+        registry = self.paths.project_registry
+        registry.parent.mkdir(parents=True, exist_ok=True)
+        registry.write_text(json.dumps({
+            "current_project": str(project.resolve()),
+            "projects": [{"root": str(project.resolve())}],
+        }), encoding="utf-8")
         with mock.patch(
             "vibe_memory_cli.vibe_memory_migration.preview_legacy_hooks",
             return_value=expected,
@@ -755,11 +811,23 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(output, expected)
-        preview.assert_called_once_with([project.resolve()])
+        preview.assert_called_once_with([project.absolute()], paths=self.paths)
+
+    def test_migrate_requires_an_explicit_selected_root(self) -> None:
+        code, output, stderr = self.invoke(["migrate", "preview"])
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertIn("project root", stderr.lower())
 
     def test_migrate_apply_requires_explicit_approval_and_then_delegates(self) -> None:
         project = pathlib.Path(self.temporary.name) / "project"
         project.mkdir()
+        self.paths.project_registry.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.project_registry.write_text(json.dumps({
+            "current_project": str(project.resolve()),
+            "projects": [{"root": str(project.resolve())}],
+        }), encoding="utf-8")
 
         code, output, stderr = self.invoke(["migrate", "apply", str(project)])
 
@@ -778,7 +846,22 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(output, expected)
-        apply.assert_called_once_with([project.resolve()])
+        apply.assert_called_once_with([project.absolute()], paths=self.paths)
+
+    def test_migrate_cli_preserves_symlink_identity_for_validation(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+        alias = pathlib.Path(self.temporary.name) / "alias"
+        alias.symlink_to(project, target_is_directory=True)
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.preview_legacy_hooks",
+            return_value=[],
+        ) as preview:
+            code, output, _ = self.invoke(["migrate", "preview", str(alias)])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output, [])
+        preview.assert_called_once_with([alias.absolute()], paths=self.paths)
 
     def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
         with mock.patch(

@@ -9,6 +9,9 @@ import re
 import shutil
 import tempfile
 import datetime as _dt
+import contextlib
+import fcntl
+import hashlib
 from collections.abc import Mapping
 from typing import Any
 
@@ -20,7 +23,8 @@ from vibe_memory_paths import RuntimePaths
 
 _MARKDOWN_SECTION_RE = re.compile(r"(?m)^#{2,6}\s+")
 _LEGACY_MEMORY_HOOK_RE = re.compile(
-    r"(^|[/\\\"'\s])shared_memory_hook\.py($|[\"'\s])"
+    r"(^|[/\\\"'\s])\.(?:codex|claude)[/\\]hooks[/\\]"
+    r"shared_memory_hook\.py($|[\"'\s])"
 )
 _LEGACY_HOOK_DOCUMENTS = (
     (
@@ -211,6 +215,97 @@ def _atomic_write_json(path: pathlib.Path, value: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _read_registry(paths: RuntimePaths) -> Mapping[str, object]:
+    value, issue = _read_json(paths.project_registry)
+    if issue is not None:
+        raise ValueError(
+            f"project registry is invalid: {issue['path']}: {issue['error']}"
+        )
+    if not isinstance(value, dict):
+        raise ValueError("project registry is missing or invalid")
+    return value
+
+
+def _selected_registered_roots(
+    project_roots: list[pathlib.Path], paths: RuntimePaths
+) -> list[pathlib.Path]:
+    if not project_roots:
+        raise ValueError("at least one explicit project root is required")
+    registered = {str(root) for root in valid_project_roots(_read_registry(paths))}
+    selected: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for raw in project_roots:
+        requested = pathlib.Path(raw).expanduser()
+        if requested.is_symlink():
+            raise ValueError(f"legacy migration refuses symlink root: {requested}")
+        resolved = requested.resolve()
+        key = str(resolved)
+        if key not in registered:
+            raise ValueError(f"legacy migration requires a registered project root: {resolved}")
+        if not resolved.is_dir():
+            raise ValueError(f"registered project root is not a directory: {resolved}")
+        if key not in seen:
+            selected.append(resolved)
+            seen.add(key)
+    return selected
+
+
+@contextlib.contextmanager
+def _project_lock(root: pathlib.Path):
+    descriptor = os.open(
+        root,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _legacy_state_digest(root: pathlib.Path) -> str:
+    digest = hashlib.sha256()
+    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+        for relative in (document_relative, script_relative):
+            path = root / relative
+            digest.update(str(relative).encode("utf-8"))
+            if path.is_symlink():
+                digest.update(b"symlink\0" + os.readlink(path).encode("utf-8"))
+            elif path.is_file():
+                digest.update(b"file\0" + path.read_bytes())
+            else:
+                digest.update(b"missing\0")
+    return digest.hexdigest()
+
+
+def _write_migration_audit(
+    root: pathlib.Path,
+    stamp: str,
+    *,
+    before_digest: str,
+    after_digest: str,
+    changed_paths: list[str],
+    backups: list[str],
+    result: str,
+) -> pathlib.Path:
+    audit = root / "codex" / "migration_audits" / f"legacy-hooks-{stamp}.json"
+    _atomic_write_json(
+        audit,
+        {
+            "root": str(root),
+            "before_digest": before_digest,
+            "after_digest": after_digest,
+            "changed_paths": changed_paths,
+            "backups": backups,
+            "result": result,
+        },
+    )
+    return audit
+
+
 def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     project_root = pathlib.Path(root).expanduser().resolve()
     managed: set[str] = set()
@@ -267,14 +362,24 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     }
 
 
-def preview_legacy_hooks(project_roots: list[pathlib.Path]) -> list[dict[str, Any]]:
+def preview_legacy_hooks(
+    project_roots: list[pathlib.Path], *, paths: RuntimePaths | None = None
+) -> list[dict[str, Any]]:
     """Return a read-only legacy project memory-hook migration preview."""
-    return [_legacy_hook_preview_for_project(pathlib.Path(root)) for root in project_roots]
+    runtime_paths = paths or memory_project.RUNTIME_PATHS
+    return [
+        _legacy_hook_preview_for_project(root)
+        for root in _selected_registered_roots(project_roots, runtime_paths)
+    ]
 
 
-def apply_legacy_hooks(project_roots: list[pathlib.Path]) -> list[dict[str, Any]]:
+def apply_legacy_hooks(
+    project_roots: list[pathlib.Path], *, paths: RuntimePaths | None = None
+) -> list[dict[str, Any]]:
     """Remove old per-project memory hook entries after backing up touched files."""
-    previews = preview_legacy_hooks(project_roots)
+    runtime_paths = paths or memory_project.RUNTIME_PATHS
+    selected = _selected_registered_roots(project_roots, runtime_paths)
+    previews = [_legacy_hook_preview_for_project(root) for root in selected]
     errors = [
         error
         for project in previews
@@ -288,51 +393,84 @@ def apply_legacy_hooks(project_roots: list[pathlib.Path]) -> list[dict[str, Any]
     results: list[dict[str, Any]] = []
     for preview in previews:
         project_root = pathlib.Path(str(preview["root"]))
-        backups: list[str] = []
-        changed_paths: list[str] = []
-        removed_handlers = 0
-        referenced_scripts: set[pathlib.Path] = set()
-        for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
-            document_path = project_root / document_relative
-            script_path = project_root / script_relative
-            value, issue = _read_json(document_path)
-            if issue is not None:
-                raise ValueError(
-                    f"legacy hook migration failed while reading {document_path}: {issue['error']}"
-                )
-            if value is None:
-                continue
-            if not isinstance(value, dict):
-                raise ValueError(f"legacy hook migration target must be an object: {document_path}")
-            updated, removed = _remove_legacy_memory_entries(value)
-            if removed:
-                if document_path.is_symlink():
-                    raise ValueError(f"legacy hook migration refuses to edit symlink: {document_path}")
-                backup = _backup_file(document_path, stamp)
-                backups.append(str(backup))
-                _atomic_write_json(document_path, updated)
-                changed_paths.append(str(document_path))
-                referenced_scripts.add(script_path)
-                removed_handlers += removed
-        for script_path in sorted(referenced_scripts):
-            if not script_path.exists():
-                continue
-            if script_path.is_symlink():
-                raise ValueError(f"legacy hook migration refuses to remove symlink: {script_path}")
-            backup = _backup_file(script_path, stamp)
-            backups.append(str(backup))
-            script_path.unlink()
-            changed_paths.append(str(script_path))
+        with _project_lock(project_root):
+            before_digest = _legacy_state_digest(project_root)
+            cleanup = _archive_project_legacy_hooks(project_root, stamp=stamp)
+            after_digest = _legacy_state_digest(project_root)
+            result_status = "applied" if cleanup["changed_paths"] else "unchanged"
+            audit = _write_migration_audit(
+                project_root,
+                stamp,
+                before_digest=before_digest,
+                after_digest=after_digest,
+                changed_paths=cleanup["changed_paths"],
+                backups=cleanup["backups"],
+                result=result_status,
+            )
         results.append(
             {
                 **preview,
-                "status": "applied" if changed_paths else "unchanged",
-                "backups": backups,
-                "changed_paths": changed_paths,
-                "removed_handlers": removed_handlers,
+                "status": result_status,
+                **cleanup,
+                "audit": str(audit),
             }
         )
     return results
+
+
+def _archive_project_legacy_hooks(
+    project_root: pathlib.Path, *, stamp: str
+) -> dict[str, Any]:
+    backups: list[str] = []
+    changed_paths: list[str] = []
+    removed_handlers = 0
+    referenced_scripts: set[pathlib.Path] = set()
+    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+        document_path = project_root / document_relative
+        script_path = project_root / script_relative
+        value, issue = _read_json(document_path)
+        if issue is not None:
+            raise ValueError(
+                f"legacy hook migration failed while reading {document_path}: {issue['error']}"
+            )
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            raise ValueError(f"legacy hook migration target must be an object: {document_path}")
+        updated, removed = _remove_legacy_memory_entries(value)
+        if not removed:
+            continue
+        if document_path.is_symlink():
+            raise ValueError(f"legacy hook migration refuses to edit symlink: {document_path}")
+        backups.append(str(_backup_file(document_path, stamp)))
+        _atomic_write_json(document_path, updated)
+        changed_paths.append(str(document_path))
+        referenced_scripts.add(script_path)
+        removed_handlers += removed
+    for script_path in sorted(referenced_scripts):
+        if not script_path.exists():
+            continue
+        if script_path.is_symlink():
+            raise ValueError(f"legacy hook migration refuses to archive symlink: {script_path}")
+        backup = _backup_path(script_path, stamp)
+        os.replace(script_path, backup)
+        backups.append(str(backup))
+        changed_paths.append(str(script_path))
+    return {
+        "backups": backups,
+        "changed_paths": changed_paths,
+        "removed_handlers": removed_handlers,
+    }
+
+
+def remove_managed_legacy_hooks(project_root: pathlib.Path) -> dict[str, Any]:
+    """Back up and detach only manager-owned project memory hook assets."""
+    root = pathlib.Path(project_root).expanduser().resolve()
+    if not root.is_dir():
+        return {"backups": [], "changed_paths": [], "removed_handlers": 0}
+    stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    with _project_lock(root):
+        return _archive_project_legacy_hooks(root, stamp=stamp)
 
 
 def _registry_projects(registry: Mapping[str, object]) -> list[dict[str, Any]]:

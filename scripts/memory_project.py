@@ -373,7 +373,7 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
     managed_hooks_status = (
         "current"
         if all(state == "current" for state in hook_states)
-        else "missing"
+        else "not_applicable"
         if all(state == "missing" for state in hook_states)
         else "upgrade_available"
     )
@@ -381,7 +381,7 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
         "not_initialized"
         if not has_memory
         else "initialized"
-        if managed_rules_status == "current" and managed_hooks_status == "current"
+        if managed_rules_status == "current"
         else "upgrade_available"
     )
 
@@ -418,14 +418,39 @@ def register_project(root: str | pathlib.Path, make_current: bool = True) -> dic
 
 
 def unregister_project(root: str | pathlib.Path) -> dict[str, Any]:
-    project_root = str(normalize_project_root(root))
+    project_path = normalize_project_root(root)
+    project_root = str(project_path)
+    registered = set()
+    for item in registry().get("projects", []):
+        raw_root = item.get("root") if isinstance(item, dict) else None
+        if not isinstance(raw_root, str) or not raw_root:
+            continue
+        try:
+            registered.add(str(normalize_project_root(raw_root)))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    if project_root not in registered:
+        raise ValueError(f"project is not registered: {project_root}")
+
+    import vibe_memory_migration
+
+    cleanup = vibe_memory_migration.remove_managed_legacy_hooks(project_path)
+
     def mutate(data: dict[str, Any]) -> None:
         data["projects"] = [
             item for item in data.get("projects", []) if item.get("root") != project_root
         ]
         if data.get("current_project") == project_root:
             data["current_project"] = ""
-    return _mutate_registry(mutate)
+    data = _mutate_registry(mutate)
+    return {
+        **data,
+        "status": "unregistered",
+        "project": project_root,
+        "removed_legacy_hooks": cleanup["changed_paths"],
+        "legacy_hook_backups": cleanup["backups"],
+        "registry": data,
+    }
 
 
 def set_current_project(root: str | pathlib.Path) -> dict[str, Any]:
@@ -1023,42 +1048,23 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     ui_root = project_root / "codex" / "ui_design"
     ensure_file(
         ui_root / "config.json",
-        json.dumps(
-            ui_design_config(project_root),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps(ui_design_config(project_root), ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "preferences.json",
-        json.dumps(
-            {"schema_version": 1, "overrides": {}},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps({"schema_version": 1, "overrides": {}}, ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "active-skills.json",
-        json.dumps(
-            {"schema_version": 1, "execution_order": [], "skills": []},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps({"schema_version": 1, "execution_order": [], "skills": []}, ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "approvals.json",
         json.dumps(
-            {
-                "schema_version": 1,
-                "package_approvals": {},
-                "project_global_approval": None,
-            },
+            {"schema_version": 1, "package_approvals": {}, "project_global_approval": None},
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -1068,27 +1074,21 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     context_path = ui_root / "effective-context.json"
     context_existed = context_path.exists()
     publish_effective_ui_context(project_root)
-    changes.append(
-        {
-            "path": str(context_path),
-            "status": "existing" if context_existed else "created",
-        }
-    )
+    changes.append({
+        "path": str(context_path),
+        "status": "existing" if context_existed else "created",
+    })
     append_if_missing(project_root / "AGENTS.md", f"# {name} Codex Instructions", agent_memory_block(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "# " + name + " Shared Memory Instructions", claude_md(project_root), changes)
     append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
-    ensure_file(project_root / ".codex" / "hooks.json", codex_hooks_json(), changes)
-    _merge_gate_hook_config(project_root / ".codex" / "hooks.json", "codex", changes)
-    ensure_file(project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex"), changes)
+    # These are inert compatibility assets: without project hook documents they
+    # are not hook entry points. Universal user hooks remain the sole entries.
     ensure_file(
         project_root / ".codex" / "hooks" / "ui_design_gate_hook.py",
         ui_design_gate_hook_text(),
         changes,
     )
-    ensure_file(project_root / ".claude" / "settings.json", claude_settings_json(), changes)
-    _merge_gate_hook_config(project_root / ".claude" / "settings.json", "claude", changes)
-    ensure_file(project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude"), changes)
     ensure_file(
         project_root / ".claude" / "hooks" / "ui_design_gate_hook.py",
         ui_design_gate_hook_text(),

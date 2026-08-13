@@ -257,7 +257,7 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             project = fixture.project_roots[0]
             before = _snapshot_tree(project)
 
-            preview = migration.preview_legacy_hooks([project])
+            preview = migration.preview_legacy_hooks([project], paths=fixture.paths)
 
             self.assertEqual(_snapshot_tree(project), before)
             self.assertEqual(len(preview), 1)
@@ -274,7 +274,7 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             fixture = build_complete_legacy_fixture(pathlib.Path(value))
             project = fixture.project_roots[0]
 
-            result = migration.apply_legacy_hooks([project])
+            result = migration.apply_legacy_hooks([project], paths=fixture.paths)
 
             codex_hooks = (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
             claude_hooks = (project / ".claude" / "settings.json").read_text(encoding="utf-8")
@@ -289,6 +289,65 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             self.assertTrue(result[0]["backups"])
             self.assertEqual(result[0]["managed_entries"], 5)
             self.assertEqual(result[0]["custom_entries"], 1)
+            audit_path = pathlib.Path(result[0]["audit"])
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            self.assertEqual(audit["root"], str(project.resolve()))
+            self.assertNotEqual(audit["before_digest"], audit["after_digest"])
+            self.assertEqual(audit["changed_paths"], result[0]["changed_paths"])
+            self.assertEqual(audit["backups"], result[0]["backups"])
+            self.assertEqual(audit["result"], "applied")
+
+    def test_two_registered_roots_receive_separate_audit_records(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+
+            results = migration.apply_legacy_hooks(
+                list(fixture.project_roots), paths=fixture.paths
+            )
+
+            audits = [pathlib.Path(item["audit"]) for item in results]
+            self.assertEqual(len(set(audits)), 2)
+            self.assertTrue(all(path.exists() for path in audits))
+            self.assertEqual(
+                {json.loads(path.read_text(encoding="utf-8"))["root"] for path in audits},
+                {str(root.resolve()) for root in fixture.project_roots},
+            )
+
+    def test_preview_and_apply_refuse_unregistered_outside_and_symlink_roots(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            unregistered = pathlib.Path(value) / "projects" / "other"
+            unregistered.mkdir()
+            outside = pathlib.Path(value) / "outside"
+            outside.mkdir()
+            alias = pathlib.Path(value) / "alias"
+            alias.symlink_to(fixture.project_roots[0], target_is_directory=True)
+
+            for root in (unregistered, outside, alias):
+                with self.subTest(root=root):
+                    with self.assertRaises(ValueError):
+                        migration.preview_legacy_hooks([root], paths=fixture.paths)
+                    with self.assertRaises(ValueError):
+                        migration.apply_legacy_hooks([root], paths=fixture.paths)
+
+    def test_custom_command_with_same_basename_is_not_manager_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            path = project / ".codex/hooks.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["hooks"]["Stop"].append({
+                "hooks": [{
+                    "type": "command",
+                    "command": "python3 /opt/custom/shared_memory_hook.py",
+                }]
+            })
+            _write_json(path, document)
+
+            migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            current = path.read_text(encoding="utf-8")
+            self.assertIn("/opt/custom/shared_memory_hook.py", current)
 
 
 if __name__ == "__main__":

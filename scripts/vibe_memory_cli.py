@@ -563,8 +563,10 @@ def memory_command(args: argparse.Namespace) -> int:
 def _migration_project_roots(args: argparse.Namespace) -> list[pathlib.Path]:
     raw_roots = getattr(args, "project_root", None) or []
     if not raw_roots:
-        return [memory_project.current_project().resolve()]
-    return [pathlib.Path(root).expanduser().resolve() for root in raw_roots]
+        raise LifecycleError("migrate requires at least one explicit project root")
+    # Preserve the selected path identity so migration can reject a symlink
+    # before canonicalizing and comparing it with the registry.
+    return [pathlib.Path(root).expanduser().absolute() for root in raw_roots]
 
 
 def _registry_snapshot(paths: vibe_memory_paths.RuntimePaths) -> dict[str, object]:
@@ -586,12 +588,13 @@ def _registry_snapshot(paths: vibe_memory_paths.RuntimePaths) -> dict[str, objec
 
 def migrate_command(args: argparse.Namespace) -> int:
     roots = _migration_project_roots(args)
+    paths = vibe_memory_paths.for_home()
     if args.migrate_command == "preview":
-        value = vibe_memory_migration.preview_legacy_hooks(roots)
+        value = vibe_memory_migration.preview_legacy_hooks(roots, paths=paths)
     else:
         if not args.approved:
             raise LifecycleError("migrate apply requires --approved")
-        value = vibe_memory_migration.apply_legacy_hooks(roots)
+        value = vibe_memory_migration.apply_legacy_hooks(roots, paths=paths)
     _json(value)
     return 0
 
