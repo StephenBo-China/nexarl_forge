@@ -2528,6 +2528,26 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             ])
             self.assertTrue(all(call.kwargs["input"] == "{}" for call in runner.call_args_list))
 
+    def test_smoke_managed_hooks_rejects_fail_open_degraded_and_unknown_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            for status in ("degraded", "error", "handled", None):
+                payload = {} if status is None else {"status": status}
+                runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(payload), ""))
+                with self.subTest(status=status), self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, "unsuccessful status"
+                ):
+                    vibe_memory_install.smoke_managed_hooks(paths, ["codex"], runner=runner)
+
+    def test_smoke_managed_hooks_accepts_router_success_and_duplicate_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            for status in ("ok", "duplicate"):
+                runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps({"status": status}), ""))
+                with self.subTest(status=status):
+                    result = vibe_memory_install.smoke_managed_hooks(paths, ["codex"], runner=runner)
+                self.assertEqual(result["codex"]["status"], status)
+
     def test_update_renders_matching_assets_restarts_and_smokes_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -2550,13 +2570,29 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(vibe_memory_install.read_runtime_config(paths)["app_version"], "1.1.0")
             self.assertIn("/current/scripts/memory_review_server.py", paths.launch_agent.read_text(encoding="utf-8"))
 
+    def test_update_health_failure_removes_new_release_and_restores_old_service(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(root, {**MANIFEST, "app_version": "1.1.0"})
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.0.0", python_executable=sys.executable)
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(current_version="1.0.0", previous_version=None, port=9123, installed_clients=["codex"], python_executable=sys.executable))
+            with mock.patch("vibe_memory_install.activate_launch_agent", side_effect=[vibe_memory_install.InstallError("health"), {"status": "healthy"}]) as activate, mock.patch("vibe_memory_hooks.repair", return_value={"status": "created"}):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.update(source, paths, validation={"control": "ok"})
+            self.assertEqual(os.readlink(paths.install_root / "current"), "releases/1.0.0")
+            self.assertFalse((paths.install_root / "releases/1.1.0").exists())
+            self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.0.0"))
+
     def test_uninstall_boots_out_before_removing_owned_releases_and_runtime_home_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
-            paths = self.make_paths(pathlib.Path(value))
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
             home = paths.personal_memory.parents[1]
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
             release = paths.install_root / "releases/1.0.0"
-            release.mkdir(parents=True)
-            (paths.install_root / "current").symlink_to("releases/1.0.0")
             vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(
                 current_version="1.0.0", previous_version=None, port=9123,
                 installed_clients=["codex"], python_executable=sys.executable,
@@ -2566,18 +2602,55 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             hook.write_text(json.dumps(vibe_memory_hooks.merge_document({"hooks": {}}, "codex", paths.launcher)), encoding="utf-8")
             order: list[str] = []
             with mock.patch("vibe_memory_install.bootout_launch_agent", side_effect=lambda: order.append("bootout")), \
-                    mock.patch("vibe_memory_hooks.uninstall", side_effect=lambda path: order.append(str(path)) or {"status": "removed"}):
+                    mock.patch("vibe_memory_hooks.uninstall", side_effect=lambda path, _runtime: order.append(str(path)) or {"status": "removed"}):
                 result = vibe_memory_install.uninstall(paths)
             self.assertEqual(order[0], "bootout")
             self.assertIn(str(hook), order)
             self.assertFalse(release.exists())
             self.assertTrue(result["data_retained"])
 
-    def test_repair_health_failure_restores_all_managed_files_and_restarts_old_service(self) -> None:
+    def test_uninstall_without_valid_state_removes_all_owned_releases_and_exact_home_hook(self) -> None:
+        for state_mode in ("missing", "malformed"):
+            with self.subTest(state=state_mode), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                paths = self.make_paths(root)
+                source = RuntimeInstallTest().make_source(root)
+                vibe_memory_install.install_runtime(source, paths)
+                for version in ("1.1.0", "2.0.0"):
+                    release = paths.install_root / "releases" / version
+                    shutil.copytree(paths.install_root / "releases/1.0.0", release)
+                    manifest = json.loads((release / "release.json").read_text(encoding="utf-8"))
+                    manifest["app_version"] = version
+                    (release / "release.json").write_text(json.dumps(manifest), encoding="utf-8")
+                state = vibe_memory_install.install_state_path(paths)
+                if state_mode == "malformed":
+                    state.parent.mkdir(parents=True, exist_ok=True)
+                    state.write_text("{bad", encoding="utf-8")
+                hook = paths.personal_memory.parents[1] / ".codex/hooks.json"
+                hook.parent.mkdir(parents=True)
+                hook.write_text(json.dumps(vibe_memory_hooks.merge_document({"hooks": {}}, "codex", paths.launcher)), encoding="utf-8")
+                with mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "booted_out"}):
+                    result = vibe_memory_install.uninstall(paths)
+                self.assertEqual(list((paths.install_root / "releases").glob("*")), [])
+                self.assertNotIn(str(paths.launcher), hook.read_text(encoding="utf-8"))
+                self.assertEqual(result["preserved_releases"], [])
+
+    def test_uninstall_preserves_and_reports_unknown_release_without_deleting_it(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
-            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
-            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            unknown = paths.install_root / "releases/custom"
+            unknown.mkdir(parents=True)
+            (unknown / "sentinel").write_text("keep", encoding="utf-8")
+            with mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "booted_out"}):
+                result = vibe_memory_install.uninstall(paths)
+            self.assertTrue((unknown / "sentinel").exists())
+            self.assertEqual(result["preserved_releases"], [str(unknown)])
+
+    def test_repair_health_failure_restores_all_managed_files_and_restarts_old_service(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
             vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.0.0", python_executable=sys.executable)
             vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
             vibe_memory_install.install_launch_agent(paths, vibe_memory_install.render_launch_agent(paths, port=9123, python_executable=sys.executable))
@@ -2597,6 +2670,29 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     vibe_memory_install.repair(paths)
             self.assertEqual(before, {path: path.read_bytes() for path in managed})
             self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.0.0"))
+
+    def test_repair_rebuilds_missing_or_malformed_config_and_state_from_current_release(self) -> None:
+        for config_mode, state_mode in (("missing", "missing"), ("malformed", "missing"), ("missing", "malformed"), ("malformed", "malformed")):
+            with self.subTest(config=config_mode, state=state_mode), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                paths = self.make_paths(root)
+                source = RuntimeInstallTest().make_source(root)
+                vibe_memory_install.install_runtime(source, paths)
+                config = paths.install_root / "config.json"
+                state = vibe_memory_install.install_state_path(paths)
+                if config_mode == "malformed":
+                    config.write_text("{bad", encoding="utf-8")
+                if state_mode == "malformed":
+                    state.parent.mkdir(parents=True, exist_ok=True)
+                    state.write_text("{bad", encoding="utf-8")
+                with mock.patch("vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}), mock.patch("vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}), mock.patch("vibe_memory_hooks.repair", return_value={"status": "created"}):
+                    result = vibe_memory_install.repair(paths)
+                self.assertEqual(result["status"], "repaired")
+                rebuilt_config = vibe_memory_install.read_runtime_config(paths)
+                rebuilt_state = vibe_memory_install.read_install_state(paths)
+                self.assertEqual(rebuilt_config["app_version"], "1.0.0")
+                self.assertEqual(rebuilt_state["current_version"], "1.0.0")
+                self.assertEqual(rebuilt_state["installed_clients"], ["codex"])
 
     def test_rollback_health_failure_restores_assets_state_current_and_restarts_original(self) -> None:
         with tempfile.TemporaryDirectory() as value:

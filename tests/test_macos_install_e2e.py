@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -138,6 +139,12 @@ class MacOSInstallE2ETest(unittest.TestCase):
             )
             self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
             self.assertTrue(json.loads(doctor.stdout)["service"]["ok"])
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                health = json.loads(response.read().decode("utf-8"))
+            release = json.loads((runtime / "release.json").read_text(encoding="utf-8"))
+            self.assertIs(health["ok"], True)
+            self.assertEqual(health["service"], "vibe-memory")
+            self.assertEqual(health["app_version"], release["app_version"])
 
     def test_legacy_install_preserves_every_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as value:

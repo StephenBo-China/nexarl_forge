@@ -14,6 +14,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Sequence
 
 # Hook mode must remain independently fail-open when only this entry point is
@@ -289,7 +290,15 @@ def _restore_current(path: pathlib.Path, before: str | None, installed_version: 
     if metadata is not None and stat.S_ISLNK(metadata.st_mode) and os.readlink(path) == before:
         return
     if metadata is not None:
-        raise ValueError("current runtime changed concurrently during rollback")
+        if not stat.S_ISLNK(metadata.st_mode) or os.readlink(path) != f"releases/{installed_version}":
+            raise ValueError("current runtime changed concurrently during rollback")
+        temporary = path.with_name(f".current.restore-{uuid.uuid4().hex}")
+        try:
+            temporary.symlink_to(before)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return
     path.symlink_to(before)
 
 
@@ -308,6 +317,8 @@ def install_command(args: argparse.Namespace) -> int:
     try:
         python_executable = vibe_memory_install.discover_python()
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
+        release_path = paths.install_root / "releases" / validated["version"]
+        release_preexisted = release_path.exists()
         plist = vibe_memory_install.render_launch_agent(
             paths, port=args.port, python_executable=python_executable
         )
@@ -337,8 +348,15 @@ def install_command(args: argparse.Namespace) -> int:
     rollback_paths: set[pathlib.Path] = set()
     attempted_hook_targets: set[pathlib.Path] = set()
     lifecycle_attempted = False
+    release_identity: tuple[int, int] | None = None
     try:
-        installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
+        installed = vibe_memory_install.install_runtime(
+            pathlib.Path(args.source_root), paths, activate=False
+        )
+        if not release_preexisted and release_path.exists():
+            metadata = release_path.stat(follow_symlinks=False)
+            release_identity = (metadata.st_dev, metadata.st_ino)
+        vibe_memory_install._activate_managed_version(paths, installed["version"])
         data = vibe_memory_install.prepare_data(paths)
         rollback_paths.add(runtime_config_path)
         runtime_config = vibe_memory_install.install_runtime_config(
@@ -413,6 +431,23 @@ def install_command(args: argparse.Namespace) -> int:
             _restore_current(runtime, current_before, validated["version"])
         except Exception:
             rollback_errors.append(str(runtime))
+        if current_before is not None:
+            previous_version = current_before.removeprefix("releases/")
+            try:
+                vibe_memory_install.activate_launch_agent(
+                    paths, expected_version=previous_version
+                )
+            except Exception:
+                rollback_errors.append("previous launch agent restart")
+        if release_identity is not None:
+            try:
+                vibe_memory_install._remove_new_managed_release(
+                    release_path,
+                    preexisted=release_preexisted,
+                    expected_identity=release_identity,
+                )
+            except Exception:
+                rollback_errors.append(str(release_path))
         if not rollback_errors:
             for target in attempted_hook_targets:
                 artifacts = _hook_backup_artifacts(target) - hook_backups[target]

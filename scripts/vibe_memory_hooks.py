@@ -1036,7 +1036,10 @@ def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
                 os.close(source_descriptor)
 
 
-def uninstall(path: str | pathlib.Path) -> dict[str, Any]:
+def uninstall(
+    path: str | pathlib.Path,
+    runtime: str | pathlib.Path | None = None,
+) -> dict[str, Any]:
     """Remove Vibe Memory managed hook entries while preserving custom handlers."""
     target = pathlib.Path(path)
     _reject_symlink(target)
@@ -1061,7 +1064,7 @@ def uninstall(path: str | pathlib.Path) -> dict[str, Any]:
         try:
             source = _descriptor_bytes(source_descriptor)
             current = _parse_document_bytes(target, source)
-            updated = remove_managed_entries(current)
+            updated = remove_managed_entries(current, runtime)
             if current == updated:
                 return {
                     "changed": False,

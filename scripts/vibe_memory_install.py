@@ -265,9 +265,12 @@ def smoke_managed_hooks(
             raise InstallError(f"{client} hook smoke test returned invalid JSON") from error
         if not isinstance(payload, dict):
             raise InstallError(f"{client} hook smoke test returned invalid JSON")
+        status = payload.get("status")
+        if status not in {"ok", "duplicate"}:
+            raise InstallError(f"{client} hook smoke test returned unsuccessful status")
         results["claude" if client == "claude-code" else client] = {
             "ok": True,
-            "status": payload.get("status", "ok"),
+            "status": status,
         }
     return results
 
@@ -2291,6 +2294,36 @@ def _restore_regular_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None
         temporary.unlink(missing_ok=True)
 
 
+def _managed_release_version(path: pathlib.Path) -> str | None:
+    """Return a release's validated version, or None for an unknown directory."""
+    if path.is_symlink() or not path.is_dir() or not _VERSION_PATTERN.fullmatch(path.name):
+        return None
+    try:
+        metadata = path.stat()
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            return None
+        manifest = json.loads((path / "release.json").read_text(encoding="utf-8"))
+        version = _validate_manifest(manifest)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    return version if version == path.name else None
+
+
+def _remove_new_managed_release(
+    path: pathlib.Path,
+    *,
+    preexisted: bool,
+    expected_identity: tuple[int, int] | None,
+) -> bool:
+    if preexisted or not path.exists():
+        return False
+    metadata = path.stat(follow_symlinks=False)
+    if expected_identity is None or _identity(metadata) != expected_identity or _managed_release_version(path) != path.name:
+        raise InstallError(f"new release changed or is not manager-owned: {path}")
+    shutil.rmtree(path)
+    return True
+
+
 def _install_state_document(
     *,
     current_version: str,
@@ -2333,9 +2366,17 @@ def update(
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     selected_port = _runtime_port(paths, port)
     selected_python = _runtime_python(paths)
+    new_release: pathlib.Path | None = None
+    new_release_identity: tuple[int, int] | None = None
+    release_preexisted = True
     try:
+        source_version = validate_runtime_source(source_root)["version"]
+        new_release = pathlib.Path(paths.install_root) / "releases" / source_version
+        release_preexisted = new_release.exists()
         installed = install_runtime(source_root, paths, activate=False)
         new_version = installed["version"]
+        if not release_preexisted:
+            new_release_identity = _identity(new_release.stat(follow_symlinks=False))
         install_runtime_config(
             paths,
             port=selected_port,
@@ -2377,6 +2418,7 @@ def update(
             "hook_smoke": hook_smoke,
         }
     except Exception as error:
+        restart_error: InstallError | None = None
         try:
             bootout_launch_agent()
         except InstallError:
@@ -2387,8 +2429,16 @@ def update(
             _activate_managed_version(paths, previous_version)
             try:
                 activate_launch_agent(paths, expected_version=previous_version)
-            except InstallError as restart_error:
-                raise InstallError("update failed and previous service could not be restarted") from restart_error
+            except InstallError as caught_restart_error:
+                restart_error = caught_restart_error
+        if new_release is not None:
+            _remove_new_managed_release(
+                new_release,
+                preexisted=release_preexisted,
+                expected_identity=new_release_identity,
+            )
+        if restart_error is not None:
+            raise InstallError("update failed and previous service could not be restarted") from restart_error
         if isinstance(error, InstallError):
             raise
         raise InstallError("update failed") from error
@@ -2457,6 +2507,37 @@ def _installed_clients(paths: RuntimePaths) -> list[str]:
     return clients or ["codex"]
 
 
+def _repair_metadata(paths: RuntimePaths, current_version: str) -> tuple[int, str, list[str], str | None]:
+    """Recover lifecycle metadata from either valid persisted document."""
+    try:
+        config = read_runtime_config(paths)
+    except Exception:
+        config = {}
+    try:
+        state = read_install_state(paths)
+    except Exception:
+        state = {}
+    port_value = config.get("port", state.get("port", 8897))
+    port = port_value if isinstance(port_value, int) and not isinstance(port_value, bool) and 1 <= port_value <= 65535 else 8897
+    python_candidates = (config.get("python_executable"), state.get("python_executable"))
+    python = ""
+    for candidate in python_candidates:
+        if isinstance(candidate, str):
+            try:
+                python = validate_python(candidate)
+                break
+            except InstallError:
+                pass
+    if not python:
+        python = discover_python()
+    raw_clients = state.get("installed_clients", ["codex"])
+    clients = [item for item in raw_clients if item in {"codex", "claude-code"}] if isinstance(raw_clients, list) else []
+    previous = state.get("previous_version")
+    if not isinstance(previous, str) or not _VERSION_PATTERN.fullmatch(previous) or previous == current_version:
+        previous = None
+    return port, python, clients or ["codex"], previous
+
+
 def _hook_target_for_client(paths: RuntimePaths, client: str) -> tuple[pathlib.Path, str, str]:
     home = pathlib.Path(paths.personal_memory).parents[1]
     if client == "claude-code":
@@ -2474,20 +2555,30 @@ def repair(paths: RuntimePaths) -> dict[str, Any]:
     current_version = _current_version(paths)
     if current_version is None:
         raise InstallError("current runtime is not installed")
-    clients = _installed_clients(paths)
+    release = pathlib.Path(paths.install_root) / "releases" / current_version
+    if _managed_release_version(release) != current_version:
+        raise InstallError("current runtime release is not manager-owned")
     managed_paths = [
         pathlib.Path(paths.install_root) / "config.json", pathlib.Path(paths.launch_agent),
         pathlib.Path(paths.launcher), install_state_path(paths),
     ]
+    port, python, clients, previous_version = _repair_metadata(paths, current_version)
     managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     try:
-        port = int(read_runtime_config(paths)["port"])
-        launcher = install_launcher(paths)
-        launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port))
+        install_runtime_config(paths, port=port, app_version=current_version, python_executable=python)
+        launcher = install_launcher(paths, python_executable=python)
+        launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python))
         hook_results = {}
         for path, agent, label in (_hook_target_for_client(paths, client) for client in clients):
             hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)
+        write_install_state(paths, _install_state_document(
+            current_version=current_version,
+            previous_version=previous_version,
+            port=port,
+            installed_clients=clients,
+            python_executable=python,
+        ))
         service = activate_launch_agent(paths, expected_version=current_version)
         smoke = smoke_managed_hooks(paths, clients)
     except Exception as error:
@@ -2575,11 +2666,21 @@ def uninstall(
 
     removed: list[str] = []
     service = bootout_launch_agent()
-    state = read_install_state(paths)
+    releases_root = pathlib.Path(paths.install_root) / "releases"
+    owned_releases: list[pathlib.Path] = []
+    preserved_releases: list[pathlib.Path] = []
+    if releases_root.exists():
+        if releases_root.is_symlink() or not releases_root.is_dir():
+            raise InstallError("releases root must be a real directory")
+        for release in sorted(releases_root.iterdir(), key=lambda item: item.name):
+            if _managed_release_version(release) == release.name:
+                owned_releases.append(release)
+            else:
+                preserved_releases.append(release)
     hook_results = {}
     for client in ("codex", "claude-code"):
         path, _agent, label = _hook_target_for_client(paths, client)
-        hook_results[label] = vibe_memory_hooks.uninstall(path)
+        hook_results[label] = vibe_memory_hooks.uninstall(path, paths.launcher)
     home = pathlib.Path(paths.personal_memory).parents[1]
     launch_agent = pathlib.Path(paths.launch_agent)
     if _is_managed_launch_agent(launch_agent):
@@ -2598,20 +2699,11 @@ def uninstall(
     for path in (pathlib.Path(paths.install_root) / "config.json", install_state_path(paths)):
         if _unlink_regular_file(path):
             removed.append(str(path))
-    release_versions = {
-        value for value in (state.get("current_version"), state.get("previous_version"))
-        if isinstance(value, str)
-    }
-    releases_root = pathlib.Path(paths.install_root) / "releases"
-    for version in sorted(release_versions):
-        release = releases_root / version
-        if release.is_symlink():
-            raise InstallError(f"managed release must not be a symlink: {release}")
-        if release.exists():
-            if not release.is_dir():
-                raise InstallError(f"managed release must be a directory: {release}")
-            shutil.rmtree(release)
-            removed.append(str(release))
+    for release in owned_releases:
+        if _managed_release_version(release) != release.name:
+            raise InstallError(f"managed release changed during uninstall: {release}")
+        shutil.rmtree(release)
+        removed.append(str(release))
     deleted_data: list[str] = []
     if remove_data:
         allowed = {
@@ -2630,4 +2722,5 @@ def uninstall(
         "data_retained": not remove_data,
         "deleted_data": deleted_data,
         "service": service,
+        "preserved_releases": [str(path) for path in preserved_releases],
     }

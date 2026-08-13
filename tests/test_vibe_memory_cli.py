@@ -246,6 +246,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         with mock.patch("vibe_memory_cli.vibe_memory_install.discover_python", return_value="/opt/homebrew/bin/python3") as discover, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.validate_runtime_source", return_value={"version": "1.0.0"}) as validate, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime", return_value={"version": "1.0.0"}) as install, \
+                mock.patch("vibe_memory_cli.vibe_memory_install._activate_managed_version") as activate_version, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.prepare_data", return_value={"files": []}) as prepare, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launch_agent", return_value="<plist/>") as render, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_runtime_config", return_value="{}\n") as render_config, \
@@ -265,7 +266,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(code, 0)
         discover.assert_called_once_with()
         validate.assert_called_once_with(pathlib.Path("/portable/source"))
-        install.assert_called_once_with(pathlib.Path("/portable/source"), self.paths)
+        install.assert_called_once_with(pathlib.Path("/portable/source"), self.paths, activate=False)
+        activate_version.assert_called_once_with(self.paths, "1.0.0")
         prepare.assert_called_once_with(self.paths)
         render.assert_called_once_with(
             self.paths, port=8897, python_executable="/opt/homebrew/bin/python3"
@@ -320,10 +322,36 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
 
         self.assertEqual(code, 1, stderr)
         self.assertEqual(output["phase"], "commit")
-        self.assertTrue(output["rollback"]["ok"])
+        self.assertTrue(output["rollback"]["ok"], output)
         self.assertEqual(plist.read_text(encoding="utf-8"), "old plist\n")
         self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
         bootout.assert_called_once_with()
+
+    def test_existing_install_health_failure_restores_current_and_removes_only_new_release(self) -> None:
+        old = self.paths.install_root / "releases/0.9.0"
+        old.mkdir(parents=True)
+        current = self.paths.install_root / "current"
+        current.symlink_to("releases/0.9.0")
+        state = self.paths.install_root / "state/install.json"
+        state.parent.mkdir(parents=True)
+        state.write_text('{"sentinel":true}\n', encoding="utf-8")
+        def lifecycle(_paths: object, *, expected_version: str) -> dict[str, str]:
+            if expected_version == "1.0.0":
+                raise vibe_memory_cli.vibe_memory_install.InstallError("health failed")
+            return {"status": "healthy"}
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            side_effect=lifecycle,
+        ) as activate, mock.patch("vibe_memory_cli.vibe_memory_install.bootout_launch_agent"), \
+                mock.patch("vibe_memory_cli.vibe_memory_install.read_install_state", return_value={}):
+            code, output, stderr = self.invoke(["install", "--source-root", str(ROOT)])
+        self.assertEqual(code, 1, stderr)
+        self.assertTrue(output["rollback"]["ok"], output)
+        self.assertEqual(os.readlink(current), "releases/0.9.0")
+        self.assertFalse((self.paths.install_root / "releases/1.0.0").exists())
+        self.assertEqual(state.read_text(encoding="utf-8"), '{"sentinel":true}\n')
+        self.assertEqual(activate.call_args_list[-1], mock.call(self.paths, expected_version="0.9.0"))
 
     def test_install_error_is_nonzero_and_not_hook_degraded(self) -> None:
         with mock.patch("vibe_memory_cli.vibe_memory_install.validate_runtime_source", side_effect=ValueError("unsafe source")):
