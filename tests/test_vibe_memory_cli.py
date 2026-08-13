@@ -1663,7 +1663,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             mock.call(self.home / ".claude/settings.json", "claude-code", self.paths.launcher),
         ])
 
-        with mock.patch("vibe_memory_cli.vibe_memory_install.read_install_state", return_value=state), \
+        with mock.patch.object(vibe_memory_cli, "_validate_hooks_repair_installation", return_value=["codex", "claude-code"]), \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", return_value={"status": "current"}) as repair:
             code, output, stderr = self.invoke(["hooks", "repair"])
         self.assertEqual(code, 0, stderr)
@@ -1697,8 +1697,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             except BaseException as error:
                 errors.append(error)
 
-        with mock.patch("vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths), mock.patch(
-            "vibe_memory_cli.vibe_memory_install.read_install_state", return_value={"installed_clients": ["codex"]}
+        with mock.patch("vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths), mock.patch.object(
+            vibe_memory_cli, "_validate_hooks_repair_installation", return_value=["codex"]
         ), mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair), mock.patch(
             "vibe_memory_cli.vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}
         ), mock.patch("vibe_memory_cli.vibe_memory_install.uninstall", side_effect=uninstall), mock.patch.object(vibe_memory_cli, "_json"):
@@ -1714,6 +1714,76 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertTrue(uninstall_entered.is_set())
+
+    def test_hooks_repair_fails_closed_before_writing_when_uninstalled(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair"
+        ) as repair:
+            code, output, stderr = self.invoke(["hooks", "repair"])
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertEqual(stderr, "hooks failed: hooks repair requires an installed runtime\n")
+        repair.assert_not_called()
+        self.assertFalse(codex.exists())
+
+    def test_hooks_repair_rolls_back_all_attempted_hooks_on_later_failure(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        claude = self.home / ".claude/settings.json"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        codex.write_text('{"before":"codex"}\n', encoding="utf-8")
+        claude.write_text('{"before":"claude"}\n', encoding="utf-8")
+        before = {codex: codex.read_bytes(), claude: claude.read_bytes()}
+
+        def repair(target: pathlib.Path, *_args: object) -> dict[str, object]:
+            target.write_text('{"managed":true}\n', encoding="utf-8")
+            if target == claude:
+                raise RuntimeError("second client failed")
+            return {"status": "current"}
+
+        with mock.patch.object(
+            vibe_memory_cli, "_validate_hooks_repair_installation",
+            return_value=["codex", "claude-code"],
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair
+        ):
+            code, output, stderr = self.invoke(["hooks", "repair"])
+
+        self.assertEqual(code, 1)
+        self.assertIsNone(output)
+        self.assertEqual(stderr, "hooks failed: hooks repair failed and changes were rolled back\n")
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+
+    def test_hooks_repair_rollback_preserves_concurrent_hook_replacement(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        claude = self.home / ".claude/settings.json"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        codex.write_text('{"before":"codex"}\n', encoding="utf-8")
+        claude.write_text('{"before":"claude"}\n', encoding="utf-8")
+        concurrent = b'{"third_party":true}\n'
+
+        def repair(target: pathlib.Path, *_args: object) -> dict[str, object]:
+            target.write_text('{"managed":true}\n', encoding="utf-8")
+            if target == claude:
+                codex.write_bytes(concurrent)
+                raise RuntimeError("second client failed")
+            return {"status": "current"}
+
+        with mock.patch.object(
+            vibe_memory_cli, "_validate_hooks_repair_installation",
+            return_value=["codex", "claude-code"],
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair
+        ):
+            code, _, stderr = self.invoke(["hooks", "repair"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "hooks failed: hooks repair failed with rollback conflict\n")
+        self.assertEqual(codex.read_bytes(), concurrent)
+        self.assertEqual(claude.read_text(encoding="utf-8"), '{"before":"claude"}\n')
 
 
 class InstallScriptContractTest(unittest.TestCase):

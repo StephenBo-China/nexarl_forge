@@ -778,7 +778,8 @@ def hooks_command(args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
     if args.hooks_command == "repair":
         with vibe_memory_settings.lifecycle_lock(paths):
-            results, _current = _hooks_operation(paths, repair=True)
+            clients = _validate_hooks_repair_installation(paths)
+            results = _repair_hooks_transaction(paths, clients)
         _json({"status": "repaired", "hooks": results})
         return 0
     results, current = _hooks_operation(paths, repair=False)
@@ -787,6 +788,58 @@ def hooks_command(args: argparse.Namespace) -> int:
         "hooks": results,
     })
     return 0 if current else 1
+
+
+def _validate_hooks_repair_installation(
+    paths: vibe_memory_paths.RuntimePaths,
+) -> list[str]:
+    state = vibe_memory_install.read_install_state(paths)
+    if not state:
+        raise LifecycleError("hooks repair requires an installed runtime")
+    current_version = vibe_memory_install._current_version(paths)
+    if current_version != state.get("current_version"):
+        raise LifecycleError("hooks repair runtime state is inconsistent")
+    release = pathlib.Path(paths.install_root) / "releases" / str(current_version)
+    if vibe_memory_install._managed_release_version(release) != current_version:
+        raise LifecycleError("hooks repair runtime release is invalid")
+    if not vibe_memory_install._is_managed_launcher(pathlib.Path(paths.launcher)):
+        raise LifecycleError("hooks repair launcher is missing or invalid")
+    clients = state.get("installed_clients")
+    if not isinstance(clients, list) or not clients:
+        raise LifecycleError("hooks repair has no installed clients")
+    return list(clients)
+
+
+def _repair_hooks_transaction(
+    paths: vibe_memory_paths.RuntimePaths, clients: list[str]
+) -> dict[str, object]:
+    targets = [
+        (*vibe_memory_install._hook_target_for_client(paths, client), client)
+        for client in clients
+    ]
+    snapshots = {target: _snapshot_managed_file(target) for target, _agent, _label, _client in targets}
+    written: dict[pathlib.Path, ManagedFileSnapshot | None] = {}
+    attempted: list[pathlib.Path] = []
+    results: dict[str, object] = {}
+    try:
+        for target, agent, label, _client in targets:
+            attempted.append(target)
+            try:
+                results[label] = vibe_memory_hooks.repair(target, agent, paths.launcher)
+            finally:
+                written[target] = _snapshot_managed_file(target)
+        vibe_memory_install.smoke_managed_hooks(paths, clients)
+        return results
+    except Exception as error:
+        conflicts = []
+        for target in reversed(attempted):
+            try:
+                _restore_managed_file(target, snapshots[target], written[target])
+            except Exception:
+                conflicts.append(target.name)
+        if conflicts:
+            raise LifecycleError("hooks repair failed with rollback conflict") from error
+        raise LifecycleError("hooks repair failed and changes were rolled back") from error
 
 
 def _hooks_operation(
@@ -800,12 +853,7 @@ def _hooks_operation(
     results: dict[str, object] = {}
     for client in clients:
         target, agent, label = vibe_memory_install._hook_target_for_client(paths, client)
-        if repair:
-            results[label] = vibe_memory_hooks.repair(target, agent, paths.launcher)
-        else:
-            results[label] = vibe_memory_hooks.status(target, agent, paths.launcher)
-    if repair:
-        vibe_memory_install.smoke_managed_hooks(paths, clients)
+        results[label] = vibe_memory_hooks.status(target, agent, paths.launcher)
     current = all(
         isinstance(result, dict) and result.get("status") == "current"
         for result in results.values()
