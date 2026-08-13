@@ -802,12 +802,37 @@ def _validate_hooks_repair_installation(
     release = pathlib.Path(paths.install_root) / "releases" / str(current_version)
     if vibe_memory_install._managed_release_version(release) != current_version:
         raise LifecycleError("hooks repair runtime release is invalid")
-    if not vibe_memory_install._is_managed_launcher(pathlib.Path(paths.launcher)):
+    if not _launcher_is_current(paths):
         raise LifecycleError("hooks repair launcher is missing or invalid")
     clients = state.get("installed_clients")
     if not isinstance(clients, list) or not clients:
         raise LifecycleError("hooks repair has no installed clients")
     return list(clients)
+
+
+def _launcher_is_current(paths: vibe_memory_paths.RuntimePaths) -> bool:
+    persisted_python, python_error = _persisted_python_status(paths)
+    if python_error is not None or persisted_python is None:
+        return False
+    launcher = pathlib.Path(paths.launcher)
+    try:
+        vibe_memory_install.read_runtime_config(paths)
+        metadata = launcher.stat(follow_symlinks=False)
+        snapshot = _snapshot_managed_file(launcher)
+        expected = vibe_memory_install.render_launcher(
+            paths, python_executable=persisted_python
+        ).encode("utf-8")
+    except (OSError, ValueError, vibe_memory_install.InstallError):
+        return False
+    return bool(
+        snapshot is not None
+        and snapshot[0] == (metadata.st_dev, metadata.st_ino)
+        and stat.S_ISREG(metadata.st_mode)
+        and metadata.st_uid == os.geteuid()
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and bool(metadata.st_mode & stat.S_IXUSR)
+        and snapshot[1] == expected
+    )
 
 
 def _repair_hooks_transaction(
@@ -824,17 +849,31 @@ def _repair_hooks_transaction(
     try:
         for target, agent, label, _client in targets:
             attempted.append(target)
-            try:
-                results[label] = vibe_memory_hooks.repair(target, agent, paths.launcher)
-            finally:
-                written[target] = _snapshot_managed_file(target)
+            result = vibe_memory_hooks.repair(
+                target,
+                agent,
+                paths.launcher,
+                _include_commit_snapshot=True,
+            )
+            results[label] = result
+            if result.get("changed") is True:
+                committed = result.pop("_commit_snapshot", None)
+                if committed is None:
+                    raise RuntimeError("hook repair did not return a commit snapshot")
+                written[target] = committed
         vibe_memory_install.smoke_managed_hooks(paths, clients)
         return results
     except Exception as error:
+        committed = getattr(error, "_commit_snapshot", None)
+        if committed is not None and attempted:
+            written[attempted[-1]] = committed
         conflicts = []
         for target in reversed(attempted):
             try:
-                _restore_managed_file(target, snapshots[target], written[target])
+                if target in written:
+                    _restore_managed_file(target, snapshots[target], written[target])
+                elif _snapshot_managed_file(target) != snapshots[target]:
+                    raise ValueError("unowned hook target changed during repair")
             except Exception:
                 conflicts.append(target.name)
         if conflicts:

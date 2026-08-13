@@ -63,9 +63,16 @@ class ContinuousConfigChange(ConcurrentConfigChange):
 class ConfigWriteError(OSError):
     """Raised after replacement when durability confirmation fails."""
 
-    def __init__(self, message: str, backup: pathlib.Path | None) -> None:
+    def __init__(
+        self,
+        message: str,
+        backup: pathlib.Path | None,
+        *,
+        commit_snapshot: tuple[tuple[int, int], bytes, int] | None = None,
+    ) -> None:
         super().__init__(message)
         self.backup = str(backup) if backup is not None else None
+        self._commit_snapshot = commit_snapshot
 
 
 class RecoveryArtifactError(OSError):
@@ -689,6 +696,7 @@ def write_with_backup(
     *,
     expected_source: bytes | None | object = _NO_SOURCE_CHECK,
     _source_descriptor: int | None = None,
+    _include_commit_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Atomically write an object, retaining a permission-preserving backup on change."""
     target = pathlib.Path(path)
@@ -767,7 +775,14 @@ def write_with_backup(
                     )
                 replaced = True
                 _fsync_directory(target.parent)
-                return {"changed": True, "path": str(target), "backup": None}
+                result = {
+                    "changed": True,
+                    "path": str(target),
+                    "backup": None,
+                }
+                if _include_commit_snapshot:
+                    result["_commit_snapshot"] = (manager_identity, content, existing_mode)
+                return result
 
             _darwin_rename(temporary, target, RENAME_SWAP)
             replaced = True
@@ -841,11 +856,14 @@ def write_with_backup(
                     attempt=attempt,
                     recovery_paths=[backup],
                 )
-            return {
+            result = {
                 "changed": True,
                 "path": str(target),
                 "backup": str(backup),
             }
+            if _include_commit_snapshot:
+                result["_commit_snapshot"] = (manager_identity, content, existing_mode)
+            return result
         if current_source is not None:
             current_mode = stat.S_IMODE(target.stat().st_mode)
             backup = _create_backup_exclusive(target, current_source, current_mode)
@@ -936,6 +954,10 @@ def write_with_backup(
                     f"hook configuration was replaced but durability sync failed; backup: "
                     f"{backup_description}",
                     backup,
+                    commit_snapshot=(manager_identity, content, existing_mode)
+                    if manager_identity is not None
+                    and _path_matches(target, manager_identity, content)
+                    else None,
                 ) from exc
             raise
         temporary.unlink(missing_ok=True)
@@ -945,6 +967,10 @@ def write_with_backup(
                 f"hook configuration was replaced but durability sync failed; backup: "
                 f"{backup_description}",
                 backup,
+                commit_snapshot=(manager_identity, content, existing_mode)
+                if manager_identity is not None
+                and _path_matches(target, manager_identity, content)
+                else None,
             ) from exc
         if backup is not None and backup.exists():
             backup.unlink(missing_ok=True)
@@ -956,11 +982,14 @@ def write_with_backup(
     finally:
         if owns_descriptor and held_descriptor is not None:
             os.close(held_descriptor)
-    return {
+    result = {
         "changed": True,
         "path": str(target),
         "backup": str(backup) if backup is not None else None,
     }
+    if _include_commit_snapshot:
+        result["_commit_snapshot"] = (manager_identity, content, existing_mode)
+    return result
 
 
 def status(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
@@ -996,7 +1025,13 @@ def preview(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -
     }
 
 
-def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) -> dict[str, Any]:
+def repair(
+    path: str | pathlib.Path,
+    agent: str,
+    runtime: str | pathlib.Path,
+    *,
+    _include_commit_snapshot: bool = False,
+) -> dict[str, Any]:
     """Create or repair one document and describe its resulting backup, if any."""
     target = pathlib.Path(path)
     _reject_symlink(target)
@@ -1026,6 +1061,7 @@ def repair(path: str | pathlib.Path, agent: str, runtime: str | pathlib.Path) ->
                 expected,
                 expected_source=source,
                 _source_descriptor=source_descriptor,
+                _include_commit_snapshot=_include_commit_snapshot,
             )
             result["status"] = "created" if result["changed"] and not existed else (
                 "updated" if result["changed"] else "current"
