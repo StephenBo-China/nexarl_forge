@@ -633,18 +633,49 @@ def migrate_command(args: argparse.Namespace) -> int:
 
 
 def update_command(args: argparse.Namespace) -> int:
-    value = vibe_memory_install.update(pathlib.Path(args.source_root), vibe_memory_paths.for_home())
+    paths = vibe_memory_paths.for_home()
+    with vibe_memory_settings.lifecycle_lock(paths):
+        settings = vibe_memory_settings.load_settings(paths)
+        desired = bool(settings["start_at_login"])
+        value = vibe_memory_install.update(
+            pathlib.Path(args.source_root), paths, run_at_load=desired
+        )
+        vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired,
+            status="active" if desired else "current_session_active",
+        )
     _json(value)
     return 0
 
 
 def rollback_command(_args: argparse.Namespace) -> int:
-    _json(vibe_memory_install.rollback(vibe_memory_paths.for_home()))
+    paths = vibe_memory_paths.for_home()
+    with vibe_memory_settings.lifecycle_lock(paths):
+        settings = vibe_memory_settings.load_settings(paths)
+        desired = bool(settings["start_at_login"])
+        value = vibe_memory_install.rollback(paths, run_at_load=desired)
+        vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired,
+            status="active" if desired else "current_session_active",
+        )
+    _json(value)
     return 0
 
 
 def repair_command(_args: argparse.Namespace) -> int:
-    _json(vibe_memory_install.repair(vibe_memory_paths.for_home()))
+    paths = vibe_memory_paths.for_home()
+    with vibe_memory_settings.lifecycle_lock(paths):
+        settings = vibe_memory_settings.load_settings(paths)
+        desired = bool(settings["start_at_login"])
+        value = vibe_memory_install.repair(paths, run_at_load=desired)
+        vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired,
+            status="active" if desired else "current_session_active",
+        )
+    _json(value)
     return 0
 
 
@@ -667,10 +698,24 @@ def start_command(_args: argparse.Namespace) -> int:
             run_at_load=bool(settings["start_at_login"]),
         )
         vibe_memory_install.install_launch_agent(paths, plist)
-        result = vibe_memory_install.activate_launch_agent(
-            paths, expected_version=version
-        )
         desired_start_at_login = bool(settings["start_at_login"])
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        transitional_action = vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired_start_at_login,
+            status="start_pending",
+        )
+        try:
+            result = vibe_memory_install.activate_launch_agent(
+                paths, expected_version=version
+            )
+        except Exception:
+            vibe_memory_settings.restore_service_action_if_generation(
+                paths,
+                expected_generation=str(transitional_action["generation"]),
+                previous=previous_action,
+            )
+            raise
         vibe_memory_settings.write_service_action(
             paths,
             desired_start_at_login=desired_start_at_login,
@@ -683,12 +728,14 @@ def start_command(_args: argparse.Namespace) -> int:
 def uninstall_command(args: argparse.Namespace) -> int:
     if args.remove_data and not args.approved_data_deletion:
         raise LifecycleError("uninstall --remove-data requires --approved-data-deletion")
-    value = vibe_memory_install.uninstall(
-        vibe_memory_paths.for_home(),
-        remove_data=args.remove_data,
-        approved_data_deletion=args.approved_data_deletion,
-        data_paths=[pathlib.Path(path).expanduser().resolve() for path in args.data_path],
-    )
+    paths = vibe_memory_paths.for_home()
+    with vibe_memory_settings.lifecycle_lock(paths):
+        value = vibe_memory_install.uninstall(
+            paths,
+            remove_data=args.remove_data,
+            approved_data_deletion=args.approved_data_deletion,
+            data_paths=[pathlib.Path(path).expanduser().resolve() for path in args.data_path],
+        )
     _json(value)
     return 0
 

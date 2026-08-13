@@ -2480,6 +2480,7 @@ def update(
     port: int | None = None,
     installed_clients: list[str] | None = None,
     validation: dict[str, str] | None = None,
+    run_at_load: bool = True,
 ) -> dict[str, Any]:
     """Install a new runtime release, validate it, then switch current."""
     previous_version = _current_version(paths)
@@ -2514,7 +2515,7 @@ def update(
         _activate_managed_version(paths, new_version)
         install_launch_agent(
             paths,
-            render_launch_agent(paths, port=selected_port, python_executable=selected_python),
+            render_launch_agent(paths, port=selected_port, python_executable=selected_python, run_at_load=run_at_load),
         )
         import vibe_memory_hooks
         for hook_path, agent, _label in (
@@ -2579,7 +2580,7 @@ def update(
         raise InstallError("update failed") from error
 
 
-def rollback(paths: RuntimePaths) -> dict[str, Any]:
+def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
     """Switch current back to the previous runtime without touching memory data."""
     state = read_install_state(paths)
     previous_version = state.get("previous_version")
@@ -2600,7 +2601,7 @@ def rollback(paths: RuntimePaths) -> dict[str, Any]:
         python = state.get("python_executable") if isinstance(state.get("python_executable"), str) else _runtime_python(paths)
         install_runtime_config(paths, port=port, app_version=previous_version, python_executable=python)
         install_launcher(paths, python_executable=python)
-        install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python))
+        install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python, run_at_load=run_at_load))
         import vibe_memory_hooks
         for hook_path, agent, _label in (_hook_target_for_client(paths, client) for client in clients):
             vibe_memory_hooks.repair(hook_path, agent, paths.launcher)
@@ -2694,7 +2695,7 @@ def _hook_target_for_client(paths: RuntimePaths, client: str) -> tuple[pathlib.P
     return home / ".codex" / "hooks.json", "codex", "codex"
 
 
-def repair(paths: RuntimePaths) -> dict[str, Any]:
+def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
     """Re-render managed LaunchAgent and hook entries for the current runtime."""
     import vibe_memory_hooks
 
@@ -2718,7 +2719,7 @@ def repair(paths: RuntimePaths) -> dict[str, Any]:
     try:
         install_runtime_config(paths, port=port, app_version=current_version, python_executable=python)
         launcher = install_launcher(paths, python_executable=python)
-        launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python))
+        launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python, run_at_load=run_at_load))
         hook_results = {}
         for path, agent, label in (_hook_target_for_client(paths, client) for client in clients):
             hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)

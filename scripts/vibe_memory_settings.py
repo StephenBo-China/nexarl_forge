@@ -91,6 +91,36 @@ def write_service_action(
     return value
 
 
+def read_service_action(paths: RuntimePaths) -> dict[str, object]:
+    action_path = pathlib.Path(paths.install_root) / "state" / "service-action.json"
+    if action_path.is_symlink():
+        raise ValueError("service action state must not be a symlink")
+    try:
+        value = json.loads(action_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("service action state must be an object")
+    return value
+
+
+def restore_service_action_if_generation(
+    paths: RuntimePaths,
+    *,
+    expected_generation: str,
+    previous: Mapping[str, object],
+) -> bool:
+    current = read_service_action(paths)
+    if current.get("generation") != expected_generation:
+        return False
+    action_path = pathlib.Path(paths.install_root) / "state" / "service-action.json"
+    if previous:
+        vibe_memory_install._atomic_write_private_json(action_path, dict(previous))
+    else:
+        action_path.unlink(missing_ok=True)
+    return True
+
+
 def default_settings() -> dict[str, object]:
     return {
         "schema_version": 1,

@@ -1120,6 +1120,224 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(action["generation"], pending["generation"])
         self.assertEqual(action["status"], "bootout_pending")
 
+    def test_start_invalidates_pending_generation_before_activation(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        pending = memory_review_server.write_service_action(self.paths, desired=False)
+
+        def activate(_paths: object, *, expected_version: str) -> dict[str, object]:
+            self.assertEqual(expected_version, "1.0.0")
+            action = memory_review_server.read_service_action(self.paths)
+            self.assertNotEqual(action["generation"], pending["generation"])
+            self.assertEqual(action["status"], "start_pending")
+            with mock.patch.object(
+                memory_review_server.vibe_memory_settings.vibe_memory_install,
+                "bootout_launch_agent",
+            ) as bootout:
+                memory_review_server.complete_scheduled_bootout(
+                    self.paths, str(pending["generation"])
+                )
+            bootout.assert_not_called()
+            return {"status": "healthy"}
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            side_effect=activate,
+        ):
+            code, _, stderr = self.invoke(["start"])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(
+            memory_review_server.read_service_action(self.paths)["status"],
+            "current_session_active",
+        )
+
+    def test_start_crash_leaves_transitional_generation_and_stale_worker_noops(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        pending = memory_review_server.write_service_action(self.paths, desired=False)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            side_effect=KeyboardInterrupt(),
+        ), self.assertRaises(KeyboardInterrupt):
+            vibe_memory_cli.start_command(argparse.Namespace())
+
+        transitional = memory_review_server.read_service_action(self.paths)
+        self.assertNotEqual(transitional["generation"], pending["generation"])
+        self.assertEqual(transitional["status"], "start_pending")
+        with mock.patch.object(
+            memory_review_server.vibe_memory_settings.vibe_memory_install,
+            "bootout_launch_agent",
+        ) as bootout:
+            memory_review_server.scheduled_bootout_worker(
+                self.paths, str(pending["generation"])
+            )
+        bootout.assert_not_called()
+
+    def test_failed_start_restore_does_not_overwrite_newer_generation(self) -> None:
+        previous = memory_review_server.write_service_action(self.paths, desired=False)
+        transitional = vibe_memory_cli.vibe_memory_settings.write_service_action(
+            self.paths,
+            desired_start_at_login=False,
+            status="start_pending",
+        )
+        newer = memory_review_server.write_service_action(self.paths, desired=True)
+
+        restored = vibe_memory_cli.vibe_memory_settings.restore_service_action_if_generation(
+            self.paths,
+            expected_generation=str(transitional["generation"]),
+            previous=previous,
+        )
+
+        self.assertFalse(restored)
+        self.assertEqual(
+            memory_review_server.read_service_action(self.paths)["generation"],
+            newer["generation"],
+        )
+
+    def test_start_and_uninstall_serialize_without_orphan_service(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        start_entered = threading.Event()
+        allow_start = threading.Event()
+        uninstall_entered = threading.Event()
+        state = {"service": "stopped", "assets": "installed"}
+        errors: list[BaseException] = []
+
+        def activate(_paths: object, *, expected_version: str) -> dict[str, object]:
+            start_entered.set()
+            if not allow_start.wait(2):
+                raise AssertionError("timed out waiting for uninstall interleave")
+            state["service"] = "active"
+            return {"status": "healthy"}
+
+        def uninstall(_paths: object, **_kwargs: object) -> dict[str, object]:
+            uninstall_entered.set()
+            state["service"] = "stopped"
+            state["assets"] = "removed"
+            memory_review_server.service_action_path(self.paths).unlink(missing_ok=True)
+            return {"status": "uninstalled"}
+
+        def run(command: object) -> None:
+            try:
+                command(argparse.Namespace(remove_data=False, approved_data_deletion=False, data_path=[]))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent", side_effect=activate
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.uninstall", side_effect=uninstall
+        ), mock.patch.object(vibe_memory_cli, "_json"):
+            start_thread = threading.Thread(target=run, args=(vibe_memory_cli.start_command,))
+            start_thread.start()
+            self.assertTrue(start_entered.wait(1))
+            uninstall_thread = threading.Thread(target=run, args=(vibe_memory_cli.uninstall_command,))
+            uninstall_thread.start()
+            self.assertFalse(uninstall_entered.wait(0.05))
+            allow_start.set()
+            start_thread.join(2)
+            uninstall_thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(uninstall_entered.is_set())
+        self.assertEqual(state, {"service": "stopped", "assets": "removed"})
+        self.assertFalse(memory_review_server.service_action_path(self.paths).exists())
+
+    def test_start_and_repair_serialize_and_preserve_manual_lifecycle(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        start_entered = threading.Event()
+        allow_start = threading.Event()
+        repair_entered = threading.Event()
+        repair_run_at_load: list[bool] = []
+        errors: list[BaseException] = []
+
+        def activate(_paths: object, *, expected_version: str) -> dict[str, object]:
+            start_entered.set()
+            if not allow_start.wait(2):
+                raise AssertionError("timed out waiting for repair interleave")
+            return {"status": "healthy"}
+
+        def repair(_paths: object, *, run_at_load: bool) -> dict[str, object]:
+            repair_entered.set()
+            repair_run_at_load.append(run_at_load)
+            return {"status": "repaired"}
+
+        def run(command: object) -> None:
+            try:
+                command(argparse.Namespace())
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent", side_effect=activate
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.repair", side_effect=repair
+        ), mock.patch.object(vibe_memory_cli, "_json"):
+            start_thread = threading.Thread(target=run, args=(vibe_memory_cli.start_command,))
+            start_thread.start()
+            self.assertTrue(start_entered.wait(1))
+            repair_thread = threading.Thread(target=run, args=(vibe_memory_cli.repair_command,))
+            repair_thread.start()
+            self.assertFalse(repair_entered.wait(0.05))
+            allow_start.set()
+            start_thread.join(2)
+            repair_thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(repair_run_at_load, [False])
+        action = memory_review_server.read_service_action(self.paths)
+        self.assertFalse(action["desired_start_at_login"])
+        self.assertEqual(action["status"], "current_session_active")
+
     def test_start_preserves_login_launch_agent_and_enabled_setting(self) -> None:
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths,
@@ -1246,7 +1464,9 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             code, output, _ = self.invoke(["update", "--source-root", "/next"])
         self.assertEqual(code, 0)
         self.assertEqual(output["status"], "updated")
-        update.assert_called_once_with(pathlib.Path("/next"), self.paths)
+        update.assert_called_once_with(
+            pathlib.Path("/next"), self.paths, run_at_load=True
+        )
 
         with mock.patch(
             "vibe_memory_cli.vibe_memory_install.rollback",
@@ -1255,7 +1475,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             code, output, _ = self.invoke(["rollback"])
         self.assertEqual(code, 0)
         self.assertEqual(output["status"], "rolled_back")
-        rollback.assert_called_once_with(self.paths)
+        rollback.assert_called_once_with(self.paths, run_at_load=True)
 
         with mock.patch(
             "vibe_memory_cli.vibe_memory_install.repair",
@@ -1264,7 +1484,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             code, output, _ = self.invoke(["repair"])
         self.assertEqual(code, 0)
         self.assertEqual(output["status"], "repaired")
-        repair.assert_called_once_with(self.paths)
+        repair.assert_called_once_with(self.paths, run_at_load=True)
 
         with mock.patch("vibe_memory_cli.vibe_memory_install.uninstall") as uninstall:
             code, output, stderr = self.invoke(["uninstall", "--remove-data"])

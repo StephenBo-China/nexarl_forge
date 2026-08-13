@@ -92,16 +92,7 @@ def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:
 
 
 def read_service_action(paths: vibe_memory_paths.RuntimePaths) -> dict[str, object]:
-    path = service_action_path(paths)
-    if path.is_symlink():
-        raise ValueError("service action state must not be a symlink")
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError("service action state must be an object")
-    return value
+    return vibe_memory_settings.read_service_action(paths)
 
 
 def write_service_action(paths: vibe_memory_paths.RuntimePaths, *, desired: bool) -> dict[str, object]:
