@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -58,46 +59,30 @@ def settings_payload() -> dict[str, object]:
 
 
 def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
-    allowed = {
-        "codex_hooks_enabled",
-        "claude_hooks_enabled",
-        "automatic_candidate_checks",
-        "personal_short_retention_days",
-        "start_at_login",
-        "service_port",
-        "workspace",
-        "formal_memory_requires_approval",
-        "service_host",
-    }
-    unknown = set(body).difference(allowed)
-    if unknown:
-        raise ValueError(f"unknown first-run settings: {', '.join(sorted(unknown))}")
-    if body.get("formal_memory_requires_approval", True) is not True:
-        raise ValueError("formal_memory_requires_approval must remain true")
-    if body.get("service_host", "127.0.0.1") != "127.0.0.1":
-        raise ValueError("service_host must remain 127.0.0.1")
-    workspace = body.get("workspace")
-    if workspace is not None and not isinstance(workspace, str):
-        raise ValueError("workspace must be a path string")
     paths = vibe_memory_paths.for_home()
-    value = vibe_memory_settings.load_settings(paths)
-    for key in (
-        "codex_hooks_enabled",
-        "claude_hooks_enabled",
-        "automatic_candidate_checks",
-        "personal_short_retention_days",
-        "start_at_login",
-        "service_port",
-    ):
-        if key in body:
-            value[key] = body[key]
-    value["first_run_complete"] = True
-    saved = vibe_memory_settings.save_settings(paths, value)
-    vibe_memory_settings.reconcile_hooks(paths, saved)
-    vibe_memory_settings.reconcile_launch_agent(paths, saved)
-    if isinstance(workspace, str) and workspace.strip():
-        memory_project.register_project(workspace)
-    return saved
+    return vibe_memory_settings.apply_first_run(
+        paths,
+        body,
+        manager_source_root=pathlib.Path(__file__).resolve().parents[1],
+        register_workspace=memory_project.register_project,
+    )
+
+
+def first_run_page() -> str:
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设置 Vibe Memory</title><style>
+:root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:#171717;color:#ececec}body{margin:0;display:grid;min-height:100vh;place-items:center}.wizard{width:min(680px,calc(100vw - 32px));background:#202020;border:1px solid #333;border-radius:12px;padding:28px;box-shadow:0 18px 60px #0006}h1{font-size:24px;margin:0 0 8px}p{color:#aaa;line-height:1.6}.row{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #303030}.stack{display:grid;gap:8px}.radios{display:flex;gap:14px;flex-wrap:wrap}input[type=text],input[type=number]{background:#2b2b2b;border:1px solid #444;border-radius:7px;color:#fff;padding:9px;width:min(380px,70vw)}button{margin-top:18px;background:#eee;border:0;border-radius:8px;color:#171717;font-weight:650;padding:11px 16px}.message{min-height:20px;color:#8ab4ff}</style></head>
+<body><form class="wizard" id="first-run"><h1>首次运行设置</h1><p>配置本机客户端与保留策略。工作区必须手动输入一个已存在的目录；浏览器无法打开原生目录选择器。</p>
+<label class="row"><span>Codex hooks</span><input name="codex_hooks" type="checkbox" checked></label>
+<label class="row"><span>Claude Code hooks</span><input name="claude_hooks" type="checkbox"></label>
+<label class="row"><span>自动候选检查</span><input name="automatic_candidate_checks" type="checkbox" checked></label>
+<div class="row"><span>个人短记忆保留</span><div class="radios"><label><input name="personal_short_retention_days" type="radio" value="0">不保留</label><label><input name="personal_short_retention_days" type="radio" value="14">14 天</label><label><input name="personal_short_retention_days" type="radio" value="30" checked>30 天</label></div></div>
+<label class="row"><span>登录时启动</span><input name="start_at_login" type="checkbox" checked></label>
+<label class="row"><span>本机端口</span><input name="service_port" type="number" min="1" max="65535" value="8897" required></label>
+<label class="row stack"><span>可选工作区路径</span><input name="workspace" type="text" placeholder="/path/to/workspace"></label>
+<div class="message" id="message"></div><button type="submit">保存并继续</button></form>
+<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');location.href='/'}catch(error){msg.textContent=error.message}}</script></body></html>"""
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -2516,7 +2501,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(project_payload())
             return
         if parsed.path == "/":
-            payload = page().encode("utf-8")
+            force_first_run = parse_qs(parsed.query).get("first-run") == ["1"]
+            show_first_run = force_first_run or not bool(settings_payload()["first_run_complete"])
+            payload = (first_run_page() if show_first_run else page()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -2532,7 +2519,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(ui_design_post(parsed.path, self.read_json()))
                 return
             if parsed.path == "/api/settings/first-run":
-                self.send_json(save_first_run_settings(self.read_json()))
+                result = save_first_run_settings(self.read_json())
+                self.send_json(result)
+                if result.get("bootout_after_response"):
+                    threading.Thread(
+                        target=vibe_memory_settings.vibe_memory_install.bootout_launch_agent,
+                        daemon=True,
+                    ).start()
                 return
             if parsed.path == "/api/projects/register":
                 body = self.read_json()

@@ -26,6 +26,7 @@ try:
     import vibe_memory_install
     import vibe_memory_migration
     import vibe_memory_paths
+    import vibe_memory_settings
 except ImportError:
     pass
 
@@ -517,6 +518,8 @@ def open_command(_args: argparse.Namespace) -> int:
     if not health["ok"]:
         raise LifecycleError("local health endpoint is unavailable")
     url = str(health["url"])
+    if not vibe_memory_settings.load_settings(paths)["first_run_complete"]:
+        url += "?first-run=1"
     completed = subprocess.run(["/usr/bin/open", url], check=False)
     if completed.returncode:
         raise LifecycleError("open command failed")

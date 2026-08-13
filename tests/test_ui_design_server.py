@@ -91,8 +91,8 @@ class UIDesignServerTest(unittest.TestCase):
         workspace = self.temp / "chosen-workspace"
         workspace.mkdir()
         body = {
-            "codex_hooks_enabled": False,
-            "claude_hooks_enabled": True,
+            "codex_hooks": False,
+            "claude_hooks": True,
             "automatic_candidate_checks": False,
             "personal_short_retention_days": 14,
             "start_at_login": False,
@@ -113,14 +113,13 @@ class UIDesignServerTest(unittest.TestCase):
             )
 
         self.assertEqual(status, 200)
-        self.assertTrue(payload["first_run_complete"])
-        self.assertFalse(payload["automatic_candidate_checks"])
-        hooks.assert_called_once_with(paths, payload)
-        launch.assert_called_once_with(paths, payload)
-        register.assert_called_once_with(str(workspace))
+        self.assertTrue(payload["settings"]["first_run_complete"])
+        self.assertFalse(payload["settings"]["automatic_candidate_checks"])
+        self.assertEqual(payload["registered_project"], {"projects": []})
+        register.assert_called_once_with(str(workspace.resolve()))
 
         persisted = vibe_memory_settings.load_settings(paths)
-        self.assertEqual(persisted, payload)
+        self.assertEqual(persisted, payload["settings"])
 
     def test_first_run_without_workspace_never_registers_application_clone(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "settings-home")
@@ -137,6 +136,34 @@ class UIDesignServerTest(unittest.TestCase):
 
         self.assertEqual(status, 200)
         register.assert_not_called()
+
+    def test_first_run_page_is_visible_until_setup_completes(self) -> None:
+        html = server.first_run_page()
+        for expected in (
+            'name="codex_hooks"', 'name="claude_hooks"',
+            'name="automatic_candidate_checks"', 'value="0"', 'value="14"',
+            'value="30"', 'name="start_at_login"', 'name="service_port"',
+            'name="workspace"', '/api/settings/first-run',
+        ):
+            self.assertIn(expected, html)
+
+    def test_first_run_bootout_is_scheduled_only_after_response_is_sent(self) -> None:
+        handler = object.__new__(server.Handler)
+        handler.path = "/api/settings/first-run"
+        handler.read_json = mock.Mock(return_value={})
+        order: list[str] = []
+        handler.send_json = mock.Mock(side_effect=lambda *_args, **_kwargs: order.append("response"))
+        thread = mock.Mock()
+        thread.start.side_effect = lambda: order.append("bootout")
+        with mock.patch.object(
+            server, "save_first_run_settings", return_value={"bootout_after_response": True}
+        ), mock.patch.object(server.threading, "Thread", return_value=thread) as make_thread:
+            handler.do_POST()
+        self.assertEqual(order, ["response", "bootout"])
+        make_thread.assert_called_once_with(
+            target=server.vibe_memory_settings.vibe_memory_install.bootout_launch_agent,
+            daemon=True,
+        )
 
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(

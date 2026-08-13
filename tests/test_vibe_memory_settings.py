@@ -109,6 +109,48 @@ class VibeMemorySettingsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             settings.save_settings(self.paths, candidate)
 
+    def test_first_run_normalization_requires_exact_types_retention_and_safe_workspace(self) -> None:
+        workspace = pathlib.Path(self.temporary.name) / "workspace"
+        workspace.mkdir()
+        request = {
+            "codex_hooks": True,
+            "claude_hooks": False,
+            "automatic_candidate_checks": True,
+            "personal_short_retention_days": 14,
+            "start_at_login": False,
+            "service_port": 9123,
+            "workspace": str(workspace),
+        }
+        normalized = settings.normalize_first_run_request(
+            self.paths, request, manager_source_root=ROOT
+        )
+        self.assertEqual(normalized["workspace"], str(workspace.resolve()))
+        self.assertEqual(normalized["settings"]["service_port"], 9123)
+        self.assertTrue(normalized["settings"]["first_run_complete"])
+        for key, value in (
+            ("codex_hooks", 1),
+            ("personal_short_retention_days", 7),
+            ("service_port", True),
+        ):
+            with self.subTest(key=key):
+                invalid = dict(request)
+                invalid[key] = value
+                with self.assertRaises(ValueError):
+                    settings.normalize_first_run_request(
+                        self.paths, invalid, manager_source_root=ROOT
+                    )
+        for forbidden in (
+            self.paths.install_root,
+            self.paths.install_root / "current",
+            ROOT,
+        ):
+            forbidden.mkdir(parents=True, exist_ok=True)
+            invalid = dict(request, workspace=str(forbidden))
+            with self.assertRaisesRegex(ValueError, "workspace must not"):
+                settings.normalize_first_run_request(
+                    self.paths, invalid, manager_source_root=ROOT
+                )
+
     def test_runtime_reinstall_preserves_settings_and_updates_shared_port(self) -> None:
         original = settings.default_settings()
         original["first_run_complete"] = True
@@ -132,11 +174,13 @@ class VibeMemorySettingsTest(unittest.TestCase):
 Unstructured notes remain.
 
 ## temporary-project-context
+<!-- vibe-memory:managed-short -->
 expires_on: 2026-07-29
 
 expired temporary context
 
 ## active-temporary-context
+<!-- vibe-memory:managed-short -->
 expires_on: 2026-07-30
 
 active temporary context
@@ -171,6 +215,98 @@ keep this too
         )
         self.assertEqual(self.short_memory.read_text(encoding="utf-8"), source)
         self.assertEqual(list(self.short_memory.parent.glob("short.md.bak.*")), [])
+
+    def test_retention_zero_removes_only_manager_marked_sections(self) -> None:
+        source = """# Personal Short Memory
+
+## managed
+<!-- vibe-memory:managed-short -->
+
+temporary
+
+## user-owned
+expires_on: 2020-01-01
+
+keep exactly
+"""
+        self.short_memory.write_text(source, encoding="utf-8")
+        result = settings.prune_personal_short(
+            self.short_memory, today=dt.date(2026, 7, 30), retention_days=0
+        )
+        self.assertEqual(result, ["managed"])
+        current = self.short_memory.read_text(encoding="utf-8")
+        self.assertNotIn("temporary", current)
+        self.assertIn("keep exactly", current)
+
+    def test_retention_normalizes_managed_expiry_and_preserves_unmarked_text(self) -> None:
+        source = """# Personal Short Memory
+
+## managed
+<!-- vibe-memory:managed-short -->
+expires_on: invalid
+
+temporary
+
+## user-owned
+expires_on: 2020-01-01
+
+keep exactly
+"""
+        self.short_memory.write_text(source, encoding="utf-8")
+        settings.prune_personal_short(
+            self.short_memory, today=dt.date(2026, 7, 30), retention_days=14
+        )
+        current = self.short_memory.read_text(encoding="utf-8")
+        self.assertIn("expires_on: 2026-08-13", current)
+        self.assertIn("## user-owned\nexpires_on: 2020-01-01\n\nkeep exactly", current)
+
+    def test_first_run_failure_restores_settings_hooks_registry_plist_and_short_memory(self) -> None:
+        config = self.paths.install_root / "config.json"
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({**settings.default_settings(), "port": 8897}), encoding="utf-8")
+        codex_hook = self.home / ".codex/hooks.json"
+        codex_hook.parent.mkdir(parents=True, exist_ok=True)
+        codex_hook.write_text('{"old":"hook"}\n', encoding="utf-8")
+        registry = self.paths.project_registry
+        registry.parent.mkdir(parents=True)
+        registry.write_text('{"current_project":"","projects":[]}\n', encoding="utf-8")
+        plist = self.paths.launch_agent
+        plist.parent.mkdir(parents=True)
+        plist.write_text("old plist\n", encoding="utf-8")
+        self.short_memory.write_text("old short\n", encoding="utf-8")
+        before = {path: path.read_bytes() for path in (config, codex_hook, registry, plist, self.short_memory)}
+        workspace = pathlib.Path(self.temporary.name) / "workspace"
+        workspace.mkdir()
+
+        def mutate_hooks(*_args: object) -> dict[str, object]:
+            codex_hook.write_text('{"new":"hook"}\n', encoding="utf-8")
+            return {}
+
+        def register(_workspace: str) -> dict[str, object]:
+            registry.write_text('{"current_project":"new","projects":[]}\n', encoding="utf-8")
+            return {}
+
+        with mock.patch.object(settings, "reconcile_hooks", side_effect=mutate_hooks), \
+                mock.patch.object(settings, "reconcile_launch_agent", side_effect=RuntimeError("boom")), \
+                mock.patch.object(settings.vibe_memory_install, "bootout_launch_agent"):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                settings.apply_first_run(
+                    self.paths,
+                    {
+                        "codex_hooks": True,
+                        "claude_hooks": False,
+                        "automatic_candidate_checks": True,
+                        "personal_short_retention_days": 30,
+                        "start_at_login": False,
+                        "service_port": 9123,
+                        "workspace": str(workspace),
+                    },
+                    manager_source_root=ROOT,
+                    register_workspace=register,
+                )
+
+        for path, content in before.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
 
     def test_context_omits_candidate_reminder_when_automatic_checks_are_disabled(self) -> None:
         event = NormalizedEvent(

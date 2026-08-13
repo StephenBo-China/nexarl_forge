@@ -10,6 +10,7 @@ import re
 import stat
 import tempfile
 import uuid
+from collections.abc import Callable
 from typing import Mapping
 
 from ui_design_store import atomic_write_json, exclusive_lock
@@ -39,6 +40,22 @@ _RUNTIME_KEYS = {
 }
 _SECTION = re.compile(r"(?ms)^##[ \t]+([^\n]+)\n.*?(?=^##[ \t]+|\Z)")
 _EXPIRY = re.compile(r"(?m)^expires_on:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$")
+_ANY_EXPIRY = re.compile(r"(?m)^expires_on:[^\n]*(?:\n|\Z)")
+_MANAGED_SHORT = re.compile(
+    r"(?m)^(?:<!--[ \t]*vibe-memory:managed-short[ \t]*-->|"
+    r"managed_by:[ \t]*vibe-memory|vibe_memory_managed:[ \t]*true)[ \t]*$"
+)
+_FIRST_RUN_KEYS = {
+    "codex_hooks",
+    "claude_hooks",
+    "automatic_candidate_checks",
+    "personal_short_retention_days",
+    "start_at_login",
+    "service_port",
+    "workspace",
+    "formal_memory_requires_approval",
+    "service_host",
+}
 
 
 def default_settings() -> dict[str, object]:
@@ -82,8 +99,8 @@ def validate_settings(value: Mapping[str, object]) -> dict[str, object]:
     if normalized["service_host"] != "127.0.0.1":
         raise ValueError("service_host must remain 127.0.0.1")
     retention = normalized["personal_short_retention_days"]
-    if isinstance(retention, bool) or not isinstance(retention, int) or retention < 0:
-        raise ValueError("personal_short_retention_days must be a non-negative integer")
+    if isinstance(retention, bool) or retention not in {0, 14, 30}:
+        raise ValueError("personal_short_retention_days must be 0, 14, or 30")
     port = normalized["service_port"]
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("service_port must be an integer from 1 through 65535")
@@ -142,6 +159,70 @@ def save_settings(paths: RuntimePaths, value: Mapping[str, object]) -> dict[str,
         atomic_write_json(path, persisted, backup=path.exists())
         path.chmod(0o600)
     return dict(normalized)
+
+
+def _is_within(path: pathlib.Path, parent: pathlib.Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def normalize_first_run_request(
+    paths: RuntimePaths,
+    request: Mapping[str, object],
+    *,
+    manager_source_root: pathlib.Path | str,
+) -> dict[str, object]:
+    if not isinstance(request, Mapping):
+        raise ValueError("first-run request must contain an object")
+    unknown = set(request).difference(_FIRST_RUN_KEYS)
+    if unknown:
+        raise ValueError(f"unknown first-run settings: {', '.join(sorted(unknown))}")
+    if request.get("formal_memory_requires_approval", True) is not True:
+        raise ValueError("formal_memory_requires_approval must remain true")
+    if request.get("service_host", "127.0.0.1") != "127.0.0.1":
+        raise ValueError("service_host must remain 127.0.0.1")
+    current = load_settings(paths)
+    aliases = {
+        "codex_hooks": "codex_hooks_enabled",
+        "claude_hooks": "claude_hooks_enabled",
+    }
+    for request_key, settings_key in aliases.items():
+        if request_key in request:
+            value = request[request_key]
+            if not isinstance(value, bool):
+                raise ValueError(f"{request_key} must be a boolean")
+            current[settings_key] = value
+    for key in ("automatic_candidate_checks", "start_at_login"):
+        if key in request:
+            if not isinstance(request[key], bool):
+                raise ValueError(f"{key} must be a boolean")
+            current[key] = request[key]
+    for key in ("personal_short_retention_days", "service_port"):
+        if key in request:
+            current[key] = request[key]
+    current["first_run_complete"] = True
+    normalized_settings = validate_settings(current)
+
+    workspace_value = request.get("workspace", "")
+    if not isinstance(workspace_value, str):
+        raise ValueError("workspace must be a path string")
+    workspace: str | None = None
+    if workspace_value.strip():
+        selected = pathlib.Path(workspace_value).expanduser()
+        if selected.is_symlink() or not selected.exists() or not selected.is_dir():
+            raise ValueError("workspace must be an existing directory")
+        selected = selected.resolve(strict=True)
+        forbidden = (
+            pathlib.Path(paths.install_root).resolve(),
+            pathlib.Path(manager_source_root).resolve(),
+        )
+        if any(_is_within(selected, root) or _is_within(root, selected) for root in forbidden):
+            raise ValueError("workspace must not be the installed runtime or manager source root")
+        workspace = str(selected)
+    return {"settings": normalized_settings, "workspace": workspace}
 
 
 def _write_all(descriptor: int, content: bytes) -> None:
@@ -209,9 +290,9 @@ def prune_personal_short(
     if (
         isinstance(retention_days, bool)
         or not isinstance(retention_days, int)
-        or retention_days < 0
+        or retention_days not in {0, 14, 30}
     ):
-        raise ValueError("retention_days must be a non-negative integer")
+        raise ValueError("retention_days must be 0, 14, or 30")
     target = pathlib.Path(path)
     if target.is_symlink():
         raise ValueError("personal short memory must not be a symlink")
@@ -229,26 +310,134 @@ def prune_personal_short(
     cutoff = today or dt.date.today()
     removed: list[str] = []
 
+    changed = False
     def retain_or_remove(match: re.Match[str]) -> str:
-        expiry_match = _EXPIRY.search(match.group(0))
-        if expiry_match is None:
-            return match.group(0)
+        nonlocal changed
+        section = match.group(0)
+        if _MANAGED_SHORT.search(section) is None:
+            return section
+        if retention_days == 0:
+            changed = True
+            removed.append(match.group(1).strip())
+            return ""
+        expiry_match = _EXPIRY.search(section)
+        expected_expiry = cutoff + dt.timedelta(days=retention_days)
         try:
-            expiry = dt.date.fromisoformat(expiry_match.group(1))
-        except ValueError:
-            return match.group(0)
-        if expiry >= cutoff:
-            return match.group(0)
-        removed.append(match.group(1).strip())
-        return ""
+            expiry = dt.date.fromisoformat(expiry_match.group(1)) if expiry_match else None
+        except ValueError:  # Defensive: the strict regex currently prevents this.
+            expiry = None
+        if expiry is not None and expiry < cutoff:
+            changed = True
+            removed.append(match.group(1).strip())
+            return ""
+        if expiry != expected_expiry:
+            replacement = f"expires_on: {expected_expiry.isoformat()}\n"
+            marker = _MANAGED_SHORT.search(section)
+            assert marker is not None
+            if _ANY_EXPIRY.search(section):
+                section = _ANY_EXPIRY.sub(replacement, section, count=1)
+            else:
+                section = section[:marker.end()] + "\n" + replacement + section[marker.end():].lstrip("\n")
+            changed = True
+            return section
+        return section
 
     updated = _SECTION.sub(retain_or_remove, text)
-    if not removed:
+    if not changed:
         return []
-    mode = stat.S_IMODE(metadata.st_mode)
+    mode = 0o600
     _backup_source(target, source, mode)
     _atomic_write_text(target, updated, mode)
     return removed
+
+
+def _transaction_paths(paths: RuntimePaths) -> list[pathlib.Path]:
+    home = _home(paths)
+    return [
+        _config_path(paths),
+        home / ".codex" / "hooks.json",
+        home / ".claude" / "settings.json",
+        pathlib.Path(paths.project_registry),
+        pathlib.Path(paths.launch_agent),
+        vibe_memory_install.install_state_path(paths),
+        pathlib.Path(paths.personal_memory) / "short.md",
+    ]
+
+
+def apply_first_run(
+    paths: RuntimePaths,
+    request: Mapping[str, object],
+    *,
+    manager_source_root: pathlib.Path | str,
+    register_workspace: Callable[[str], dict[str, object]],
+) -> dict[str, object]:
+    """Apply first-run choices as one rollback-capable lifecycle transaction."""
+    normalized = normalize_first_run_request(
+        paths, request, manager_source_root=manager_source_root
+    )
+    selected = normalized["settings"]
+    assert isinstance(selected, dict)
+    lock_path = pathlib.Path(paths.install_root) / ".lifecycle.vibe-memory.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with exclusive_lock(lock_path):
+        old_settings = load_settings(paths)
+        snapshots = {
+            path: vibe_memory_install._snapshot_regular_file(path)
+            for path in _transaction_paths(paths)
+        }
+        written: dict[pathlib.Path, object] = {}
+        try:
+            saved = save_settings(paths, selected)
+            reconcile_hooks(paths, saved)
+            state = vibe_memory_install.read_install_state(paths)
+            if state:
+                state["port"] = saved["service_port"]
+                vibe_memory_install.write_install_state(paths, state)
+            prune_personal_short(
+                pathlib.Path(paths.personal_memory) / "short.md",
+                retention_days=int(saved["personal_short_retention_days"]),
+            )
+            registered = None
+            workspace = normalized["workspace"]
+            if isinstance(workspace, str):
+                registered = register_workspace(workspace)
+            launch = reconcile_launch_agent(paths, saved)
+            if saved["start_at_login"]:
+                try:
+                    runtime = vibe_memory_install.read_runtime_config(paths)
+                except (OSError, ValueError, vibe_memory_install.InstallError):
+                    runtime = {}
+                version = runtime.get("app_version")
+                if isinstance(version, str):
+                    vibe_memory_install.activate_launch_agent(
+                        paths, expected_version=version
+                    )
+            written = {
+                path: vibe_memory_install._snapshot_regular_file(path)
+                for path in _transaction_paths(paths)
+            }
+            return {
+                "settings": saved,
+                "registered_project": registered,
+                "launch_agent": launch,
+                "bootout_after_response": not bool(saved["start_at_login"]),
+            }
+        except Exception:
+            try:
+                vibe_memory_install.bootout_launch_agent()
+            except vibe_memory_install.InstallError:
+                pass
+            for path, snapshot in snapshots.items():
+                vibe_memory_install._restore_regular_file(
+                    path, snapshot, expected_current=written.get(path, vibe_memory_install._NO_SNAPSHOT_CHECK)
+                )
+            if old_settings["start_at_login"] and snapshots[pathlib.Path(paths.launch_agent)] is not None:
+                try:
+                    version = vibe_memory_install.read_runtime_config(paths)["app_version"]
+                    vibe_memory_install.activate_launch_agent(paths, expected_version=str(version))
+                except Exception:
+                    pass
+            raise
 
 
 def _home(paths: RuntimePaths) -> pathlib.Path:

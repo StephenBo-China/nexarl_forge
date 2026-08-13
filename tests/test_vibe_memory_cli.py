@@ -612,6 +612,9 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths, port=9123, app_version="1.0.0"
         )
+        completed = vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)
+        completed["first_run_complete"] = True
+        vibe_memory_cli.vibe_memory_settings.save_settings(self.paths, completed)
         healthy = {
             "ok": True,
             "status": "healthy",
@@ -687,6 +690,20 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertTrue(health["ok"])
         self.assertEqual(health["url"], "http://127.0.0.1:9123/")
         opener.open.assert_called_once_with("http://127.0.0.1:9123/health", timeout=0.6)
+
+    def test_open_routes_incomplete_first_run_to_wizard(self) -> None:
+        with mock.patch("vibe_memory_cli.health_status", return_value={
+            "ok": True, "url": "http://127.0.0.1:9123/"
+        }), mock.patch("vibe_memory_cli.vibe_memory_settings.load_settings", return_value={
+            **vibe_memory_cli.vibe_memory_settings.default_settings(),
+            "service_port": 9123,
+        }), mock.patch("vibe_memory_cli.subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            code, output, _ = self.invoke(["open"])
+        self.assertEqual(code, 0)
+        self.assertEqual(output["url"], "http://127.0.0.1:9123/?first-run=1")
+        run.assert_called_once_with(
+            ["/usr/bin/open", "http://127.0.0.1:9123/?first-run=1"], check=False
+        )
 
     def test_project_register_list_unregister_and_explicit_init(self) -> None:
         notes = pathlib.Path(self.temporary.name) / "notes"
