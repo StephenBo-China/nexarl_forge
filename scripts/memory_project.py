@@ -420,29 +420,37 @@ def register_project(root: str | pathlib.Path, make_current: bool = True) -> dic
 def unregister_project(root: str | pathlib.Path) -> dict[str, Any]:
     project_path = normalize_project_root(root)
     project_root = str(project_path)
-    registered = set()
-    for item in registry().get("projects", []):
-        raw_root = item.get("root") if isinstance(item, dict) else None
-        if not isinstance(raw_root, str) or not raw_root:
-            continue
-        try:
-            registered.add(str(normalize_project_root(raw_root)))
-        except (OSError, RuntimeError, ValueError):
-            continue
-    if project_root not in registered:
-        raise ValueError(f"project is not registered: {project_root}")
-
     import vibe_memory_migration
 
-    cleanup = vibe_memory_migration.remove_managed_legacy_hooks(project_path)
-
-    def mutate(data: dict[str, Any]) -> None:
+    cleanup_plan = vibe_memory_migration.prepare_legacy_hook_cleanup(project_path)
+    with _registry_lock(exclusive=True) as parent_fd:
+        before_registry = _read_registry_at(parent_fd)
+        registered = {
+            str(normalize_project_root(raw_root))
+            for item in before_registry.get("projects", [])
+            if isinstance(item, dict)
+            for raw_root in [item.get("root")]
+            if isinstance(raw_root, str) and raw_root
+        }
+        if project_root not in registered:
+            raise ValueError(f"project is not registered: {project_root}")
+        data = json.loads(json.dumps(before_registry, ensure_ascii=False))
         data["projects"] = [
-            item for item in data.get("projects", []) if item.get("root") != project_root
+            item
+            for item in data.get("projects", [])
+            if not isinstance(item, dict)
+            or str(normalize_project_root(item.get("root", ""))) != project_root
         ]
-        if data.get("current_project") == project_root:
+        if data.get("current_project") and str(
+            normalize_project_root(data["current_project"])
+        ) == project_root:
             data["current_project"] = ""
-    data = _mutate_registry(mutate)
+        _write_registry_at(parent_fd, data)
+        try:
+            cleanup = vibe_memory_migration.execute_legacy_hook_cleanup(cleanup_plan)
+        except BaseException:
+            _write_registry_at(parent_fd, before_registry)
+            raise
     return {
         **data,
         "status": "unregistered",

@@ -177,8 +177,14 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                 root / ".claude" / "settings.json",
                 json.loads(memory_project.claude_settings_json()),
             )
-            _write_text(root / ".codex" / "hooks" / "shared_memory_hook.py", "# legacy codex hook\n")
-            _write_text(root / ".claude" / "hooks" / "shared_memory_hook.py", "# legacy claude hook\n")
+            _write_text(
+                root / ".codex" / "hooks" / "shared_memory_hook.py",
+                memory_project.hook_script(root, "codex"),
+            )
+            _write_text(
+                root / ".claude" / "hooks" / "shared_memory_hook.py",
+                memory_project.hook_script(root, "claude"),
+            )
             _write_text(root / ".codex" / "hooks" / "ui_design_gate_hook.py", "# ui design gate hook\n")
             _write_text(root / ".claude" / "hooks" / "ui_design_gate_hook.py", "# ui design gate hook\n")
 
@@ -348,6 +354,108 @@ class VibeMemoryMigrationTest(unittest.TestCase):
 
             current = path.read_text(encoding="utf-8")
             self.assertIn("/opt/custom/shared_memory_hook.py", current)
+
+    def test_same_project_path_with_custom_script_is_preserved_and_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            script = project / ".codex/hooks/shared_memory_hook.py"
+            script.write_text("# custom project hook\n", encoding="utf-8")
+            before = _snapshot_tree(project)
+
+            preview = migration.preview_legacy_hooks([project], paths=fixture.paths)
+            with self.assertRaises(ValueError):
+                migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(_snapshot_tree(project), before)
+            self.assertTrue(preview[0]["errors"])
+
+    def test_missing_owned_script_preserves_document_and_reports_error(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            (project / ".codex/hooks/shared_memory_hook.py").unlink()
+            before = _snapshot_tree(project)
+
+            preview = migration.preview_legacy_hooks([project], paths=fixture.paths)
+            with self.assertRaises(ValueError):
+                migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(_snapshot_tree(project), before)
+            self.assertTrue(preview[0]["errors"])
+
+    def test_script_symlink_preflight_leaves_zero_changes_or_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            script = project / ".codex/hooks/shared_memory_hook.py"
+            target = pathlib.Path(value) / "outside.py"
+            target.write_text(memory_project.hook_script(project, "codex"), encoding="utf-8")
+            script.unlink()
+            script.symlink_to(target)
+            before = _snapshot_tree(project)
+            before_backups = set(project.rglob("*.bak.*"))
+
+            with self.assertRaises(ValueError):
+                migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(_snapshot_tree(project), before)
+            self.assertEqual(set(project.rglob("*.bak.*")), before_backups)
+
+    def test_rename_failure_restores_documents_scripts_and_transaction_backups(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            active_paths = [
+                project / ".codex/hooks.json",
+                project / ".claude/settings.json",
+                project / ".codex/hooks/shared_memory_hook.py",
+                project / ".claude/hooks/shared_memory_hook.py",
+            ]
+            before = {path: (path.read_bytes(), path.stat().st_mode) for path in active_paths}
+            real_replace = migration.os.replace
+
+            def fail_second_script(source: object, target: object, *args: object, **kwargs: object):
+                if str(source).endswith(".claude/hooks/shared_memory_hook.py"):
+                    raise OSError("injected rename failure")
+                return real_replace(source, target, *args, **kwargs)
+
+            with mock.patch.object(migration.os, "replace", side_effect=fail_second_script):
+                with self.assertRaises(OSError):
+                    migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(
+                {path: (path.read_bytes(), path.stat().st_mode) for path in active_paths},
+                before,
+            )
+            self.assertFalse([
+                path for path in project.rglob("*.bak.*")
+                if "ui_design" not in str(path)
+            ])
+            failed = list((project / "codex/migration_audits").glob("*.json"))
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(
+                json.loads(failed[0].read_text(encoding="utf-8"))["result"], "failed"
+            )
+
+    def test_audit_write_failure_restores_active_resources(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            active_paths = [
+                project / ".codex/hooks.json",
+                project / ".claude/settings.json",
+                project / ".codex/hooks/shared_memory_hook.py",
+                project / ".claude/hooks/shared_memory_hook.py",
+            ]
+            before = {path: path.read_bytes() for path in active_paths}
+            with mock.patch.object(
+                migration, "_write_migration_audit", side_effect=OSError("audit failure")
+            ):
+                with self.assertRaises(OSError):
+                    migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual({path: path.read_bytes() for path in active_paths}, before)
 
 
 if __name__ == "__main__":

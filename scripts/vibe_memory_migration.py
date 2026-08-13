@@ -97,7 +97,7 @@ def _canonical_hook_command(command: str) -> str:
 
 
 def _hook_entry_counts(
-    document: Mapping[str, object],
+    document: Mapping[str, object], *, owned_script: bool = True
 ) -> tuple[set[str], set[str]]:
     hooks = document.get("hooks")
     if not isinstance(hooks, dict):
@@ -122,14 +122,16 @@ def _hook_entry_counts(
                 if not isinstance(command, str):
                     continue
                 signature = f"{event}:{_canonical_hook_command(command)}"
-                if _is_legacy_memory_command(command):
+                if _is_legacy_memory_command(command) and owned_script:
                     managed.add(signature)
                 else:
                     custom.add(signature)
     return managed, custom
 
 
-def _remove_legacy_memory_entries(document: Mapping[str, object]) -> tuple[dict[str, Any], int]:
+def _remove_legacy_memory_entries(
+    document: Mapping[str, object], *, owned_script: bool = True
+) -> tuple[dict[str, Any], int]:
     copied = json.loads(json.dumps(document, ensure_ascii=False))
     hooks = copied.get("hooks")
     if not isinstance(hooks, dict):
@@ -149,6 +151,7 @@ def _remove_legacy_memory_entries(document: Mapping[str, object]) -> tuple[dict[
                 if (
                     isinstance(handler, dict)
                     and handler.get("type") == "command"
+                    and owned_script
                     and _is_legacy_memory_command(handler.get("command"))
                 ):
                     removed += 1
@@ -281,6 +284,52 @@ def _legacy_state_digest(root: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
+def _snapshot_legacy_files(root: pathlib.Path) -> dict[pathlib.Path, tuple[bytes, int] | None]:
+    snapshots: dict[pathlib.Path, tuple[bytes, int] | None] = {}
+    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+        for relative in (document_relative, script_relative):
+            path = root / relative
+            if path.is_symlink():
+                raise ValueError(f"legacy migration refuses symlink target: {path}")
+            if not path.exists():
+                snapshots[path] = None
+                continue
+            if not path.is_file():
+                raise ValueError(f"legacy migration target must be a regular file: {path}")
+            snapshots[path] = (path.read_bytes(), path.stat().st_mode & 0o777)
+    return snapshots
+
+
+def _atomic_write_bytes(path: pathlib.Path, content: bytes, mode: int) -> None:
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.restore-", dir=path.parent)
+    temporary = pathlib.Path(name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_legacy_snapshot(
+    snapshots: Mapping[pathlib.Path, tuple[bytes, int] | None], backups: list[str]
+) -> None:
+    for path, snapshot in snapshots.items():
+        if snapshot is None:
+            if path.exists() and path.is_file() and not path.is_symlink():
+                path.unlink()
+            continue
+        content, mode = snapshot
+        _atomic_write_bytes(path, content, mode)
+    for raw in backups:
+        backup = pathlib.Path(raw)
+        if backup.exists() and backup.is_file() and not backup.is_symlink():
+            backup.unlink()
+
+
 def _write_migration_audit(
     root: pathlib.Path,
     stamp: str,
@@ -306,6 +355,22 @@ def _write_migration_audit(
     return audit
 
 
+def _owned_legacy_script(
+    root: pathlib.Path, script_path: pathlib.Path, agent: str
+) -> tuple[bool, str | None]:
+    if script_path.is_symlink():
+        return False, "managed legacy script must not be a symlink"
+    text, issue = _read_text(script_path)
+    if issue is not None:
+        return False, issue["error"]
+    if text is None:
+        return False, "referenced managed legacy script is missing"
+    expected = memory_project.hook_script(root, agent)
+    if text != expected:
+        return False, "referenced script does not match a known manager-owned version"
+    return True, None
+
+
 def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     project_root = pathlib.Path(root).expanduser().resolve()
     managed: set[str] = set()
@@ -314,7 +379,7 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     documents: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     script_targets: set[pathlib.Path] = set()
-    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+    for index, (document_relative, script_relative) in enumerate(_LEGACY_HOOK_DOCUMENTS):
         document_path = project_root / document_relative
         script_path = project_root / script_relative
         value, issue = _read_json(document_path)
@@ -330,8 +395,24 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
             errors.append(error)
             documents.append({"path": str(document_path), "status": "invalid"})
             continue
+        has_reference = any(
+            _is_legacy_memory_command(handler.get("command"))
+            for groups in value.get("hooks", {}).values()
+            if isinstance(groups, list)
+            for group in groups
+            if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+            for handler in group["hooks"]
+            if isinstance(handler, dict) and handler.get("type") == "command"
+        ) if isinstance(value.get("hooks"), dict) else False
+        owned, ownership_error = _owned_legacy_script(
+            project_root, script_path, "codex" if index == 0 else "claude"
+        ) if has_reference else (False, None)
+        if has_reference and not owned:
+            errors.append(_issue(script_path, ValueError(ownership_error or "unowned script")))
         try:
-            document_managed, document_custom = _hook_entry_counts(value)
+            document_managed, document_custom = _hook_entry_counts(
+                value, owned_script=owned
+            )
         except ValueError as error:
             errors.append(_issue(document_path, error))
             documents.append({"path": str(document_path), "status": "invalid"})
@@ -394,19 +475,44 @@ def apply_legacy_hooks(
     for preview in previews:
         project_root = pathlib.Path(str(preview["root"]))
         with _project_lock(project_root):
+            snapshots = _snapshot_legacy_files(project_root)
             before_digest = _legacy_state_digest(project_root)
-            cleanup = _archive_project_legacy_hooks(project_root, stamp=stamp)
-            after_digest = _legacy_state_digest(project_root)
-            result_status = "applied" if cleanup["changed_paths"] else "unchanged"
-            audit = _write_migration_audit(
-                project_root,
-                stamp,
-                before_digest=before_digest,
-                after_digest=after_digest,
-                changed_paths=cleanup["changed_paths"],
-                backups=cleanup["backups"],
-                result=result_status,
-            )
+            cleanup: dict[str, Any] = {
+                "backups": [], "changed_paths": [], "removed_handlers": 0
+            }
+            try:
+                cleanup = _archive_project_legacy_hooks(project_root, stamp=stamp)
+                after_digest = _legacy_state_digest(project_root)
+                result_status = "applied" if cleanup["changed_paths"] else "unchanged"
+                audit = _write_migration_audit(
+                    project_root,
+                    stamp,
+                    before_digest=before_digest,
+                    after_digest=after_digest,
+                    changed_paths=cleanup["changed_paths"],
+                    backups=cleanup["backups"],
+                    result=result_status,
+                )
+            except BaseException:
+                transaction_backups = [
+                    str(path)
+                    for path in project_root.rglob(f"*.bak.{stamp}*")
+                    if path.is_file() and not path.is_symlink()
+                ]
+                _restore_legacy_snapshot(snapshots, transaction_backups)
+                try:
+                    _write_migration_audit(
+                        project_root,
+                        stamp,
+                        before_digest=before_digest,
+                        after_digest=_legacy_state_digest(project_root),
+                        changed_paths=[],
+                        backups=[],
+                        result="failed",
+                    )
+                except Exception:
+                    pass
+                raise
         results.append(
             {
                 **preview,
@@ -463,14 +569,42 @@ def _archive_project_legacy_hooks(
     }
 
 
-def remove_managed_legacy_hooks(project_root: pathlib.Path) -> dict[str, Any]:
-    """Back up and detach only manager-owned project memory hook assets."""
+def prepare_legacy_hook_cleanup(project_root: pathlib.Path) -> dict[str, Any]:
+    """Validate ownership and capture the active legacy-hook state."""
     root = pathlib.Path(project_root).expanduser().resolve()
     if not root.is_dir():
-        return {"backups": [], "changed_paths": [], "removed_handlers": 0}
+        raise ValueError(f"project root is not a directory: {root}")
+    with _project_lock(root):
+        preview = _legacy_hook_preview_for_project(root)
+        if preview["errors"]:
+            first = preview["errors"][0]
+            raise ValueError(f"legacy hook cleanup preflight failed: {first['path']}: {first['error']}")
+        snapshots = _snapshot_legacy_files(root)
+    return {"root": root, "snapshots": snapshots}
+
+
+def execute_legacy_hook_cleanup(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Execute one prepared cleanup and restore the active state on failure."""
+    root = pathlib.Path(plan["root"])
+    snapshots = plan["snapshots"]
     stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     with _project_lock(root):
-        return _archive_project_legacy_hooks(root, stamp=stamp)
+        if _snapshot_legacy_files(root) != snapshots:
+            raise ValueError("legacy hook state changed after preflight")
+        try:
+            return _archive_project_legacy_hooks(root, stamp=stamp)
+        except BaseException:
+            transaction_backups = [
+                str(path)
+                for path in root.rglob(f"*.bak.{stamp}*")
+                if path.is_file() and not path.is_symlink()
+            ]
+            _restore_legacy_snapshot(snapshots, transaction_backups)
+            raise
+
+
+def remove_managed_legacy_hooks(project_root: pathlib.Path) -> dict[str, Any]:
+    return execute_legacy_hook_cleanup(prepare_legacy_hook_cleanup(project_root))
 
 
 def _registry_projects(registry: Mapping[str, object]) -> list[dict[str, Any]]:

@@ -745,7 +745,10 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         memory.write_text("approved memory\n", encoding="utf-8")
         script = project / ".codex/hooks/shared_memory_hook.py"
         script.parent.mkdir(parents=True)
-        script.write_text("# managed legacy hook\n", encoding="utf-8")
+        script.write_text(
+            vibe_memory_cli.memory_project.hook_script(project, "codex"),
+            encoding="utf-8",
+        )
         settings = project / ".codex/hooks.json"
         settings.write_text(json.dumps({
             "custom_text": "keep me",
@@ -778,6 +781,44 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertNotIn(".codex/hooks/shared_memory_hook.py", current)
         self.assertFalse(script.exists())
         self.assertTrue(result["legacy_hook_backups"])
+
+    def test_unregister_registry_write_failure_leaves_hooks_unchanged(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "legacy"
+        project.mkdir()
+        script = project / ".codex/hooks/shared_memory_hook.py"
+        script.parent.mkdir(parents=True)
+        script.write_text(
+            vibe_memory_cli.memory_project.hook_script(project, "codex"), encoding="utf-8"
+        )
+        settings = project / ".codex/hooks.json"
+        settings.write_text(vibe_memory_cli.memory_project.codex_hooks_json(), encoding="utf-8")
+        with mock.patch.object(vibe_memory_cli.memory_project, "REGISTRY_PATH", self.paths.project_registry):
+            vibe_memory_cli.memory_project.register_project(project)
+            before_registry = self.paths.project_registry.read_bytes()
+            with mock.patch.object(
+                vibe_memory_cli.memory_project, "_write_registry_at", side_effect=OSError("registry write")
+            ):
+                code, _output, _stderr = self.invoke(["project", "unregister", str(project)])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.paths.project_registry.read_bytes(), before_registry)
+        self.assertTrue(script.exists())
+        self.assertIn("shared_memory_hook.py", settings.read_text(encoding="utf-8"))
+
+    def test_unregister_cleanup_failure_restores_registry_and_hooks(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "legacy"
+        project.mkdir()
+        with mock.patch.object(vibe_memory_cli.memory_project, "REGISTRY_PATH", self.paths.project_registry):
+            vibe_memory_cli.memory_project.register_project(project)
+            before = self.paths.project_registry.read_bytes()
+            with mock.patch(
+                "vibe_memory_migration.execute_legacy_hook_cleanup",
+                side_effect=OSError("cleanup failure"),
+            ):
+                code, _output, _stderr = self.invoke(["project", "unregister", str(project)])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.paths.project_registry.read_bytes(), before)
 
     def test_memory_commands_delegate_to_review_apis(self) -> None:
         candidate = {"id": "candidate-1", "status": "pending", "scope": "personal", "target": "personal_long", "risk_flags": [], "summary": "summary", "content": "content"}
