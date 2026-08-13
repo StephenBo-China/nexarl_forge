@@ -1419,7 +1419,9 @@ def _read_launch_agent_template() -> str:
     return _LAUNCH_AGENT_TEMPLATE.read_text(encoding="utf-8")
 
 
-def _validate_launch_agent(plist: object, runtime: str, port: int) -> None:
+def _validate_launch_agent(
+    plist: object, runtime: str, port: int, *, run_at_load: bool = True
+) -> None:
     if not isinstance(plist, dict):
         raise ValueError("launch agent template must contain a dictionary")
     python_executable = plist.get("ProgramArguments", [None])[0] if isinstance(plist, dict) else None
@@ -1442,7 +1444,10 @@ def _validate_launch_agent(plist: object, runtime: str, port: int) -> None:
         raise ValueError("launch agent ProgramArguments are invalid")
     if plist.get("EnvironmentVariables") != expected_environment:
         raise ValueError("launch agent environment is invalid")
-    if plist.get("KeepAlive") is not True or plist.get("RunAtLoad") is not True:
+    if (
+        plist.get("KeepAlive") is not True
+        or plist.get("RunAtLoad") is not run_at_load
+    ):
         raise ValueError("launch agent lifecycle settings are invalid")
 
 
@@ -1473,6 +1478,7 @@ def render_launch_agent(
     port: int = 8897,
     *,
     python_executable: str | os.PathLike[str] | None = None,
+    run_at_load: bool = True,
 ) -> str:
     """Render and validate the loopback-only LaunchAgent property list."""
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
@@ -1489,7 +1495,10 @@ def render_launch_agent(
         plist = plistlib.loads(rendered.encode("utf-8"))
     except Exception as error:
         raise ValueError("rendered launch agent is not a valid plist") from error
-    _validate_launch_agent(plist, runtime, port)
+    if not run_at_load:
+        plist["RunAtLoad"] = False
+        rendered = plistlib.dumps(plist, fmt=plistlib.FMT_XML).decode("utf-8")
+    _validate_launch_agent(plist, runtime, port, run_at_load=run_at_load)
     return rendered
 
 
@@ -2789,18 +2798,24 @@ def _unlink_regular_file(path: pathlib.Path) -> bool:
     return True
 
 
-def _remove_explicit_data_path(path: pathlib.Path, allowed: set[pathlib.Path]) -> None:
-    resolved = path.expanduser().resolve()
-    if resolved not in allowed:
-        raise InstallError(f"data deletion path is not an approved managed path: {resolved}")
-    if not resolved.exists():
-        return
-    if resolved.is_symlink():
-        raise InstallError(f"data deletion refuses symlink: {resolved}")
-    if resolved.is_dir():
-        shutil.rmtree(resolved)
-    else:
-        resolved.unlink()
+def _validate_explicit_data_paths(
+    data_paths: list[pathlib.Path], allowed: set[pathlib.Path]
+) -> list[pathlib.Path]:
+    validated: list[pathlib.Path] = []
+    for raw_path in data_paths:
+        candidate = pathlib.Path(raw_path).expanduser().absolute()
+        if candidate.is_symlink():
+            raise InstallError(f"data deletion refuses symlink: {candidate}")
+        if candidate.exists() and not candidate.is_file():
+            raise InstallError(
+                f"data deletion path must be a regular file: {candidate}"
+            )
+        if candidate not in allowed:
+            raise InstallError(
+                f"data deletion path is not an approved managed file: {candidate}"
+            )
+        validated.append(candidate)
+    return validated
 
 
 def uninstall(
@@ -2816,6 +2831,12 @@ def uninstall(
         raise InstallError(
             "data deletion requires --approved-data-deletion and explicit managed data paths"
         )
+    allowed_data_files = {pathlib.Path(paths.project_registry).absolute()}
+    validated_data_paths = (
+        _validate_explicit_data_paths(data_paths or [], allowed_data_files)
+        if remove_data
+        else []
+    )
     import vibe_memory_hooks
 
     removed: list[str] = []
@@ -2864,15 +2885,9 @@ def uninstall(
         removed.append(str(release))
     deleted_data: list[str] = []
     if remove_data:
-        allowed = {
-            pathlib.Path(paths.personal_memory).resolve(),
-            pathlib.Path(paths.project_registry).resolve(),
-            pathlib.Path(paths.ui_design_home).resolve(),
-            pathlib.Path(paths.worktree_manager).resolve(),
-        }
-        for raw_path in data_paths or []:
-            _remove_explicit_data_path(pathlib.Path(raw_path), allowed)
-            deleted_data.append(str(pathlib.Path(raw_path).expanduser().resolve()))
+        for data_path in validated_data_paths:
+            data_path.unlink(missing_ok=True)
+            deleted_data.append(str(data_path))
     return {
         "status": "uninstalled",
         "removed": removed,

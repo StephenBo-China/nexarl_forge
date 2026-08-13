@@ -6,6 +6,7 @@ import io
 import json
 import os
 import pathlib
+import plistlib
 import shlex
 import shutil
 import stat
@@ -860,7 +861,13 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
     def test_migrate_preview_delegates_to_legacy_hook_migration(self) -> None:
         project = pathlib.Path(self.temporary.name) / "project"
         project.mkdir()
-        expected = [{"root": str(project.resolve()), "managed_entries": 5, "custom_entries": 1}]
+        expected = [{
+            "root": str(project.resolve()),
+            "status": "preview",
+            "managed_entries": 5,
+            "custom_entries": 1,
+            "errors": [],
+        }]
         registry = self.paths.project_registry
         registry.parent.mkdir(parents=True, exist_ok=True)
         registry.write_text(json.dumps({
@@ -969,6 +976,61 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, [])
         preview.assert_called_once_with([alias.absolute()], paths=self.paths)
+
+    def test_migrate_preview_prints_errors_and_returns_nonzero(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+        expected = [{
+            "root": str(project),
+            "status": "error",
+            "errors": [{"error": "ownership conflict"}],
+        }]
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.preview_legacy_hooks",
+            return_value=expected,
+        ):
+            code, output, _ = self.invoke([
+                "migrate", "preview", "--project-root", str(project)
+            ])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(output, expected)
+
+    def test_start_recreates_manual_launch_agent_without_changing_settings(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent",
+            return_value={"changed": True},
+        ) as install_plist, mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            return_value={"status": "healthy"},
+        ) as activate:
+            code, output, stderr = self.invoke(["start"])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "healthy")
+        plist = install_plist.call_args.args[1]
+        self.assertFalse(plistlib.loads(plist.encode("utf-8"))["RunAtLoad"])
+        activate.assert_called_once_with(self.paths, expected_version="1.0.0")
+        self.assertFalse(
+            vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)[
+                "start_at_login"
+            ]
+        )
 
     def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
         with mock.patch(

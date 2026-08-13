@@ -29,7 +29,12 @@ cd vibe_coding_manage_platform
 LaunchAgent `com.noema.vibe-memory`，最后运行 doctor。无关 hooks 不会被覆盖；
 受管文件变化前会创建带时间戳备份。安装完成后可移动或删除源码 clone。
 
-若新终端找不到 `vibe-memory`，请把 `~/.local/bin` 加入 `PATH`。
+若 zsh 新终端找不到 `vibe-memory`，执行：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+source "$HOME/.zshrc"
+```
 
 ## 2. 首次运行选项
 
@@ -46,13 +51,20 @@ workspace。三类正式记忆——个人长期、个人短期、项目长期�
 session，让客户端重新加载并信任用户级配置。旧会话继续可用，但不能作为 hook
 已加载的验证证据。
 
+若关闭“登录时启动”，首次设置完成后服务会停止。需要使用时显式启动当前登录
+会话，且不会改变该持久偏好：
+
+```bash
+vibe-memory start && vibe-memory open
+```
+
 ## 3. 注册与初始化项目边界
 
 workspace 可以是代码仓库，也可以是普通目录：
 
 ```bash
-vibe-memory project register /path/to/workspace
-vibe-memory project init /path/to/workspace
+vibe-memory project register "/path/to/workspace"
+vibe-memory project init "/path/to/workspace"
 vibe-memory project list
 ```
 
@@ -67,7 +79,7 @@ vibe-memory project list
 注销项目只移除注册与受管说明，不删除项目记忆：
 
 ```bash
-vibe-memory project unregister /path/to/workspace
+vibe-memory project unregister "/path/to/workspace"
 ```
 
 ## 4. 旧安装迁移：先预览，再批准
@@ -76,8 +88,8 @@ vibe-memory project unregister /path/to/workspace
 项目根：
 
 ```bash
-vibe-memory migrate preview --project-root /path/to/workspace
-vibe-memory migrate apply --approved --project-root /path/to/workspace
+vibe-memory migrate preview --project-root "/path/to/workspace"
+vibe-memory migrate apply --approved --project-root "/path/to/workspace"
 vibe-memory doctor
 ```
 
@@ -87,7 +99,9 @@ preferences、UI design approval、UI Skills、Loop、policy 以及旧 Codex/Cla
 root、before/after digest、changed paths、backups 与 result 的审计信息。
 
 `partial` 或 `failed` 会返回非零状态。按输出定位失败的控制面区域或备份，不要
-盲目重试；修正后重新 preview，再显式 apply。
+盲目重试；修正后重新 preview，再显式 apply。必须同时检查 preview JSON 和退出码：
+任何项目 `error`、无效 preflight 或非 clean 结果都会返回非零，但仍完整打印 JSON
+诊断。
 
 ## 5. Hook 与模型各自负责什么
 
@@ -189,9 +203,9 @@ plane。全部健康时各区域为 `ok/current/healthy/ready`，命令返回 0�
 更新源必须是已审核的本地 clone：
 
 ```bash
-cd /path/to/local/clone
+cd "/path/to/local/clone"
 git pull --ff-only
-vibe-memory update --source-root /path/to/local/clone
+vibe-memory update --source-root "/path/to/local/clone"
 vibe-memory doctor
 ```
 
@@ -237,17 +251,18 @@ backups。
 
 ```bash
 vibe-memory uninstall --remove-data --approved-data-deletion \
-  --data-path "$HOME/.codex/personal_memory" \
-  --data-path "$HOME/.codex/memory_review"
+  --data-path "$HOME/.codex/memory_review/projects.json"
 ```
 
-工具不会推断要删除的项目目录。执行前逐项核对路径；若只想重装，请使用默认
-卸载，不要删除数据。
+每个 `--data-path` 必须是 allowlist 中精确的受管 regular file，cannot be a directory，
+也不能是 symlink。工具会在停服务或修改 hooks/runtime 前完整验证所有
+目标，不会推断要删除的项目目录。若只想重装，请使用默认卸载，不要删除数据。
 
 ## 15. 服务与 LaunchAgent 故障排查
 
 1. `vibe-memory doctor --json` 查看是 runtime、service、hook 还是 control plane。
-2. `vibe-memory repair` 修复受管安装并重新加载 LaunchAgent。
+2. 若关闭登录启动，先运行 `vibe-memory start && vibe-memory open`；否则运行
+   `vibe-memory repair` 修复受管安装并重新加载 LaunchAgent。
 3. `vibe-memory hooks status` 检查两个客户端；需要时运行 hooks repair。
 4. 若端口被占用，停止错误监听者或使用空闲回环端口重新安装/修复；`open` 会
    拒绝连接身份或版本不匹配的服务。

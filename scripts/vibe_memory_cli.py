@@ -621,6 +621,14 @@ def migrate_command(args: argparse.Namespace) -> int:
             raise LifecycleError("migrate apply requires --approved")
         value = vibe_memory_migration.apply_legacy_hooks(roots, paths=paths)
     _json(value)
+    if args.migrate_command == "preview":
+        clean = isinstance(value, list) and all(
+            isinstance(project, dict)
+            and project.get("status") == "preview"
+            and not project.get("errors")
+            for project in value
+        )
+        return 0 if clean else 1
     return 1 if isinstance(value, dict) and value.get("status") in {"partial", "failed"} else 0
 
 
@@ -637,6 +645,30 @@ def rollback_command(_args: argparse.Namespace) -> int:
 
 def repair_command(_args: argparse.Namespace) -> int:
     _json(vibe_memory_install.repair(vibe_memory_paths.for_home()))
+    return 0
+
+
+def start_command(_args: argparse.Namespace) -> int:
+    paths = vibe_memory_paths.for_home()
+    runtime = vibe_memory_install.read_runtime_config(paths)
+    version = runtime.get("app_version")
+    port = runtime.get("port")
+    python_executable = runtime.get("python_executable")
+    if not isinstance(version, str) or not isinstance(port, int) or not isinstance(
+        python_executable, str
+    ):
+        raise LifecycleError("runtime configuration is incomplete")
+    plist = vibe_memory_install.render_launch_agent(
+        paths,
+        port=port,
+        python_executable=python_executable,
+        run_at_load=False,
+    )
+    vibe_memory_install.install_launch_agent(paths, plist)
+    result = vibe_memory_install.activate_launch_agent(
+        paths, expected_version=version
+    )
+    _json(result)
     return 0
 
 
@@ -774,6 +806,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     repair = subcommands.add_parser("repair", help="Repair managed runtime assets")
     repair.set_defaults(command_handler=repair_command)
+
+    start = subcommands.add_parser("start", help="Start the service for this login session")
+    start.set_defaults(command_handler=start_command)
 
     uninstall = subcommands.add_parser("uninstall", help="Remove the managed runtime")
     uninstall.add_argument("--remove-data", action="store_true")

@@ -35,7 +35,13 @@ installs `~/Library/LaunchAgents/com.noema.vibe-memory.plist`, starts the local
 service, and runs `vibe-memory doctor`. Unrelated hooks are preserved and
 changed managed files receive timestamped backups.
 
-If `vibe-memory` is not found in a new shell, add `~/.local/bin` to `PATH`.
+If `vibe-memory` is not found in zsh, add `~/.local/bin` to `PATH` and reload
+the shell configuration:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+source "$HOME/.zshrc"
+```
 
 ## Complete first run
 
@@ -60,14 +66,21 @@ After installing or repairing hooks, close existing clients and start a fresh
 Codex or Claude Code session so the client reloads and trusts the new user-hook
 configuration.
 
+If you disable login startup, the LaunchAgent remains stopped after first run.
+Start it only for the current login session, without changing that preference:
+
+```bash
+vibe-memory start && vibe-memory open
+```
+
 ## Register and initialize a workspace
 
 A workspace may be a code repository or any other directory. Registration and
 initialization are deliberately separate:
 
 ```bash
-vibe-memory project register /path/to/workspace
-vibe-memory project init /path/to/workspace
+vibe-memory project register "/path/to/workspace"
+vibe-memory project init "/path/to/workspace"
 vibe-memory project list
 ```
 
@@ -87,8 +100,8 @@ Register every target first. Preview is read-only; apply requires the explicit
 approval flag and an explicit registered root:
 
 ```bash
-vibe-memory migrate preview --project-root /path/to/workspace
-vibe-memory migrate apply --approved --project-root /path/to/workspace
+vibe-memory migrate preview --project-root "/path/to/workspace"
+vibe-memory migrate apply --approved --project-root "/path/to/workspace"
 vibe-memory doctor
 ```
 
@@ -97,7 +110,9 @@ approval data, UI Skills, Loop configuration, and policy data. It removes only
 recognized legacy project-hook entries, preserves unrelated client config, and
 writes timestamped backups plus an audit result. A partial or failed result is
 non-zero; inspect the reported root, changed paths, backup paths, and failed
-control-plane areas before retrying.
+control-plane areas before retrying. Always inspect both the preview JSON and
+its exit status: any project `error`, invalid preflight, or non-clean preview
+returns non-zero even though the complete diagnostic JSON is still printed.
 
 ## Memory behavior and governance
 
@@ -167,9 +182,9 @@ never substituted for deterministic tests.
 Updates come from an already reviewed local clone:
 
 ```bash
-cd /path/to/local/clone
+cd "/path/to/local/clone"
 git pull --ff-only
-vibe-memory update --source-root /path/to/local/clone
+vibe-memory update --source-root "/path/to/local/clone"
 vibe-memory doctor
 ```
 
@@ -215,12 +230,13 @@ managed target; review the paths before running it:
 
 ```bash
 vibe-memory uninstall --remove-data --approved-data-deletion \
-  --data-path "$HOME/.codex/personal_memory" \
-  --data-path "$HOME/.codex/memory_review"
+  --data-path "$HOME/.codex/memory_review/projects.json"
 ```
 
-Project data is never inferred for deletion. Omitting `--remove-data` is the
-recommended, recoverable uninstall.
+Each `--data-path` must be an allowlisted exact managed regular file; it cannot be a directory
+or symlink. All targets are validated before the service is
+stopped or any hook/runtime asset is changed. Project data is never inferred
+for deletion. Omitting `--remove-data` is the recommended, recoverable uninstall.
 
 ## Troubleshooting
 
@@ -232,8 +248,9 @@ vibe-memory doctor --json
 vibe-memory hooks status
 ```
 
-- **Service or LaunchAgent unavailable:** run `vibe-memory repair`, then
-  `vibe-memory doctor`. Check
+- **Service or LaunchAgent unavailable:** if login startup is disabled, run
+  `vibe-memory start && vibe-memory open`. Otherwise run `vibe-memory repair`,
+  then `vibe-memory doctor`. Check
   `~/Library/Logs/VibeMemory/` and the LaunchAgent status if it remains down.
 - **Port conflict:** stop the unexpected listener or reinstall/repair with a
   free loopback port. `vibe-memory open` refuses an unhealthy or wrong service.

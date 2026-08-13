@@ -926,18 +926,20 @@ class UIDesignServerTest(unittest.TestCase):
             "./install.sh",
             "./install.sh --with-claude-hooks",
             "vibe-memory open",
-            "vibe-memory project register /path/to/workspace",
-            "vibe-memory project init /path/to/workspace",
-            "vibe-memory migrate preview --project-root /path/to/workspace",
-            "vibe-memory migrate apply --approved --project-root /path/to/workspace",
+            'vibe-memory project register "/path/to/workspace"',
+            'vibe-memory project init "/path/to/workspace"',
+            'vibe-memory migrate preview --project-root "/path/to/workspace"',
+            'vibe-memory migrate apply --approved --project-root "/path/to/workspace"',
             "vibe-memory doctor",
-            "vibe-memory update --source-root /path/to/local/clone",
+            'vibe-memory update --source-root "/path/to/local/clone"',
             "vibe-memory rollback",
             "vibe-memory repair",
+            "vibe-memory start",
             "vibe-memory hooks status",
             "vibe-memory hooks repair",
             "vibe-memory uninstall",
             "--approved-data-deletion",
+            '--data-path "$HOME/.codex/memory_review/projects.json"',
         )
         required_contracts = (
             "Python 3.10+",
@@ -967,6 +969,16 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertIn("real Darwin installed-runtime E2E", release)
         self.assertIn("Claude Code evaluation", release)
         self.assertIn("release reports", release)
+        self.assertIn("preview exit status", release)
+
+        for path in user_docs:
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("cannot be a directory", text)
+            self.assertIn("vibe-memory start && vibe-memory open", text)
+            self.assertIn(
+                "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> \"$HOME/.zshrc\"",
+                text,
+            )
 
         for path in (*user_docs, ROOT / "docs/RELEASE_CHECKLIST.md"):
             text = path.read_text(encoding="utf-8")

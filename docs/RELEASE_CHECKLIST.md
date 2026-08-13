@@ -14,11 +14,12 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
   candidate checks, retention, login startup, port, and optional workspace.
 - [ ] In fresh Codex and Claude Code sessions, approve/trust the installed user
   configuration and prove the managed hooks—not source-tree shortcuts—run.
-- [ ] Run `vibe-memory project register /path/to/workspace`, then
-  `vibe-memory project init /path/to/workspace`; prove init creates no project
+- [ ] Run `vibe-memory project register "/path/to/workspace"`, then
+  `vibe-memory project init "/path/to/workspace"`; prove init creates no project
   hooks and an unregistered cwd remains personal-only.
-- [ ] Run `vibe-memory migrate preview --project-root /path/to/workspace`, then
-  `vibe-memory migrate apply --approved --project-root /path/to/workspace` on a
+- [ ] Run `vibe-memory migrate preview --project-root "/path/to/workspace"`,
+  require clean JSON and zero preview exit status, then run
+  `vibe-memory migrate apply --approved --project-root "/path/to/workspace"` on a
   registered legacy fixture; audit backups and changed paths.
 - [ ] Exercise pending/active memory, projects, design preferences, UI design
   approval, UI Skills, Loop, and policy in the installed review console.
@@ -29,17 +30,23 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
 - [ ] Run `vibe-memory doctor` and require all runtime, hooks, service, data,
   and control-plane areas healthy.
 - [ ] From a reviewed clone run
-  `vibe-memory update --source-root /path/to/local/clone`, then test
+  `vibe-memory update --source-root "/path/to/local/clone"`, then test
   `vibe-memory rollback` without losing post-update data.
 - [ ] Run `vibe-memory repair`, `vibe-memory hooks status`, and
   `vibe-memory hooks repair`; verify LaunchAgent recovery and fresh-client
   restart behavior.
+- [ ] With login startup disabled, run
+  `vibe-memory start && vibe-memory open`; prove it recreates a manual
+  `RunAtLoad=false` plist, starts a healthy current service, and does not change
+  the persisted preference.
 - [ ] Run `vibe-memory uninstall`; prove runtime, launcher, LaunchAgent, and
   managed hooks are removed while memories, review/audit state, projects,
   design state, UI Skills, Loop state, logs, and backups remain.
 - [ ] Separately verify data deletion is refused unless `--remove-data`,
-  `--approved-data-deletion`, and explicit managed `--data-path` values are all
-  supplied.
+  `--approved-data-deletion`, and the exact allowlisted regular-file target
+  `--data-path "$HOME/.codex/memory_review/projects.json"` are all supplied.
+  Reject every directory, symlink, unknown path, or invalid batch before
+  bootout or any hook/runtime mutation.
 
 ## Automated release evidence
 

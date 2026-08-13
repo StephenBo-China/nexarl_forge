@@ -2456,6 +2456,58 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertIn("custom-hook", text)
             self.assertNotIn("vibe-memory hook", text)
 
+    def test_uninstall_rejects_directory_data_target_before_any_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            memory = paths.personal_memory / "long.md"
+            memory.parent.mkdir(parents=True)
+            memory.write_text("keep\n", encoding="utf-8")
+            current = paths.install_root / "current"
+            current.parent.mkdir(parents=True)
+            current.write_text("runtime sentinel\n", encoding="utf-8")
+            with mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ) as bootout, mock.patch("vibe_memory_hooks.uninstall") as hooks:
+                with self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, "regular file"
+                ):
+                    vibe_memory_install.uninstall(
+                        paths,
+                        remove_data=True,
+                        approved_data_deletion=True,
+                        data_paths=[paths.personal_memory],
+                    )
+
+            bootout.assert_not_called()
+            hooks.assert_not_called()
+            self.assertEqual(memory.read_text(encoding="utf-8"), "keep\n")
+            self.assertEqual(current.read_text(encoding="utf-8"), "runtime sentinel\n")
+
+    def test_uninstall_rejects_symlink_data_target_before_any_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            target = paths.project_registry
+            target.parent.mkdir(parents=True)
+            outside = pathlib.Path(value) / "outside.json"
+            outside.write_text("keep\n", encoding="utf-8")
+            target.symlink_to(outside)
+            with mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ) as bootout, mock.patch("vibe_memory_hooks.uninstall") as hooks:
+                with self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, "symlink"
+                ):
+                    vibe_memory_install.uninstall(
+                        paths,
+                        remove_data=True,
+                        approved_data_deletion=True,
+                        data_paths=[target],
+                    )
+
+            bootout.assert_not_called()
+            hooks.assert_not_called()
+            self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+
     def test_installed_launcher_runs_without_a_source_cli_path(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
