@@ -2801,7 +2801,11 @@ def uninstall(
             raise InstallError("current runtime target is not a managed symlink")
         current.unlink()
         removed.append(str(current))
-    for path in (pathlib.Path(paths.install_root) / "config.json", install_state_path(paths)):
+    for path in (
+        pathlib.Path(paths.install_root) / "config.json",
+        install_state_path(paths),
+        pathlib.Path(paths.install_root) / "state" / "service-action.json",
+    ):
         if _unlink_regular_file(path):
             removed.append(str(path))
     for release in owned_releases:

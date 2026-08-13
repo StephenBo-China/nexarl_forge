@@ -884,12 +884,13 @@ def append_official_memory(
     path.parent.mkdir(parents=True, exist_ok=True)
     title = memory_title(item, content)
     date = _dt.datetime.now().astimezone().date().isoformat()
-    metadata = (
-        "\n<!-- vibe-memory:managed-short -->\nmanaged_by: vibe-memory\n"
-        if managed_short
-        else ""
-    )
-    entry = f"\n### {date} - {title}{metadata}\n\n{content.strip()}\n"
+    if managed_short:
+        import vibe_memory_settings
+        entry = "\n" + vibe_memory_settings.render_managed_short_envelope(
+            f"{date} - {title}", content
+        )
+    else:
+        entry = f"\n### {date} - {title}\n\n{content.strip()}\n"
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:

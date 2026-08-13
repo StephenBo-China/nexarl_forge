@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import pathlib
@@ -45,6 +46,12 @@ _MANAGED_SHORT = re.compile(
     r"(?m)^(?:<!--[ \t]*vibe-memory:managed-short[ \t]*-->|"
     r"managed_by:[ \t]*vibe-memory|vibe_memory_managed:[ \t]*true)[ \t]*$"
 )
+_ENVELOPE_BEGIN = re.compile(
+    rb"(?m)^(#{2,3})[ \t]+([^\n]+)\n"
+    rb"<!--[ \t]*vibe-memory:short:begin length=(\d+) sha256=([0-9a-f]{64})"
+    rb"(?: expires_on=(\d{4}-\d{2}-\d{2}))?[ \t]*-->\n"
+)
+_ENVELOPE_END = b"\n<!-- vibe-memory:short:end -->\n"
 _FIRST_RUN_KEYS = {
     "codex_hooks",
     "claude_hooks",
@@ -238,6 +245,20 @@ def _write_all(descriptor: int, content: bytes) -> None:
         offset += written
 
 
+def render_managed_short_envelope(
+    title: str, content: str, *, expires_on: dt.date | None = None
+) -> str:
+    safe_title = str(title).replace("\n", " ").strip() or "Approved short memory"
+    body = content.strip().encode("utf-8")
+    expiry = f" expires_on={expires_on.isoformat()}" if expires_on else ""
+    return (
+        f"### {safe_title}\n"
+        f"<!-- vibe-memory:short:begin length={len(body)} sha256={hashlib.sha256(body).hexdigest()}{expiry} -->\n"
+        + body.decode("utf-8")
+        + _ENVELOPE_END.decode("ascii")
+    )
+
+
 def _atomic_write_text(path: pathlib.Path, content: str, mode: int) -> None:
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = pathlib.Path(temporary_name)
@@ -314,17 +335,76 @@ def prune_personal_short(
     cutoff = today or dt.date.today()
     removed: list[str] = []
 
+    # New approvals use a byte-length/digest envelope. Parse these before the
+    # legacy format so Markdown headings or marker-looking body text are inert.
+    envelope_changed = False
+    chunks: list[bytes] = []
+    cursor = 0
+    search = 0
+    while True:
+        match = _ENVELOPE_BEGIN.search(source, search)
+        if match is None:
+            break
+        length = int(match.group(3))
+        body_start = match.end()
+        body_end = body_start + length
+        end_end = body_end + len(_ENVELOPE_END)
+        if body_end > len(source) or source[body_end:end_end] != _ENVELOPE_END:
+            raise ValueError("malformed managed short envelope")
+        body = source[body_start:body_end]
+        if hashlib.sha256(body).hexdigest().encode() != match.group(4):
+            raise ValueError("malformed managed short envelope digest")
+        expiry_raw = match.group(5)
+        if expiry_raw is not None:
+            try:
+                expiry = dt.date.fromisoformat(expiry_raw.decode("ascii"))
+            except ValueError as error:
+                raise ValueError("malformed managed short expiry") from error
+        else:
+            expiry = None
+        title = match.group(2).decode("utf-8").strip()
+        remove = retention_days == 0 or (expiry is not None and expiry < cutoff)
+        chunks.append(source[cursor:match.start()])
+        if remove:
+            removed.append(title)
+            envelope_changed = True
+        else:
+            record = source[match.start():end_end]
+            if expiry is None:
+                expected = cutoff + dt.timedelta(days=retention_days)
+                header_end = match.end() - 5
+                record = source[match.start():header_end] + f" expires_on={expected.isoformat()}".encode() + source[header_end:end_end]
+                envelope_changed = True
+            chunks.append(record)
+        cursor = end_end
+        search = end_end
+    if cursor:
+        chunks.append(source[cursor:])
+        source_after_envelopes = b"".join(chunks)
+        if envelope_changed:
+            mode = 0o600
+            _backup_source(target, source, mode)
+            _atomic_write_text(target, source_after_envelopes.decode("utf-8"), mode)
+        return removed
+    if b"vibe-memory:short:begin" in source or b"vibe-memory:short:end" in source:
+        raise ValueError("malformed managed short envelope")
+
     changed = False
     def retain_or_remove(match: re.Match[str]) -> str:
         nonlocal changed
         section = match.group(0)
-        if _MANAGED_SHORT.search(section) is None:
+        header_end = section.find("\n") + 1
+        metadata_prefix = section[header_end:]
+        marker = _MANAGED_SHORT.match(metadata_prefix.lstrip("\n"))
+        if marker is None:
             return section
         if retention_days == 0:
             changed = True
             removed.append(match.group(1).strip())
             return ""
         expiry_match = _EXPIRY.search(section)
+        if expiry_match is None and _ANY_EXPIRY.search(section):
+            raise ValueError("malformed managed short expiry")
         expected_expiry = cutoff + dt.timedelta(days=retention_days)
         try:
             expiry = dt.date.fromisoformat(expiry_match.group(1)) if expiry_match else None
@@ -336,12 +416,11 @@ def prune_personal_short(
             return ""
         if expiry is None:
             replacement = f"expires_on: {expected_expiry.isoformat()}\n"
-            marker = _MANAGED_SHORT.search(section)
-            assert marker is not None
+            absolute_marker_end = header_end + len(metadata_prefix) - len(metadata_prefix.lstrip("\n")) + marker.end()
             if _ANY_EXPIRY.search(section):
                 section = _ANY_EXPIRY.sub(replacement, section, count=1)
             else:
-                section = section[:marker.end()] + "\n" + replacement + section[marker.end():].lstrip("\n")
+                section = section[:absolute_marker_end] + "\n" + replacement + section[absolute_marker_end:].lstrip("\n")
             changed = True
             return section
         return section
@@ -390,9 +469,24 @@ def apply_first_run(
             for path in _transaction_paths(paths)
         }
         written: dict[pathlib.Path, object] = {}
+        uncertain_paths: set[pathlib.Path] = set()
+        def run_write(operation: Callable[[], object], affected: list[pathlib.Path]) -> object:
+            try:
+                result = operation()
+            except Exception:
+                # A callee may atomically write and then raise. We cannot prove
+                # ownership of the current bytes, so preserve them on rollback.
+                uncertain_paths.update(affected)
+                raise
+            for affected_path in affected:
+                written[affected_path] = vibe_memory_install._snapshot_regular_file(affected_path)
+            return result
         try:
-            saved = save_settings(paths, selected)
-            reconcile_hooks(paths, saved)
+            config_path = _config_path(paths)
+            saved = run_write(lambda: save_settings(paths, selected), [config_path])
+            assert isinstance(saved, dict)
+            home = _home(paths)
+            run_write(lambda: reconcile_hooks(paths, saved), [home / ".codex/hooks.json", home / ".claude/settings.json"])
             state = vibe_memory_install.read_install_state(paths)
             if state:
                 state["port"] = saved["service_port"]
@@ -404,16 +498,17 @@ def apply_first_run(
                     )
                     if enabled
                 ]
-                vibe_memory_install.write_install_state(paths, state)
-            prune_personal_short(
-                pathlib.Path(paths.personal_memory) / "short.md",
-                retention_days=int(saved["personal_short_retention_days"]),
-            )
+                state_path = vibe_memory_install.install_state_path(paths)
+                run_write(lambda: vibe_memory_install.write_install_state(paths, state), [state_path])
+            short_path = pathlib.Path(paths.personal_memory) / "short.md"
+            run_write(lambda: prune_personal_short(short_path, retention_days=int(saved["personal_short_retention_days"])), [short_path])
             registered = None
             workspace = normalized["workspace"]
             if isinstance(workspace, str):
-                registered = register_workspace(workspace)
-            launch = reconcile_launch_agent(paths, saved)
+                registry_path = pathlib.Path(paths.project_registry)
+                registered = run_write(lambda: register_workspace(workspace), [registry_path])
+            plist_path = pathlib.Path(paths.launch_agent)
+            launch = run_write(lambda: reconcile_launch_agent(paths, saved), [plist_path])
             if saved["start_at_login"]:
                 runtime = vibe_memory_install.read_runtime_config(paths)
                 version = runtime.get("app_version")
@@ -422,10 +517,6 @@ def apply_first_run(
                 vibe_memory_install.activate_launch_agent(
                     paths, expected_version=version
                 )
-            written = {
-                path: vibe_memory_install._snapshot_regular_file(path)
-                for path in _transaction_paths(paths)
-            }
             return {
                 "settings": saved,
                 "registered_project": registered,
@@ -439,6 +530,13 @@ def apply_first_run(
                 pass
             failed_paths: list[str] = []
             for path, snapshot in snapshots.items():
+                if path in uncertain_paths:
+                    failed_paths.append(str(path))
+                    continue
+                if path not in written:
+                    # This transaction never wrote the path. Preserve any
+                    # concurrent change instead of restoring the initial bytes.
+                    continue
                 try:
                     vibe_memory_install._restore_regular_file(
                         path, snapshot, expected_current=written.get(path, vibe_memory_install._NO_SNAPSHOT_CHECK)

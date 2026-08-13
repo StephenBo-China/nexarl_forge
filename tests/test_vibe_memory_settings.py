@@ -238,7 +238,7 @@ keep exactly
         self.assertNotIn("temporary", current)
         self.assertIn("keep exactly", current)
 
-    def test_retention_normalizes_managed_expiry_and_preserves_unmarked_text(self) -> None:
+    def test_retention_rejects_malformed_managed_expiry_and_preserves_unmarked_text(self) -> None:
         source = """# Personal Short Memory
 
 ## managed
@@ -253,11 +253,12 @@ expires_on: 2020-01-01
 keep exactly
 """
         self.short_memory.write_text(source, encoding="utf-8")
-        settings.prune_personal_short(
-            self.short_memory, today=dt.date(2026, 7, 30), retention_days=14
-        )
+        with self.assertRaisesRegex(ValueError, "malformed managed short expiry"):
+            settings.prune_personal_short(
+                self.short_memory, today=dt.date(2026, 7, 30), retention_days=14
+            )
         current = self.short_memory.read_text(encoding="utf-8")
-        self.assertIn("expires_on: 2026-08-13", current)
+        self.assertIn("expires_on: invalid", current)
         self.assertIn("## user-owned\nexpires_on: 2020-01-01\n\nkeep exactly", current)
 
     def test_first_run_failure_restores_settings_hooks_registry_plist_and_short_memory(self) -> None:
@@ -379,6 +380,41 @@ keep exactly
             settings.prune_personal_short(self.short_memory, today=dt.date(2026, 7, 16), retention_days=14),
             ["managed"],
         )
+
+    def test_post_write_failure_preserves_concurrent_config_and_reports_cas_path(self) -> None:
+        config = self.paths.install_root / "config.json"
+        concurrent = b'{"concurrent":true}\n'
+        real_save = settings.save_settings
+        def write_replace_raise(paths: object, value: object) -> object:
+            result = real_save(paths, value)
+            config.write_bytes(concurrent)
+            raise RuntimeError("post-write")
+        with mock.patch.object(settings, "save_settings", side_effect=write_replace_raise), mock.patch.object(
+            settings.vibe_memory_install, "bootout_launch_agent"
+        ):
+            with self.assertRaisesRegex(settings.FirstRunTransactionError, str(config)):
+                settings.apply_first_run(
+                    self.paths, {"start_at_login": False}, manager_source_root=ROOT,
+                    register_workspace=mock.Mock(),
+                )
+        self.assertEqual(config.read_bytes(), concurrent)
+
+    def test_managed_envelope_body_markers_and_headings_do_not_escape_record(self) -> None:
+        body = "body\n## inside\nexpires_on: 1999-01-01\n<!-- vibe-memory:short:end -->\nend"
+        envelope = settings.render_managed_short_envelope("approved", body)
+        self.short_memory.write_text("prefix\n" + envelope + "\nsuffix\n", encoding="utf-8")
+        removed = settings.prune_personal_short(
+            self.short_memory, today=dt.date(2026, 8, 13), retention_days=0
+        )
+        self.assertEqual(removed, ["approved"])
+        self.assertEqual(self.short_memory.read_text(encoding="utf-8"), "prefix\n\nsuffix\n")
+
+    def test_malformed_managed_envelope_fails_closed_without_rewrite(self) -> None:
+        malformed = "<!-- vibe-memory:short:begin length=4 sha256=" + "0" * 64 + " -->\nbody\n<!-- vibe-memory:short:end -->\n"
+        self.short_memory.write_text(malformed, encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "malformed managed short"):
+            settings.prune_personal_short(self.short_memory, retention_days=0)
+        self.assertEqual(self.short_memory.read_text(encoding="utf-8"), malformed)
 
     def test_context_omits_candidate_reminder_when_automatic_checks_are_disabled(self) -> None:
         event = NormalizedEvent(

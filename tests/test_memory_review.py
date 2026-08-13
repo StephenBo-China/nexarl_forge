@@ -873,19 +873,19 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 candidate = self._create_isolated_personal_candidate(temp, "短期偏好")
                 review.approve(candidate["id"], target="personal_short")
             text = paths["PERSONAL_SHORT"].read_text(encoding="utf-8")
-            self.assertIn("<!-- vibe-memory:managed-short -->", text)
-            self.assertIn("managed_by: vibe-memory", text)
+            self.assertIn("<!-- vibe-memory:short:begin length=", text)
+            self.assertIn("sha256=", text)
             self.assertNotIn("expires_on:", text)
             import vibe_memory_settings
             vibe_memory_settings.prune_personal_short(
                 paths["PERSONAL_SHORT"], today=_dt.date(2026, 8, 13), retention_days=14
             )
             text = paths["PERSONAL_SHORT"].read_text(encoding="utf-8")
-            self.assertIn("expires_on: 2026-08-27", text)
+            self.assertIn("expires_on=2026-08-27", text)
             vibe_memory_settings.prune_personal_short(
                 paths["PERSONAL_SHORT"], today=_dt.date(2026, 8, 28), retention_days=14
             )
-            self.assertNotIn("vibe-memory:managed-short", paths["PERSONAL_SHORT"].read_text(encoding="utf-8"))
+            self.assertNotIn("vibe-memory:short:begin", paths["PERSONAL_SHORT"].read_text(encoding="utf-8"))
 
     def test_repeated_reject_is_idempotent_and_conflicting_defer_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

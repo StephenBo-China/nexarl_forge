@@ -24,6 +24,8 @@ import ui_skill_registry
 import vibe_memory_paths
 import vibe_memory_settings
 
+MAX_JSON_BODY = 64 * 1024
+
 
 def server_address(environ: dict[str, str] | None = None) -> tuple[str, int]:
     values = os.environ if environ is None else environ
@@ -83,6 +85,41 @@ def first_run_page() -> str:
 <label class="row stack"><span>可选工作区路径</span><input name="workspace" type="text" placeholder="/path/to/workspace"></label>
 <div class="message" id="message"></div><button type="submit">保存并继续</button></form>
 <script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');location.href='/'}catch(error){msg.textContent=error.message}}</script></body></html>"""
+
+
+def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:
+    return pathlib.Path(paths.install_root) / "state" / "service-action.json"
+
+
+def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths | None = None) -> None:
+    paths = vibe_memory_paths.for_home() if paths is None else paths
+    action_path = service_action_path(paths)
+    try:
+        vibe_memory_settings.vibe_memory_install.bootout_launch_agent()
+    except Exception as error:  # Persist a retry-visible diagnostic.
+        value = {"status": "bootout_pending", "error": str(error)[:500]}
+        vibe_memory_settings.vibe_memory_install._atomic_write_private_json(action_path, value)
+    else:
+        action_path.unlink(missing_ok=True)
+
+
+def mark_bootout_pending(paths: vibe_memory_paths.RuntimePaths) -> None:
+    vibe_memory_settings.vibe_memory_install._atomic_write_private_json(
+        service_action_path(paths), {"status": "bootout_pending"}
+    )
+
+
+def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths) -> None:
+    try:
+        complete_scheduled_bootout(paths)
+    except Exception as error:  # Never leak a background traceback.
+        try:
+            vibe_memory_settings.vibe_memory_install._atomic_write_private_json(
+                service_action_path(paths),
+                {"status": "bootout_pending", "error": str(error)[:500]},
+            )
+        except Exception:
+            return
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -2470,7 +2507,28 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        host = self.headers.get("Host", "")
+        allowed_hosts = {HOST, "127.0.0.1", "localhost", "::1"}
+        host_name = host.rsplit(":", 1)[0].strip("[]") if host else ""
+        if host_name not in allowed_hosts:
+            raise ValueError("Host must be loopback")
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            if parsed_origin.scheme != "http" or parsed_origin.hostname not in allowed_hosts:
+                raise ValueError("Origin must be same-origin loopback")
+            if parsed_origin.port not in {None, PORT}:
+                raise ValueError("Origin port must match service")
+        raw_length = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Content-Length must be an integer") from error
+        if not 0 <= length <= MAX_JSON_BODY:
+            raise ValueError("JSON body exceeds 64 KiB")
         if not length:
             return {}
         raw = self.rfile.read(length).decode("utf-8")
@@ -2520,11 +2578,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/settings/first-run":
                 result = save_first_run_settings(self.read_json())
+                if result.get("bootout_after_response"):
+                    result["service_action"] = "bootout_scheduled"
+                    action_paths = vibe_memory_paths.for_home()
+                    mark_bootout_pending(action_paths)
                 self.send_json(result)
                 if result.get("bootout_after_response"):
                     threading.Thread(
-                        target=vibe_memory_settings.vibe_memory_install.bootout_launch_agent,
-                        daemon=True,
+                        target=scheduled_bootout_worker,
+                        args=(action_paths,),
+                        daemon=False,
                     ).start()
                 return
             if parsed.path == "/api/projects/register":

@@ -157,13 +157,48 @@ class UIDesignServerTest(unittest.TestCase):
         thread.start.side_effect = lambda: order.append("bootout")
         with mock.patch.object(
             server, "save_first_run_settings", return_value={"bootout_after_response": True}
+        ), mock.patch.object(
+            server, "mark_bootout_pending"
         ), mock.patch.object(server.threading, "Thread", return_value=thread) as make_thread:
             handler.do_POST()
         self.assertEqual(order, ["response", "bootout"])
         make_thread.assert_called_once_with(
-            target=server.vibe_memory_settings.vibe_memory_install.bootout_launch_agent,
-            daemon=True,
+            target=server.scheduled_bootout_worker,
+            args=(mock.ANY,),
+            daemon=False,
         )
+
+    def test_first_run_rejects_unsafe_http_metadata_before_transaction(self) -> None:
+        cases = (
+            ({"Host": "evil.example", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
+            ({"Host": "127.0.0.1:8897", "Content-Type": "text/plain", "Content-Length": "2"}, b"{}"),
+            ({"Host": "127.0.0.1:8897", "Origin": "https://evil.example", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
+            ({"Host": "127.0.0.1:8897", "Content-Type": "application/json", "Content-Length": str(65537)}, b""),
+        )
+        for headers, raw in cases:
+            with self.subTest(headers=headers):
+                handler = object.__new__(server.Handler)
+                handler.path = "/api/settings/first-run"
+                handler.headers = headers
+                handler.rfile = __import__("io").BytesIO(raw)
+                handler.send_json = mock.Mock()
+                with mock.patch.object(server, "save_first_run_settings") as save:
+                    handler.do_POST()
+                self.assertEqual(handler.send_json.call_args.kwargs["status"], 400)
+                save.assert_not_called()
+
+    def test_bootout_worker_persists_failure_and_is_non_daemon(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "worker-home")
+        settings = vibe_memory_settings.default_settings()
+        settings["start_at_login"] = False
+        vibe_memory_settings.save_settings(paths, settings)
+        with mock.patch.object(server.vibe_memory_paths, "for_home", return_value=paths), mock.patch.object(
+            server.vibe_memory_settings.vibe_memory_install, "bootout_launch_agent",
+            side_effect=RuntimeError("launchctl failed"),
+        ):
+            server.complete_scheduled_bootout()
+        persisted = json.loads(server.service_action_path(paths).read_text(encoding="utf-8"))
+        self.assertIn("launchctl failed", persisted["error"])
 
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(
