@@ -509,7 +509,11 @@ def status_command(_args: argparse.Namespace) -> int:
 def doctor_command(_args: argparse.Namespace) -> int:
     result = collect_status(vibe_memory_paths.for_home())
     paths = vibe_memory_paths.for_home()
-    control = vibe_memory_migration.validate_control_plane(paths, _registry_snapshot(paths))
+    registry = _registry_snapshot(paths)
+    registry_error = registry.pop("_diagnostic_error", None)
+    control = vibe_memory_migration.validate_control_plane(paths, registry)
+    if registry_error is not None:
+        control["projects"] = "error"
     non_ok = sorted(area for area, status in control.items() if status != "ok")
     result["control_plane"] = {
         "ok": not non_ok,
@@ -517,6 +521,8 @@ def doctor_command(_args: argparse.Namespace) -> int:
         "areas": control,
         "non_ok_areas": non_ok,
     }
+    if registry_error is not None:
+        result["control_plane"]["error"] = "project registry is malformed"
     _json(result)
     return 0 if all(result[key]["ok"] for key in (*DOCTOR_KEYS, "control_plane")) else 1
 
@@ -583,13 +589,20 @@ def _registry_snapshot(paths: vibe_memory_paths.RuntimePaths) -> dict[str, objec
         raw = paths.project_registry.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {"current_project": "", "projects": []}
-    value = json.loads(raw)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {
+            "current_project": "",
+            "projects": [],
+            "_diagnostic_error": "malformed",
+        }
     if not isinstance(value, dict):
-        raise ValueError("project registry must be an object")
+        return {"current_project": "", "projects": [], "_diagnostic_error": "invalid"}
     if not isinstance(value.get("current_project", ""), str) or not isinstance(
         value.get("projects", []), list
     ):
-        raise ValueError("project registry has an invalid structure")
+        return {"current_project": "", "projects": [], "_diagnostic_error": "invalid"}
     value.setdefault("current_project", "")
     value.setdefault("projects", [])
     return value

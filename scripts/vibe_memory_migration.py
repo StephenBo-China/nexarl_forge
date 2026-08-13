@@ -1102,6 +1102,21 @@ def inspect_projects(
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    schema_version = registry.get("schema_version", 1)
+    projects_value = registry.get("projects", [])
+    current_project = registry.get("current_project", "")
+    if schema_version != 1:
+        errors.append({"path": "projects.json", "error": "schema_version must be 1"})
+    if not isinstance(projects_value, list):
+        errors.append({"path": "projects.json", "error": "projects must be an array"})
+    else:
+        for index, record in enumerate(projects_value):
+            if not isinstance(record, dict) or not isinstance(record.get("root"), str):
+                errors.append({"path": "projects.json", "error": f"projects[{index}].root must be a string"})
+    if not isinstance(current_project, str):
+        errors.append({"path": "projects.json", "error": "current_project must be a string"})
+    elif current_project and current_project not in {str(root) for root in project_roots}:
+        errors.append({"path": "projects.json", "error": "current_project references an unregistered project"})
     for root in project_roots:
         config_path = root / ".loop" / "config.json"
         loop_summary = _json_summary(config_path)
@@ -1137,8 +1152,8 @@ def inspect_projects(
             }
         )
     return {
-        "schema_version": registry.get("schema_version", 1),
-        "current_project": registry.get("current_project", ""),
+        "schema_version": schema_version,
+        "current_project": current_project,
         "registered": len(project_roots),
         "projects": items,
         "errors": errors,
@@ -1315,6 +1330,8 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
             summary = {"path": str(path), "status": "invalid", "error": "JSON root must be an object"}
             errors.append(_issue(path, ValueError("JSON root must be an object")))
         else:
+            if value.get("schema_version") != 1:
+                errors.append(_issue(path, ValueError("approval schema_version must be 1")))
             packages = value.get("package_approvals", {})
             if not isinstance(packages, dict):
                 errors.append(_issue(path, ValueError("package_approvals must be an object")))
@@ -1333,6 +1350,9 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
                     else:
                         if package["digest"] != approval["digest"]:
                             errors.append(_issue(package_root / str(task_id), ValueError("design approval digest mismatch")))
+                idempotency = value.get("idempotency", {})
+                if not isinstance(idempotency, dict):
+                    errors.append(_issue(path, ValueError("approval idempotency must be an object")))
                 project_global = value.get("project_global_approval")
                 if project_global is not None:
                     project_global_approvals += 1
@@ -1512,8 +1532,11 @@ def inspect_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
     repositories: set[str] = set()
     for item in tasks.values():
         if not isinstance(item, dict):
+            errors.append(_issue(path, ValueError("worktree task must be an object")))
             continue
         status = str(item.get("status", "unknown"))
+        if status not in _WORKTREE_STATUSES:
+            errors.append(_issue(path, ValueError(f"unknown worktree task status: {status}")))
         status_counts[status] = status_counts.get(status, 0) + 1
         repository = item.get("repository")
         if isinstance(repository, str) and repository.strip():
@@ -1738,8 +1761,28 @@ def inspect_ui_skill_deployments(ui_design_home: pathlib.Path) -> dict[str, Any]
             if (record.get("name"), record.get("version_id")) not in packages:
                 errors.append(_issue(ui_design_home / "registry.json", ValueError(f"deployment {transaction_id} references missing package")))
             report = ui_design_home / "deployments" / f"{transaction_id}.json"
-            if not report.is_file():
+            expected_package = next(
+                (
+                    item
+                    for item in registry["packages"].get(record.get("name"), [])
+                    if isinstance(item, dict) and item.get("version_id") == record.get("version_id")
+                ),
+                None,
+            )
+            if expected_package is not None and record.get("digest") != expected_package.get("digest"):
+                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"deployment {transaction_id} digest does not match package")))
+            if report.is_symlink() or not report.is_file():
                 errors.append(_issue(report, FileNotFoundError("referenced deployment report is missing")))
+            else:
+                report_value, report_issue = _read_json(report)
+                if report_issue:
+                    errors.append(report_issue)
+                elif not isinstance(report_value, dict):
+                    errors.append(_issue(report, ValueError("deployment report must be an object")))
+                else:
+                    for field in ("transaction_id", "name", "version_id", "digest", "status"):
+                        if report_value.get(field) != record.get(field):
+                            errors.append(_issue(report, ValueError(f"deployment report {field} mismatch")))
             records.append({"transaction_id": transaction_id, **record})
     return _area({"errors": errors}, records, registry is not None and not errors)
 
@@ -1748,7 +1791,7 @@ def inspect_ui_skill_audit(ui_design_home: pathlib.Path) -> dict[str, Any]:
     return _inspect_jsonl([ui_design_home / "audit.jsonl"], "UI skill audit")
 
 
-_ACTIVE_WORKTREE_STATUSES = {
+_WORKTREE_STATUSES = {
     "developing",
     "ready_for_user_acceptance",
     "release_failed",
@@ -1756,7 +1799,10 @@ _ACTIVE_WORKTREE_STATUSES = {
     "master_pushed",
     "staging_deployed",
     "verified",
+    "cleaned",
+    "failed",
 }
+_ACTIVE_WORKTREE_STATUSES = _WORKTREE_STATUSES - {"cleaned", "failed"}
 _PENDING_WORKTREE_STATUSES = _ACTIVE_WORKTREE_STATUSES - {"developing"}
 
 

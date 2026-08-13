@@ -15,7 +15,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
+import ui_design_gate
 import ui_design_preferences as preferences
+import ui_skill_publisher
 import ui_skill_registry as skills
 import vibe_memory_paths
 import vibe_memory_migration as migration
@@ -208,7 +210,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                     },
                     "task-beta": {
                         "repository": str(second_root),
-                        "status": "released",
+                        "status": "cleaned",
                     },
                 },
             },
@@ -218,6 +220,24 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
         with mock.patch.dict(
             os.environ, {"UI_DESIGN_HOME": str(paths.ui_design_home)}
         ):
+            design_manifest = {
+                "schema_version": 1,
+                "task_id": "design-1",
+                "title": "Fixture design",
+                "classification": "visual_change",
+                "pages": ["home"],
+                "components": ["navigation"],
+                "allowed_file_patterns": ["web/src/**"],
+                "design_files": ["design-brief.md", "interaction-spec.md", "responsive-spec.md"],
+                "status": "pending_approval",
+            }
+            design = ui_design_gate.create_design_package(
+                project_root, "design-1", design_manifest, idempotency_key="fixture-design-create"
+            )
+            ui_design_gate.approve_design_package(
+                project_root, "design-1", expected_digest=design["digest"],
+                idempotency_key="fixture-design-approve",
+            )
             draft = skills.create_draft(
                 name="sample-ui",
                 source={"type": "local", "path": str(fixture_skill)},
@@ -225,7 +245,15 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                 scope={"type": "global"},
                 targets=["codex"],
             )
-            skills.approve_draft(draft["id"], expected_digest=draft["digest"])
+            approved_skill = skills.approve_draft(draft["id"], expected_digest=draft["digest"])
+            ui_skill_publisher.publish(
+                approved_skill,
+                targets={
+                    "codex": base / "targets/codex/sample-ui",
+                    "claude": base / "targets/claude/sample-ui",
+                },
+                idempotency_key="fixture-skill-publish",
+            )
 
             preferences.save_global_preferences(preferences.default_global_preferences())
             preferences.save_project_overrides(
@@ -316,6 +344,30 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             )
         self.assertEqual(result["active_worktrees"], "error")
         self.assertEqual(result["pending_worktrees"], "error")
+
+    def test_registry_approval_deployment_and_worktree_schema_errors_are_named(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            invalid_registry = {**fixture.registry, "schema_version": 999}
+            _write_json(fixture.project_roots[0] / "codex/ui_design/approvals.json", {
+                "schema_version": 999, "package_approvals": {}, "idempotency": []
+            })
+            skill_path = fixture.paths.ui_design_home / "registry.json"
+            skill = json.loads(skill_path.read_text(encoding="utf-8"))
+            skill["deployments"]["bad"] = {
+                "transaction_id": "bad", "name": "sample-ui", "version_id": "bogus",
+                "digest": "0" * 64, "status": "published",
+            }
+            _write_json(skill_path, skill)
+            _write_json(fixture.paths.ui_design_home / "deployments/bad.json", {"status": "wrong"})
+            worktree = json.loads((fixture.paths.worktree_manager / "tasks.json").read_text())
+            worktree["tasks"]["task-beta"]["status"] = "bogus"
+            _write_json(fixture.paths.worktree_manager / "tasks.json", worktree)
+            result = migration.validate_control_plane(fixture.paths, invalid_registry)
+        self.assertEqual(result["projects"], "error")
+        self.assertEqual(result["ui_design_approvals"], "error")
+        self.assertEqual(result["ui_skill_deployments"], "error")
+        self.assertEqual(result["worktrees"], "error")
 
     def test_preview_legacy_hooks_is_read_only_and_reports_targets(self) -> None:
         with tempfile.TemporaryDirectory() as value:

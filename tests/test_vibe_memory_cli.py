@@ -86,6 +86,18 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(output["control_plane"]["non_ok_areas"], ["policy", "ui_skill_deployments"])
 
+    def test_doctor_malformed_project_registry_returns_valid_json(self) -> None:
+        healthy = {name: {"ok": True, "status": "current"} for name in (
+            "runtime", "codex_hooks", "claude_hooks", "service", "data"
+        )}
+        self.paths.project_registry.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.project_registry.write_text("{bad", encoding="utf-8")
+        with mock.patch("vibe_memory_cli.collect_status", return_value=healthy):
+            code, output, _ = self.invoke(["doctor", "--json"])
+        self.assertEqual(code, 1)
+        self.assertIn("projects", output["control_plane"]["non_ok_areas"])
+        self.assertNotIn(str(self.paths.project_registry), output["control_plane"]["error"])
+
     def test_status_reports_missing_launcher_as_an_actionable_runtime_error(self) -> None:
         release = self.paths.install_root / "releases/1.0.0/scripts"
         release.mkdir(parents=True)
