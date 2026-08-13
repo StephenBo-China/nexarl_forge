@@ -38,7 +38,7 @@ _RUNTIME_KEYS = {
     "python_version",
     "service",
 }
-_SECTION = re.compile(r"(?ms)^##[ \t]+([^\n]+)\n.*?(?=^##[ \t]+|\Z)")
+_SECTION = re.compile(r"(?ms)^#{2,3}[ \t]+([^\n]+)\n.*?(?=^#{2,3}[ \t]+|\Z)")
 _EXPIRY = re.compile(r"(?m)^expires_on:[ \t]*(\d{4}-\d{2}-\d{2})[ \t]*$")
 _ANY_EXPIRY = re.compile(r"(?m)^expires_on:[^\n]*(?:\n|\Z)")
 _MANAGED_SHORT = re.compile(
@@ -56,6 +56,10 @@ _FIRST_RUN_KEYS = {
     "formal_memory_requires_approval",
     "service_host",
 }
+
+
+class FirstRunTransactionError(RuntimeError):
+    """A first-run failure whose rollback also had reportable problems."""
 
 
 def default_settings() -> dict[str, object]:
@@ -330,7 +334,7 @@ def prune_personal_short(
             changed = True
             removed.append(match.group(1).strip())
             return ""
-        if expiry != expected_expiry:
+        if expiry is None:
             replacement = f"expires_on: {expected_expiry.isoformat()}\n"
             marker = _MANAGED_SHORT.search(section)
             assert marker is not None
@@ -392,6 +396,14 @@ def apply_first_run(
             state = vibe_memory_install.read_install_state(paths)
             if state:
                 state["port"] = saved["service_port"]
+                state["installed_clients"] = [
+                    client
+                    for client, enabled in (
+                        ("codex", saved["codex_hooks_enabled"]),
+                        ("claude-code", saved["claude_hooks_enabled"]),
+                    )
+                    if enabled
+                ]
                 vibe_memory_install.write_install_state(paths, state)
             prune_personal_short(
                 pathlib.Path(paths.personal_memory) / "short.md",
@@ -403,15 +415,13 @@ def apply_first_run(
                 registered = register_workspace(workspace)
             launch = reconcile_launch_agent(paths, saved)
             if saved["start_at_login"]:
-                try:
-                    runtime = vibe_memory_install.read_runtime_config(paths)
-                except (OSError, ValueError, vibe_memory_install.InstallError):
-                    runtime = {}
+                runtime = vibe_memory_install.read_runtime_config(paths)
                 version = runtime.get("app_version")
-                if isinstance(version, str):
-                    vibe_memory_install.activate_launch_agent(
-                        paths, expected_version=version
-                    )
+                if not isinstance(version, str):
+                    raise ValueError("runtime configuration has no app_version")
+                vibe_memory_install.activate_launch_agent(
+                    paths, expected_version=version
+                )
             written = {
                 path: vibe_memory_install._snapshot_regular_file(path)
                 for path in _transaction_paths(paths)
@@ -422,21 +432,35 @@ def apply_first_run(
                 "launch_agent": launch,
                 "bootout_after_response": not bool(saved["start_at_login"]),
             }
-        except Exception:
+        except Exception as original_error:
             try:
                 vibe_memory_install.bootout_launch_agent()
             except vibe_memory_install.InstallError:
                 pass
+            failed_paths: list[str] = []
             for path, snapshot in snapshots.items():
-                vibe_memory_install._restore_regular_file(
-                    path, snapshot, expected_current=written.get(path, vibe_memory_install._NO_SNAPSHOT_CHECK)
-                )
+                try:
+                    vibe_memory_install._restore_regular_file(
+                        path, snapshot, expected_current=written.get(path, vibe_memory_install._NO_SNAPSHOT_CHECK)
+                    )
+                except Exception:
+                    failed_paths.append(str(path))
+            restart_error: Exception | None = None
             if old_settings["start_at_login"] and snapshots[pathlib.Path(paths.launch_agent)] is not None:
                 try:
                     version = vibe_memory_install.read_runtime_config(paths)["app_version"]
                     vibe_memory_install.activate_launch_agent(paths, expected_version=str(version))
-                except Exception:
-                    pass
+                except Exception as error:
+                    restart_error = error
+            if failed_paths or restart_error is not None:
+                details = [f"original={original_error}"]
+                if failed_paths:
+                    details.append("failed_paths=" + ",".join(failed_paths))
+                if restart_error is not None:
+                    details.append(f"restart={restart_error}")
+                raise FirstRunTransactionError(
+                    "first-run rollback incomplete: " + "; ".join(details)
+                ) from original_error
             raise
 
 

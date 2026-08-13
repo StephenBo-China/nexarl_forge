@@ -131,7 +131,7 @@ class UIDesignServerTest(unittest.TestCase):
             server.vibe_memory_settings, "reconcile_launch_agent"
         ), mock.patch.object(server.memory_project, "register_project") as register:
             status, _payload = self.settings_request(
-                "POST", "/api/settings/first-run", {}
+                "POST", "/api/settings/first-run", {"start_at_login": False}
             )
 
         self.assertEqual(status, 200)

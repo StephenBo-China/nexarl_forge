@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import datetime as _dt
 import io
 import json
 import os
@@ -853,6 +854,38 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 paths["PERSONAL_LONG"].read_text(encoding="utf-8").count("\n### "), 1
             )
             self.assertFalse(paths["PERSONAL_SHORT"].exists())
+
+    def test_personal_short_approval_marks_only_short_entry_for_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            paths = {
+                "PERSONAL_PROPOSALS": temp / "personal_proposals.md",
+                "PERSONAL_LONG": temp / "personal_long.md",
+                "PERSONAL_SHORT": temp / "personal_short.md",
+                "PROJECT_PROPOSALS": temp / "project_proposals.md",
+                "PROJECT_LONG": temp / "project_long.md",
+                "PROJECT_QUEUE": temp / "queue.json",
+                "PROJECT_STATE": temp / "state.json",
+                "CODEX_DIR": temp / "codex",
+            }
+            paths["PERSONAL_PROPOSALS"].write_text("# Proposals\n", encoding="utf-8")
+            with mock.patch.multiple(review, **paths):
+                candidate = self._create_isolated_personal_candidate(temp, "短期偏好")
+                review.approve(candidate["id"], target="personal_short")
+            text = paths["PERSONAL_SHORT"].read_text(encoding="utf-8")
+            self.assertIn("<!-- vibe-memory:managed-short -->", text)
+            self.assertIn("managed_by: vibe-memory", text)
+            self.assertNotIn("expires_on:", text)
+            import vibe_memory_settings
+            vibe_memory_settings.prune_personal_short(
+                paths["PERSONAL_SHORT"], today=_dt.date(2026, 8, 13), retention_days=14
+            )
+            text = paths["PERSONAL_SHORT"].read_text(encoding="utf-8")
+            self.assertIn("expires_on: 2026-08-27", text)
+            vibe_memory_settings.prune_personal_short(
+                paths["PERSONAL_SHORT"], today=_dt.date(2026, 8, 28), retention_days=14
+            )
+            self.assertNotIn("vibe-memory:managed-short", paths["PERSONAL_SHORT"].read_text(encoding="utf-8"))
 
     def test_repeated_reject_is_idempotent_and_conflicting_defer_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:

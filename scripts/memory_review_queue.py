@@ -874,11 +874,22 @@ def memory_title(item: dict[str, Any], content: str) -> str:
     return summary[:64] or item.get("id", "Approved memory")
 
 
-def append_official_memory(path: pathlib.Path, item: dict[str, Any], content: str) -> None:
+def append_official_memory(
+    path: pathlib.Path,
+    item: dict[str, Any],
+    content: str,
+    *,
+    managed_short: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     title = memory_title(item, content)
     date = _dt.datetime.now().astimezone().date().isoformat()
-    entry = f"\n### {date} - {title}\n\n{content.strip()}\n"
+    metadata = (
+        "\n<!-- vibe-memory:managed-short -->\nmanaged_by: vibe-memory\n"
+        if managed_short
+        else ""
+    )
+    entry = f"\n### {date} - {title}{metadata}\n\n{content.strip()}\n"
     try:
         mode = stat.S_IMODE(path.stat().st_mode)
     except FileNotFoundError:
@@ -961,7 +972,12 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
                     previous_official, approved_content, content_digest
                 )
                 if not already_official:
-                    append_official_memory(destination, item, approved_content)
+                    append_official_memory(
+                        destination,
+                        item,
+                        approved_content,
+                        managed_short=target == "personal_short",
+                    )
                 state["items"][candidate_id] = decision
                 try:
                     write_json(PROJECT_STATE, state)

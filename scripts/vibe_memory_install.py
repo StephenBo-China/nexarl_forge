@@ -2156,7 +2156,6 @@ def _validate_install_state(value: Any) -> dict[str, Any]:
     clients = value["installed_clients"]
     if (
         not isinstance(clients, list)
-        or not clients
         or any(
             not isinstance(client, str) or client not in {"codex", "claude-code"}
             for client in clients
@@ -2591,12 +2590,14 @@ def rollback(paths: RuntimePaths) -> dict[str, Any]:
 
 def _installed_clients(paths: RuntimePaths) -> list[str]:
     state = read_install_state(paths)
+    if "installed_clients" not in state:
+        return ["codex"]
     clients = [
         item
-        for item in state.get("installed_clients", ["codex"])
+        for item in state["installed_clients"]
         if item in {"codex", "claude-code"}
     ]
-    return clients or ["codex"]
+    return clients
 
 
 def _repair_metadata(paths: RuntimePaths, current_version: str) -> tuple[int, str, list[str], str | None]:
@@ -2627,7 +2628,7 @@ def _repair_metadata(paths: RuntimePaths, current_version: str) -> tuple[int, st
     previous = state.get("previous_version")
     if not isinstance(previous, str) or not _VERSION_PATTERN.fullmatch(previous) or previous == current_version:
         previous = None
-    return port, python, clients or ["codex"], previous
+    return port, python, clients, previous
 
 
 def _hook_target_for_client(paths: RuntimePaths, client: str) -> tuple[pathlib.Path, str, str]:

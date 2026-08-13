@@ -489,6 +489,22 @@ class RuntimeInstallTest(unittest.TestCase):
             with self.assertRaises(vibe_memory_install.InstallError):
                 vibe_memory_install.read_install_state(paths)
 
+    def test_read_install_state_allows_exact_empty_client_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state = vibe_memory_install._install_state_document(
+                current_version="1.0.0",
+                previous_version=None,
+                port=8897,
+                installed_clients=[],
+                python_executable=sys.executable,
+            )
+            vibe_memory_install.write_install_state(paths, state)
+            self.assertEqual(
+                vibe_memory_install.read_install_state(paths)["installed_clients"], []
+            )
+            self.assertEqual(vibe_memory_install._installed_clients(paths), [])
+
     def test_read_install_state_rejects_unhashable_client(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))

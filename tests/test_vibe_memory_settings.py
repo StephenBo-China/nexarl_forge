@@ -308,6 +308,78 @@ keep exactly
         for path, content in before.items():
             self.assertEqual(path.read_bytes(), content, str(path))
 
+    def test_first_run_updates_install_state_with_exact_enabled_clients_and_port(self) -> None:
+        state = {
+            "schema_version": 1, "current_version": "1.0.0", "previous_version": None,
+            "hook_protocol_version": 1, "data_schema_version": 1, "port": 8897,
+            "python_executable": sys.executable, "python_version": "3.14",
+            "installed_clients": ["codex", "claude-code"],
+        }
+        vibe_memory_install.write_install_state(self.paths, state)
+        with mock.patch.object(settings, "reconcile_hooks"), mock.patch.object(
+            settings, "reconcile_launch_agent", return_value={}
+        ), mock.patch.object(settings.vibe_memory_install, "read_runtime_config", return_value={
+            "app_version": "1.0.0"
+        }), mock.patch.object(settings.vibe_memory_install, "activate_launch_agent"):
+            settings.apply_first_run(
+                self.paths,
+                {"codex_hooks": False, "claude_hooks": True, "service_port": 9123},
+                manager_source_root=ROOT,
+                register_workspace=mock.Mock(),
+            )
+        updated = vibe_memory_install.read_install_state(self.paths)
+        self.assertEqual(updated["installed_clients"], ["claude-code"])
+        self.assertEqual(updated["port"], 9123)
+        self.assertEqual(updated["python_executable"], sys.executable)
+
+    def test_start_at_login_requires_valid_runtime_config_and_activation(self) -> None:
+        request = {"codex_hooks": True, "start_at_login": True}
+        with mock.patch.object(settings, "reconcile_hooks"), mock.patch.object(
+            settings, "reconcile_launch_agent", return_value={}
+        ), mock.patch.object(
+            settings.vibe_memory_install, "read_runtime_config", side_effect=ValueError("bad config")
+        ), mock.patch.object(settings.vibe_memory_install, "bootout_launch_agent"):
+            with self.assertRaisesRegex(ValueError, "bad config"):
+                settings.apply_first_run(
+                    self.paths, request, manager_source_root=ROOT,
+                    register_workspace=mock.Mock(),
+                )
+        self.assertFalse(settings.load_settings(self.paths)["first_run_complete"])
+
+    def test_rollback_reports_previous_service_restart_failure_after_restoring_files(self) -> None:
+        old = settings.default_settings()
+        settings.save_settings(self.paths, old)
+        plist = self.paths.launch_agent
+        plist.parent.mkdir(parents=True)
+        plist.write_text("old plist\n", encoding="utf-8")
+        with mock.patch.object(settings, "reconcile_hooks"), mock.patch.object(
+            settings, "reconcile_launch_agent", side_effect=RuntimeError("original")
+        ), mock.patch.object(settings.vibe_memory_install, "read_runtime_config", return_value={
+            "app_version": "1.0.0"
+        }), mock.patch.object(
+            settings.vibe_memory_install, "activate_launch_agent", side_effect=RuntimeError("restart")
+        ), mock.patch.object(settings.vibe_memory_install, "bootout_launch_agent"):
+            with self.assertRaisesRegex(Exception, "restart"):
+                settings.apply_first_run(
+                    self.paths, {"start_at_login": False}, manager_source_root=ROOT,
+                    register_workspace=mock.Mock(),
+                )
+        self.assertEqual(plist.read_text(encoding="utf-8"), "old plist\n")
+
+    def test_managed_expiry_is_stable_across_sessions_and_eventually_expires(self) -> None:
+        self.short_memory.write_text(
+            "## managed\n<!-- vibe-memory:managed-short -->\n\ncontent\n", encoding="utf-8"
+        )
+        settings.prune_personal_short(self.short_memory, today=dt.date(2026, 7, 1), retention_days=14)
+        first = self.short_memory.read_text(encoding="utf-8")
+        self.assertIn("expires_on: 2026-07-15", first)
+        settings.prune_personal_short(self.short_memory, today=dt.date(2026, 7, 10), retention_days=14)
+        self.assertEqual(self.short_memory.read_text(encoding="utf-8"), first)
+        self.assertEqual(
+            settings.prune_personal_short(self.short_memory, today=dt.date(2026, 7, 16), retention_days=14),
+            ["managed"],
+        )
+
     def test_context_omits_candidate_reminder_when_automatic_checks_are_disabled(self) -> None:
         event = NormalizedEvent(
             agent="codex",
