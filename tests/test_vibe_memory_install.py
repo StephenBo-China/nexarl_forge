@@ -2548,6 +2548,20 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     result = vibe_memory_install.smoke_managed_hooks(paths, ["codex"], runner=runner)
                 self.assertEqual(result["codex"]["status"], status)
 
+    def test_smoke_managed_hooks_rejects_oversized_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            cases = (
+                ("x" * (vibe_memory_install.HOOK_SMOKE_OUTPUT_LIMIT + 1), ""),
+                (json.dumps({"status": "ok"}), "x" * (vibe_memory_install.HOOK_SMOKE_OUTPUT_LIMIT + 1)),
+            )
+            for stdout, stderr in cases:
+                runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout, stderr))
+                with self.subTest(stderr=bool(stderr)), self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, "output limit"
+                ):
+                    vibe_memory_install.smoke_managed_hooks(paths, ["codex"], runner=runner)
+
     def test_update_renders_matching_assets_restarts_and_smokes_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -2646,6 +2660,21 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertTrue((unknown / "sentinel").exists())
             self.assertEqual(result["preserved_releases"], [str(unknown)])
 
+    def test_uninstall_never_deletes_semver_release_with_valid_manifest_and_user_extra(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(root)
+            vibe_memory_install.install_runtime(source, paths)
+            release = paths.install_root / "releases/1.0.0"
+            sentinel = release / "USER_SENTINEL"
+            sentinel.write_text("keep", encoding="utf-8")
+            sentinel.chmod(0o600)
+            with mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "booted_out"}):
+                result = vibe_memory_install.uninstall(paths)
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+            self.assertIn(str(release), result["preserved_releases"])
+
     def test_repair_health_failure_restores_all_managed_files_and_restarts_old_service(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -2670,6 +2699,23 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     vibe_memory_install.repair(paths)
             self.assertEqual(before, {path: path.read_bytes() for path in managed})
             self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.0.0"))
+
+    def test_repair_smoke_failure_preserves_concurrent_config_and_reports_rollback_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.0.0", python_executable=sys.executable)
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(current_version="1.0.0", previous_version=None, port=9123, installed_clients=["codex"], python_executable=sys.executable))
+            config = paths.install_root / "config.json"
+            concurrent = b'{"user":"concurrent"}\n'
+            def concurrent_smoke(*_args: object, **_kwargs: object) -> object:
+                config.write_bytes(concurrent)
+                raise vibe_memory_install.InstallError("smoke failed")
+            with mock.patch("vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}), mock.patch("vibe_memory_install.smoke_managed_hooks", side_effect=concurrent_smoke), mock.patch("vibe_memory_hooks.repair", return_value={"status": "created"}):
+                with self.assertRaisesRegex(vibe_memory_install.InstallError, "rollback failed"):
+                    vibe_memory_install.repair(paths)
+            self.assertEqual(config.read_bytes(), concurrent)
 
     def test_repair_rebuilds_missing_or_malformed_config_and_state_from_current_release(self) -> None:
         for config_mode, state_mode in (("missing", "missing"), ("malformed", "missing"), ("missing", "malformed"), ("malformed", "malformed")):

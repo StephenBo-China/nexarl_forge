@@ -428,6 +428,21 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertFalse(list(codex.parent.glob("hooks.json.bak.*")))
         self.assertFalse(list(claude.parent.glob("settings.json.bak.*")))
 
+    def test_install_rollback_preserves_concurrent_hook_replacement_and_reports_path(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        codex.parent.mkdir(parents=True)
+        codex.write_text('{"custom":"before"}\n', encoding="utf-8")
+        concurrent = b'{"custom":"concurrent"}\n'
+        def fail_after_hook(*_args: object, **_kwargs: object) -> object:
+            codex.write_bytes(concurrent)
+            raise vibe_memory_cli.vibe_memory_install.InstallError("health failed")
+        with mock.patch("vibe_memory_cli.vibe_memory_install.activate_launch_agent", side_effect=fail_after_hook), mock.patch("vibe_memory_cli.vibe_memory_install.bootout_launch_agent"):
+            code, output, stderr = self.invoke(["install", "--source-root", str(ROOT)])
+        self.assertEqual(code, 1, stderr)
+        self.assertFalse(output["rollback"]["ok"])
+        self.assertIn(str(codex), output["rollback"]["failed_paths"])
+        self.assertEqual(codex.read_bytes(), concurrent)
+
     def test_install_rolls_back_launch_agent_when_replace_then_raise_hides_result(self) -> None:
         plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
         plist.parent.mkdir(parents=True)

@@ -220,21 +220,34 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
     }
 
 
-def _snapshot_managed_file(path: pathlib.Path) -> tuple[bytes, int] | None:
+ManagedFileSnapshot = tuple[tuple[int, int], bytes, int]
+
+
+def _snapshot_managed_file(path: pathlib.Path) -> ManagedFileSnapshot | None:
     if path.is_symlink():
         raise ValueError("managed path must not be a symlink")
     try:
         metadata = path.stat()
         if not stat.S_ISREG(metadata.st_mode):
             raise ValueError("managed path must be a regular file")
-        return path.read_bytes(), stat.S_IMODE(metadata.st_mode)
+        content = path.read_bytes()
+        after = path.stat(follow_symlinks=False)
+        if (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError("managed path changed while snapshotting")
+        return (after.st_dev, after.st_ino), content, stat.S_IMODE(after.st_mode)
     except FileNotFoundError:
         return None
 
 
-def _restore_managed_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None) -> None:
+def _restore_managed_file(
+    path: pathlib.Path,
+    snapshot: ManagedFileSnapshot | None,
+    expected_current: ManagedFileSnapshot | None,
+) -> None:
     if path.is_symlink():
         raise ValueError("managed path changed to a symlink during rollback")
+    if _snapshot_managed_file(path) != expected_current:
+        raise ValueError("managed path changed concurrently during rollback")
     if snapshot is None:
         try:
             metadata = path.stat()
@@ -244,7 +257,7 @@ def _restore_managed_file(path: pathlib.Path, snapshot: tuple[bytes, int] | None
             raise ValueError("managed path changed type during rollback")
         path.unlink()
         return
-    content, mode = snapshot
+    _before_identity, content, mode = snapshot
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.rollback-", dir=path.parent)
     temporary = pathlib.Path(temporary_name)
@@ -349,6 +362,7 @@ def install_command(args: argparse.Namespace) -> int:
     attempted_hook_targets: set[pathlib.Path] = set()
     lifecycle_attempted = False
     release_identity: tuple[int, int] | None = None
+    written: dict[pathlib.Path, ManagedFileSnapshot | None] = {}
     try:
         installed = vibe_memory_install.install_runtime(
             pathlib.Path(args.source_root), paths, activate=False
@@ -359,43 +373,58 @@ def install_command(args: argparse.Namespace) -> int:
         vibe_memory_install._activate_managed_version(paths, installed["version"])
         data = vibe_memory_install.prepare_data(paths)
         rollback_paths.add(runtime_config_path)
-        runtime_config = vibe_memory_install.install_runtime_config(
-            paths,
-            port=args.port,
-            app_version=installed["version"],
-            python_executable=python_executable,
-        )
+        try:
+            runtime_config = vibe_memory_install.install_runtime_config(
+                paths,
+                port=args.port,
+                app_version=installed["version"],
+                python_executable=python_executable,
+            )
+        finally:
+            written[runtime_config_path] = _snapshot_managed_file(runtime_config_path)
         rollback_paths.add(launcher)
-        launcher_result = vibe_memory_install.install_launcher(
-            paths, python_executable=python_executable
-        )
+        try:
+            launcher_result = vibe_memory_install.install_launcher(
+                paths, python_executable=python_executable
+            )
+        finally:
+            written[launcher] = _snapshot_managed_file(launcher)
         control_plane = vibe_memory_migration.validate_control_plane(
             paths, _registry_snapshot(paths)
         )
         if any(status != "ok" for status in control_plane.values()):
             raise ValueError("control-plane compatibility validation failed")
         rollback_paths.add(launch_agent)
-        plist_result = vibe_memory_install.install_launch_agent(paths, plist)
+        try:
+            plist_result = vibe_memory_install.install_launch_agent(paths, plist)
+        finally:
+            written[launch_agent] = _snapshot_managed_file(launch_agent)
         for target, agent, name in hook_targets:
             rollback_paths.add(target)
             attempted_hook_targets.add(target)
-            hooks[name] = vibe_memory_hooks.repair(target, agent, launcher)
+            try:
+                hooks[name] = vibe_memory_hooks.repair(target, agent, launcher)
+            finally:
+                written[target] = _snapshot_managed_file(target)
         existing_clients = existing_install_state.get("installed_clients", [])
         clients = ["codex"]
         if args.with_claude_hooks or "claude-code" in existing_clients:
             clients.append("claude-code")
         previous_version = existing_install_state.get("previous_version")
         rollback_paths.add(install_state_path)
-        vibe_memory_install.write_install_state(
-            paths,
-            vibe_memory_install._install_state_document(
-                current_version=installed["version"],
-                previous_version=previous_version if isinstance(previous_version, str) else None,
-                port=args.port,
-                installed_clients=clients,
-                python_executable=python_executable,
-            ),
-        )
+        try:
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version=installed["version"],
+                    previous_version=previous_version if isinstance(previous_version, str) else None,
+                    port=args.port,
+                    installed_clients=clients,
+                    python_executable=python_executable,
+                ),
+            )
+        finally:
+            written[install_state_path] = _snapshot_managed_file(install_state_path)
         lifecycle_attempted = True
         service = vibe_memory_install.activate_launch_agent(
             paths, expected_version=installed["version"]
@@ -424,7 +453,7 @@ def install_command(args: argparse.Namespace) -> int:
                 rollback_errors.append("launchctl bootout")
         for target in rollback_paths:
             try:
-                _restore_managed_file(target, snapshots[target])
+                _restore_managed_file(target, snapshots[target], written.get(target))
             except Exception:
                 rollback_errors.append(str(target))
         try:
