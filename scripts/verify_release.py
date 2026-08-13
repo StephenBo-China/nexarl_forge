@@ -91,8 +91,10 @@ def _compile_python() -> str:
     return "ok"
 
 
-def _install_source(root: pathlib.Path, version: str | None = None) -> pathlib.Path:
-    source = pathlib.Path(tempfile.mkdtemp(prefix="verify-release-source-"))
+def _install_source(
+    root: pathlib.Path, destination: pathlib.Path, version: str | None = None
+) -> pathlib.Path:
+    source = destination
     for name in ("scripts", "templates", "docs"):
         shutil.copytree(root / name, source / name)
     for name in ("README.md", "LICENSE", "SECURITY.md", "release.json"):
@@ -177,12 +179,15 @@ def _control_plane_check(root: pathlib.Path) -> str:
 
 def _rollback_check(root: pathlib.Path) -> str:
     try:
-        with tempfile.TemporaryDirectory() as value:
+        with tempfile.TemporaryDirectory() as value, tempfile.TemporaryDirectory(
+            prefix="verify-release-sources-"
+        ) as source_value:
             home = pathlib.Path(value) / "home"
             home.mkdir()
             paths = vibe_memory_paths.for_home(home)
-            source_1 = _install_source(root, "1.0.0")
-            source_2 = _install_source(root, "1.1.0")
+            sources = pathlib.Path(source_value)
+            source_1 = _install_source(root, sources / "1.0.0", "1.0.0")
+            source_2 = _install_source(root, sources / "1.1.0", "1.1.0")
             with mock.patch.object(
                 vibe_memory_install,
                 "activate_launch_agent",
@@ -241,7 +246,7 @@ def _installed_e2e_process(
         capture_output=True,
         text=True,
         check=False,
-        timeout=30,
+        timeout=15,
     )
 
 
@@ -262,6 +267,10 @@ def _installed_e2e_http(
     path: str,
     body: dict[str, object] | None = None,
 ) -> tuple[int, str, object]:
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: object, fp: object, code: int, msg: str, headers: object, newurl: str) -> None:
+            return None
+
     url = f"http://127.0.0.1:{port}{path}"
     request = urllib.request.Request(
         url,
@@ -269,9 +278,33 @@ def _installed_e2e_http(
         headers=({"Content-Type": "application/json"} if body is not None else {}),
         method=("POST" if body is not None else "GET"),
     )
-    with urllib.request.urlopen(request, timeout=3) as response:
-        raw = response.read()
+    opener = urllib.request.build_opener(_NoRedirect())
+    deadline = time.monotonic() + 5.0
+    limit = 256 * 1024 if path == "/" else 64 * 1024
+    with opener.open(request, timeout=3) as response:
+        if response.status != 200:
+            raise RuntimeError(f"HTTP status {response.status} for {path}")
+        if response.geturl() != url:
+            raise RuntimeError(f"HTTP redirect rejected for {path}")
+        expected_type = "text/html" if path == "/" else "application/json"
         content_type = response.headers.get_content_type()
+        if content_type != expected_type:
+            raise RuntimeError(f"unexpected Content-Type for {path}")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"HTTP deadline exceeded for {path}")
+            chunk = response.read(min(8192, limit + 1 - size))
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"HTTP deadline exceeded for {path}")
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > limit:
+                raise RuntimeError(f"HTTP response too large for {path}")
+            chunks.append(chunk)
+        raw = b"".join(chunks)
         value: object = (
             json.loads(raw.decode("utf-8"))
             if content_type == "application/json"
@@ -280,17 +313,87 @@ def _installed_e2e_http(
         return response.status, response.geturl(), value
 
 
+def _launchctl_service_absent(completed: subprocess.CompletedProcess[str]) -> bool:
+    detail = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    return completed.returncode == 113 and "Could not find service" in detail
+
+
+def _launchctl(
+    arguments: list[str],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["/bin/launchctl", *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+
+def _installed_e2e_service_state(
+    home: pathlib.Path, paths: vibe_memory_paths.RuntimePaths
+) -> tuple[str, str | None]:
+    try:
+        printed = _launchctl(["print", _INSTALLED_E2E_SERVICE])
+    except (OSError, subprocess.TimeoutExpired):
+        return "error", "launchctl print failed"
+    if _launchctl_service_absent(printed):
+        return "absent", None
+    if printed.returncode != 0:
+        return "error", f"launchctl print exited {printed.returncode}"
+    launch_agent = pathlib.Path(paths.launch_agent)
+    current = pathlib.Path(paths.install_root) / "current"
+    try:
+        plist = plistlib.loads(launch_agent.read_bytes())
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return "foreign", "service plist is missing or invalid"
+    expected_program = str(current / "scripts/memory_review_server.py")
+    environment = plist.get("EnvironmentVariables", {})
+    arguments = plist.get("ProgramArguments", [])
+    detail = f"{printed.stdout or ''}\n{printed.stderr or ''}"
+    if (
+        plist.get("Label") != "com.noema.vibe-memory"
+        or not isinstance(arguments, list)
+        or expected_program not in arguments
+        or not isinstance(environment, dict)
+        or environment.get("HOME") != str(home)
+        or str(launch_agent) not in detail
+        or expected_program not in detail
+    ):
+        return "foreign", "service identity mismatch"
+    return "owned", None
+
+
 def _cleanup_installed_release_e2e(
     root: pathlib.Path,
     home: pathlib.Path,
     paths: vibe_memory_paths.RuntimePaths,
+    *,
+    owned_service: bool,
 ) -> list[str]:
     """Uninstall while HOME exists, then prove the test-owned service is absent."""
     errors: list[str] = []
     launcher = pathlib.Path(paths.launcher)
     current = pathlib.Path(paths.install_root) / "current"
     launch_agent = pathlib.Path(paths.launch_agent)
+    service_state = "absent"
+    if owned_service:
+        service_state, state_error = _installed_e2e_service_state(home, paths)
+        if service_state == "foreign":
+            errors.append(
+                f"foreign service remains: {state_error or 'identity mismatch'}"
+            )
+            return errors
+        if service_state == "error":
+            errors.append(state_error or "launchctl print failed")
+            return errors
+    launcher_owned = False
     if launcher.is_file():
+        try:
+            launcher_owned = vibe_memory_install._is_manager_launcher(launcher.read_bytes())
+        except OSError:
+            launcher_owned = False
+    if launcher_owned:
         try:
             completed = _installed_e2e_process(
                 [launcher, "uninstall"], home=home, cwd=root
@@ -310,6 +413,8 @@ def _cleanup_installed_release_e2e(
                     errors.append("installed uninstall returned an invalid status")
         except (OSError, subprocess.SubprocessError) as error:
             errors.append(f"installed uninstall failed: {error}")
+    elif launcher.is_file():
+        errors.append("installed launcher is not manager-owned")
     for path, label in (
         (launcher, "launcher"),
         (current, "current runtime"),
@@ -318,32 +423,39 @@ def _cleanup_installed_release_e2e(
         if os.path.lexists(path):
             errors.append(f"installed uninstall kept {label}")
 
-    try:
-        subprocess.run(
-            ["/bin/launchctl", "bootout", _INSTALLED_E2E_SERVICE],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as error:
-        errors.append(f"launchctl bootout failed: {error}")
-    service_absent = False
-    for attempt in range(20):
+    if not owned_service:
+        return errors
+    service_state, state_error = _installed_e2e_service_state(home, paths)
+    if service_state == "foreign":
+        errors.append(f"foreign service remains: {state_error or 'identity mismatch'}")
+        return errors
+    if service_state == "error":
+        errors.append(state_error or "launchctl print failed")
+        return errors
+    service_absent = service_state == "absent"
+    if service_state == "owned":
         try:
-            printed = subprocess.run(
-                ["/bin/launchctl", "print", _INSTALLED_E2E_SERVICE],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except OSError as error:
-            errors.append(f"launchctl print failed: {error}")
-            break
-        if printed.returncode != 0:
-            service_absent = True
-            break
-        if attempt + 1 < 20:
-            time.sleep(0.05)
+            bootout = _launchctl(["bootout", _INSTALLED_E2E_SERVICE])
+        except (OSError, subprocess.TimeoutExpired):
+            errors.append("launchctl bootout failed")
+            return errors
+        if bootout.returncode != 0 and not _launchctl_service_absent(bootout):
+            errors.append(f"launchctl bootout exited {bootout.returncode}")
+            return errors
+    if not service_absent:
+        for attempt in range(20):
+            state, state_error = _installed_e2e_service_state(home, paths)
+            if state == "absent":
+                service_absent = True
+                break
+            if state == "foreign":
+                errors.append(f"foreign service remains: {state_error or 'identity mismatch'}")
+                break
+            if state == "error":
+                errors.append(state_error or "launchctl print failed")
+                break
+            if attempt + 1 < 20:
+                time.sleep(0.05)
     if not service_absent:
         errors.append("test LaunchAgent is still loaded after cleanup")
     return errors
@@ -367,20 +479,21 @@ def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
     if sys.platform != "darwin":
         return "skipped: macOS installed-runtime E2E"
     base = pathlib.Path(root).expanduser().resolve()
-    existing = subprocess.run(
-        ["/bin/launchctl", "print", _INSTALLED_E2E_SERVICE],
-        capture_output=True,
-        text=True,
-        check=False,
+    empty_paths = vibe_memory_paths.for_home(pathlib.Path(tempfile.gettempdir()) / "vibe-memory-preflight")
+    preflight, preflight_error = _installed_e2e_service_state(
+        pathlib.Path(tempfile.gettempdir()) / "vibe-memory-preflight", empty_paths
     )
-    if existing.returncode == 0:
+    if preflight == "owned" or preflight == "foreign":
         return "skipped: fixed product LaunchAgent label is already loaded"
+    if preflight == "error":
+        return f"failed: {preflight_error or 'launchctl preflight failed'}"
     with tempfile.TemporaryDirectory(prefix="vibe-memory-installed-e2e-") as value:
         primary_error: str | None = None
         cleanup_errors: list[str] = []
         fixture_base = pathlib.Path(value)
         home = fixture_base / "home"
         paths = vibe_memory_paths.for_home(home)
+        owned_service = False
         try:
             fixture_base = pathlib.Path(value)
             fixture = build_complete_legacy_fixture(fixture_base)
@@ -394,6 +507,7 @@ def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
                 [base / "install.sh", "--port", str(port)], home=home, cwd=base
             )
             _installed_e2e_require_zero(installed, "install.sh")
+            owned_service = True
             launcher = home / ".local/bin/vibe-memory"
             if not launcher.is_file():
                 raise RuntimeError("installed launcher is missing")
@@ -523,7 +637,9 @@ def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
         except (OSError, ValueError, RuntimeError, json.JSONDecodeError, urllib.error.URLError, subprocess.SubprocessError) as error:
             primary_error = str(error)[:500]
         finally:
-            cleanup_errors = _cleanup_installed_release_e2e(base, home, paths)
+            cleanup_errors = _cleanup_installed_release_e2e(
+                base, home, paths, owned_service=owned_service
+            )
         return _installed_e2e_result(primary_error, cleanup_errors)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import io
 import pathlib
 import subprocess
 import sys
@@ -109,7 +110,13 @@ class InstalledControlPlaneTest(unittest.TestCase):
             paths = vibe_memory_paths.for_home(home)
             for path in (paths.launcher, paths.launch_agent):
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("managed\n", encoding="utf-8")
+            paths.launcher.write_text(
+                vibe_memory_install.render_launcher(
+                    paths, python_executable=sys.executable
+                ),
+                encoding="utf-8",
+            )
+            paths.launch_agent.write_text("managed\n", encoding="utf-8")
             current = paths.install_root / "current"
             current.parent.mkdir(parents=True, exist_ok=True)
             current.symlink_to("releases/1.0.0")
@@ -122,20 +129,23 @@ class InstalledControlPlaneTest(unittest.TestCase):
                 current.unlink()
                 return subprocess.CompletedProcess([], 0, '{"status":"uninstalled"}\n', "")
 
-            absent = subprocess.CompletedProcess([], 1, "", "not found")
+            absent = subprocess.CompletedProcess([], 113, "", "Could not find service")
+            booted = subprocess.CompletedProcess([], 0, "", "")
             with mock.patch.object(
                 verify_release, "_installed_e2e_process", side_effect=uninstall_while_home_exists
             ) as uninstall, mock.patch.object(
-                verify_release.subprocess, "run", return_value=absent
-            ):
+                verify_release, "_installed_e2e_service_state",
+                side_effect=[("owned", None), ("absent", None)],
+            ), mock.patch.object(verify_release, "_launchctl") as launchctl:
                 errors = verify_release._cleanup_installed_release_e2e(
-                    ROOT, home, paths
+                    ROOT, home, paths, owned_service=True
                 )
 
         self.assertEqual(errors, [])
         uninstall.assert_called_once_with(
             [paths.launcher, "uninstall"], home=home, cwd=ROOT
         )
+        launchctl.assert_not_called()
 
     def test_installed_e2e_cleanup_reports_uninstall_and_residual_service_failures(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -148,10 +158,13 @@ class InstalledControlPlaneTest(unittest.TestCase):
             with mock.patch.object(
                 verify_release, "_installed_e2e_process", return_value=failed_uninstall
             ), mock.patch.object(
+                verify_release, "_installed_e2e_service_state",
+                side_effect=[("owned", None), ("owned", None)] * 20,
+            ), mock.patch.object(
                 verify_release.subprocess, "run", return_value=residual
             ), mock.patch.object(verify_release.time, "sleep"):
                 errors = verify_release._cleanup_installed_release_e2e(
-                    ROOT, home, paths
+                    ROOT, home, paths, owned_service=True
                 )
 
         self.assertTrue(any("uninstall" in error for error in errors))
@@ -164,13 +177,128 @@ class InstalledControlPlaneTest(unittest.TestCase):
             absent = subprocess.CompletedProcess([], 1, "", "not found")
             loaded = subprocess.CompletedProcess([], 0, "loaded", "")
             with mock.patch.object(
-                verify_release.subprocess, "run", side_effect=[loaded, absent]
+                verify_release, "_installed_e2e_service_state",
+                side_effect=[("owned", None), ("absent", None)],
+            ), mock.patch.object(
+                verify_release.subprocess, "run", side_effect=[loaded]
             ), mock.patch.object(verify_release.time, "sleep"):
                 errors = verify_release._cleanup_installed_release_e2e(
-                    ROOT, home, paths
+                    ROOT, home, paths, owned_service=True
                 )
 
         self.assertEqual(errors, [])
+
+    def test_cleanup_without_owned_install_never_boots_out(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            paths = vibe_memory_paths.for_home(home)
+            with mock.patch.object(verify_release.subprocess, "run") as run:
+                errors = verify_release._cleanup_installed_release_e2e(
+                    ROOT, home, paths, owned_service=False
+                )
+
+        self.assertEqual(errors, [])
+        run.assert_not_called()
+
+    def test_foreign_service_is_reported_without_bootout(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            paths = vibe_memory_paths.for_home(home)
+            with mock.patch.object(
+                verify_release, "_installed_e2e_service_state",
+                return_value=("foreign", "service identity mismatch"),
+            ), mock.patch.object(verify_release.subprocess, "run") as run:
+                errors = verify_release._cleanup_installed_release_e2e(
+                    ROOT, home, paths, owned_service=True
+                )
+
+        self.assertIn("foreign service remains", "; ".join(errors))
+        run.assert_not_called()
+
+    def test_launchctl_absence_is_narrow_and_errors_are_not_absence(self) -> None:
+        absent = subprocess.CompletedProcess(
+            [], 113, "", 'Could not find service "com.noema.vibe-memory" in domain for user gui: 501'
+        )
+        denied = subprocess.CompletedProcess([], 1, "", "Operation not permitted")
+        self.assertTrue(verify_release._launchctl_service_absent(absent))
+        self.assertFalse(verify_release._launchctl_service_absent(denied))
+
+    def test_http_probe_rejects_redirect_oversize_and_wrong_content_type(self) -> None:
+        class Response(io.BytesIO):
+            status = 200
+            headers = mock.Mock()
+            def __enter__(self):
+                return self
+            def __exit__(self, *_args: object) -> None:
+                return None
+            def geturl(self) -> str:
+                return "http://127.0.0.1:19097/redirected"
+
+        redirected = Response(b"{}")
+        redirected.headers.get_content_type.return_value = "application/json"
+        opener = mock.Mock()
+        opener.open.return_value = redirected
+        with mock.patch.object(verify_release.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, "redirect"):
+                verify_release._installed_e2e_http(19097, "/health")
+
+        oversized = Response(b"x" * (64 * 1024 + 1))
+        oversized.geturl = lambda: "http://127.0.0.1:19097/api/queue"
+        oversized.headers.get_content_type.return_value = "application/json"
+        opener.open.return_value = oversized
+        with mock.patch.object(verify_release.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, "too large"):
+                verify_release._installed_e2e_http(19097, "/api/queue")
+
+        wrong_type = Response(b"{}")
+        wrong_type.geturl = lambda: "http://127.0.0.1:19097/health"
+        wrong_type.headers.get_content_type.return_value = "text/plain"
+        opener.open.return_value = wrong_type
+        with mock.patch.object(verify_release.urllib.request, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(RuntimeError, "Content-Type"):
+                verify_release._installed_e2e_http(19097, "/health")
+
+    def test_http_probe_rejects_a_stream_that_finishes_after_the_deadline(self) -> None:
+        clock = [0.0]
+
+        class SlowResponse(io.BytesIO):
+            status = 200
+            headers = mock.Mock()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def geturl(self) -> str:
+                return "http://127.0.0.1:19097/health"
+
+            def read(self, size: int = -1) -> bytes:
+                clock[0] = 6.0
+                return super().read(size)
+
+        response = SlowResponse(b"")
+        response.headers.get_content_type.return_value = "application/json"
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(
+            verify_release.urllib.request, "build_opener", return_value=opener
+        ), mock.patch.object(
+            verify_release.time, "monotonic", side_effect=lambda: clock[0]
+        ):
+            with self.assertRaisesRegex(RuntimeError, "deadline"):
+                verify_release._installed_e2e_http(19097, "/health")
+
+    def test_rollback_check_removes_all_temporary_install_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as value, mock.patch.object(
+            tempfile, "tempdir", value
+        ):
+            result = verify_release._rollback_check(ROOT)
+            leftovers = sorted(pathlib.Path(value).glob("verify-release-source*"))
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(leftovers, [])
 
     def test_installed_e2e_result_combines_primary_and_cleanup_failures(self) -> None:
         result = verify_release._installed_e2e_result(
