@@ -434,6 +434,22 @@ keep exactly
                     )
                 self.assertEqual(self.short_memory.read_bytes(), original)
 
+    def test_malformed_managed_tokens_before_or_between_valid_envelopes_are_read_only(self) -> None:
+        first = settings.render_managed_short_envelope("first", "one")
+        second = settings.render_managed_short_envelope("second", "two")
+        malformed = (
+            "<!-- vibe-memory:short:end -->\n",
+            "<!-- vibe-memory:short:begin length=x sha256=" + "0" * 64 + " -->\n",
+            "<!-- vibe-memory:short:begin length=3 sha256=" + "0" * 63 + " -->\n",
+        )
+        for token in malformed:
+            for original in ((token + first).encode(), (first + token + second).encode()):
+                with self.subTest(token=token[:28], position=original.startswith(token.encode())):
+                    self.short_memory.write_bytes(original)
+                    with self.assertRaisesRegex(ValueError, "malformed managed short"):
+                        settings.prune_personal_short(self.short_memory, retention_days=14)
+                    self.assertEqual(self.short_memory.read_bytes(), original)
+
     def test_context_omits_candidate_reminder_when_automatic_checks_are_disabled(self) -> None:
         event = NormalizedEvent(
             agent="codex",

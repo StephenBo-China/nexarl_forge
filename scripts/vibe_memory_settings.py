@@ -11,6 +11,7 @@ import re
 import stat
 import tempfile
 import uuid
+from contextlib import contextmanager
 from collections.abc import Callable
 from typing import Mapping
 
@@ -67,6 +68,14 @@ _FIRST_RUN_KEYS = {
 
 class FirstRunTransactionError(RuntimeError):
     """A first-run failure whose rollback also had reportable problems."""
+
+
+@contextmanager
+def lifecycle_lock(paths: RuntimePaths):
+    lock_path = pathlib.Path(paths.install_root) / ".lifecycle.vibe-memory.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with exclusive_lock(lock_path):
+        yield
 
 
 def default_settings() -> dict[str, object]:
@@ -341,6 +350,7 @@ def prune_personal_short(
     chunks: list[bytes] = []
     cursor = 0
     search = 0
+    marker_tokens = (b"vibe-memory:short:begin", b"vibe-memory:short:end")
     while True:
         match = _ENVELOPE_BEGIN.search(source, search)
         if match is None:
@@ -364,7 +374,10 @@ def prune_personal_short(
             expiry = None
         title = match.group(2).decode("utf-8").strip()
         remove = retention_days == 0 or (expiry is not None and expiry < cutoff)
-        chunks.append(source[cursor:match.start()])
+        gap = source[cursor:match.start()]
+        if any(token in gap for token in marker_tokens):
+            raise ValueError("malformed managed short envelope")
+        chunks.append(gap)
         if remove:
             removed.append(title)
             envelope_changed = True
@@ -378,7 +391,6 @@ def prune_personal_short(
             chunks.append(record)
         cursor = end_end
         search = end_end
-    marker_tokens = (b"vibe-memory:short:begin", b"vibe-memory:short:end")
     if cursor:
         if any(token in source[cursor:] for token in marker_tokens):
             raise ValueError("malformed managed short envelope")
@@ -464,9 +476,7 @@ def apply_first_run(
     )
     selected = normalized["settings"]
     assert isinstance(selected, dict)
-    lock_path = pathlib.Path(paths.install_root) / ".lifecycle.vibe-memory.lock"
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    with exclusive_lock(lock_path):
+    with lifecycle_lock(paths):
         old_settings = load_settings(paths)
         snapshots = {
             path: vibe_memory_install._snapshot_regular_file(path)

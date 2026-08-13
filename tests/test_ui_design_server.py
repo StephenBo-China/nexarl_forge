@@ -6,6 +6,7 @@ import pathlib
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -225,6 +226,41 @@ class UIDesignServerTest(unittest.TestCase):
             server.scheduled_bootout_worker(paths, stale["generation"])
             server.scheduled_bootout_worker(paths, current["generation"])
         bootout.assert_called_once_with()
+
+    def test_bootout_and_true_transaction_serialize_on_shared_lifecycle_lock(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "serialized-home")
+        action = server.write_service_action(paths, desired=False)
+        entered = threading.Event()
+        release = threading.Event()
+        order: list[str] = []
+        def bootout() -> None:
+            order.append("bootout-start")
+            entered.set()
+            release.wait(2)
+            order.append("bootout-end")
+        worker = threading.Thread(
+            target=server.scheduled_bootout_worker,
+            args=(paths, str(action["generation"])),
+        )
+        with mock.patch.object(
+            server.vibe_memory_settings.vibe_memory_install,
+            "bootout_launch_agent", side_effect=bootout,
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(1))
+            true_finished = threading.Event()
+            def true_request() -> None:
+                with vibe_memory_settings.lifecycle_lock(paths):
+                    server.write_service_action(paths, desired=True)
+                    order.append("true")
+                true_finished.set()
+            true_thread = threading.Thread(target=true_request)
+            true_thread.start()
+            self.assertFalse(true_finished.wait(0.05))
+            release.set()
+            worker.join(2)
+            true_thread.join(2)
+        self.assertEqual(order, ["bootout-start", "bootout-end", "true"])
 
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(

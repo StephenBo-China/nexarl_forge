@@ -138,7 +138,8 @@ def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths, generation
 
 def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths, generation: str) -> None:
     try:
-        complete_scheduled_bootout(paths, generation)
+        with vibe_memory_settings.lifecycle_lock(paths):
+            complete_scheduled_bootout(paths, generation)
     except Exception as error:  # Never leak a background traceback.
         try:
             if _service_action_matches(paths, generation, False):
