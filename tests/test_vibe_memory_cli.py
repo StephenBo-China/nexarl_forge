@@ -1670,6 +1670,51 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(output["status"], "repaired")
         self.assertEqual(repair.call_count, 2)
 
+    def test_hooks_repair_holds_lifecycle_lock(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        uninstall_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def repair(*_args: object) -> dict[str, object]:
+            entered.set()
+            release.wait(2)
+            return {"status": "current"}
+
+        def uninstall(*_args: object, **_kwargs: object) -> dict[str, object]:
+            uninstall_entered.set()
+            return {"status": "uninstalled"}
+
+        def run_hooks() -> None:
+            try:
+                vibe_memory_cli.hooks_command(argparse.Namespace(hooks_command="repair"))
+            except BaseException as error:
+                errors.append(error)
+
+        def run_uninstall() -> None:
+            try:
+                vibe_memory_cli.uninstall_command(argparse.Namespace(remove_data=False, approved_data_deletion=False, data_path=[]))
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch("vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.read_install_state", return_value={"installed_clients": ["codex"]}
+        ), mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}
+        ), mock.patch("vibe_memory_cli.vibe_memory_install.uninstall", side_effect=uninstall), mock.patch.object(vibe_memory_cli, "_json"):
+            hooks_thread = threading.Thread(target=run_hooks)
+            hooks_thread.start()
+            self.assertTrue(entered.wait(1))
+            uninstall_thread = threading.Thread(target=run_uninstall)
+            uninstall_thread.start()
+            self.assertFalse(uninstall_entered.wait(0.05))
+            release.set()
+            hooks_thread.join(2)
+            uninstall_thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(uninstall_entered.is_set())
+
 
 class InstallScriptContractTest(unittest.TestCase):
     def test_install_script_discovers_a_supported_python_without_usr_bin_hardcoding(self) -> None:

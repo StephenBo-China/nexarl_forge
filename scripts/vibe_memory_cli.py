@@ -776,6 +776,22 @@ def uninstall_command(args: argparse.Namespace) -> int:
 
 def hooks_command(args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
+    if args.hooks_command == "repair":
+        with vibe_memory_settings.lifecycle_lock(paths):
+            results, _current = _hooks_operation(paths, repair=True)
+        _json({"status": "repaired", "hooks": results})
+        return 0
+    results, current = _hooks_operation(paths, repair=False)
+    _json({
+        "status": "current" if current else "needs_repair",
+        "hooks": results,
+    })
+    return 0 if current else 1
+
+
+def _hooks_operation(
+    paths: vibe_memory_paths.RuntimePaths, *, repair: bool
+) -> tuple[dict[str, object], bool]:
     state = vibe_memory_install.read_install_state(paths)
     clients = [
         client for client in state.get("installed_clients", ["codex"])
@@ -784,23 +800,17 @@ def hooks_command(args: argparse.Namespace) -> int:
     results: dict[str, object] = {}
     for client in clients:
         target, agent, label = vibe_memory_install._hook_target_for_client(paths, client)
-        if args.hooks_command == "status":
-            results[label] = vibe_memory_hooks.status(target, agent, paths.launcher)
-        else:
+        if repair:
             results[label] = vibe_memory_hooks.repair(target, agent, paths.launcher)
-    if args.hooks_command == "repair":
+        else:
+            results[label] = vibe_memory_hooks.status(target, agent, paths.launcher)
+    if repair:
         vibe_memory_install.smoke_managed_hooks(paths, clients)
     current = all(
         isinstance(result, dict) and result.get("status") == "current"
         for result in results.values()
     )
-    _json({
-        "status": "current" if args.hooks_command == "status" and current else (
-            "needs_repair" if args.hooks_command == "status" else "repaired"
-        ),
-        "hooks": results,
-    })
-    return 0 if args.hooks_command == "repair" or current else 1
+    return results, current
 
 
 def hook_command(args: argparse.Namespace) -> int:
