@@ -13,7 +13,10 @@ import stat
 import subprocess
 from string import Template
 import sys
+import time
 from typing import Any, Callable
+import urllib.error
+import urllib.request
 import uuid
 from xml.sax.saxutils import escape
 
@@ -80,6 +83,193 @@ class TemporaryCleanupConflict(RuntimeError):
 
 class InstallError(RuntimeError):
     """Raised when an install lifecycle operation safely refuses to continue."""
+
+
+LAUNCH_AGENT_LABEL = "com.noema.vibe-memory"
+LaunchctlRunner = Callable[..., subprocess.CompletedProcess[str]]
+
+
+def launchctl_domain(uid: int | None = None) -> str:
+    """Return the per-user launchd domain without consulting HOME."""
+    selected = os.getuid() if uid is None else uid
+    if isinstance(selected, bool) or not isinstance(selected, int) or selected < 0:
+        raise InstallError("launchctl uid must be a non-negative integer")
+    return f"gui/{selected}"
+
+
+def _run_launchctl(
+    arguments: list[str],
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    command = ["/bin/launchctl", *arguments]
+    try:
+        completed = runner(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise InstallError(f"launchctl {arguments[0]} failed") from error
+    if not isinstance(completed, subprocess.CompletedProcess):
+        raise InstallError(f"launchctl {arguments[0]} returned an invalid result")
+    return completed
+
+
+def _service_absent(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode not in {3, 113}:
+        return False
+    message = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
+    return any(
+        marker in message
+        for marker in ("no such process", "could not find service", "service not found")
+    )
+
+
+def bootout_launch_agent(
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+    uid: int | None = None,
+) -> dict[str, object]:
+    service = f"{launchctl_domain(uid)}/{LAUNCH_AGENT_LABEL}"
+    completed = _run_launchctl(["bootout", service], runner=runner)
+    if completed.returncode == 0:
+        return {"status": "booted_out", "absent": False}
+    if _service_absent(completed):
+        return {"status": "absent", "absent": True}
+    raise InstallError(f"launchctl bootout failed with exit code {completed.returncode}")
+
+
+def bootstrap_launch_agent(
+    paths: RuntimePaths,
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+    uid: int | None = None,
+) -> dict[str, object]:
+    completed = _run_launchctl(
+        ["bootstrap", launchctl_domain(uid), str(paths.launch_agent)], runner=runner
+    )
+    if completed.returncode != 0:
+        raise InstallError(f"launchctl bootstrap failed with exit code {completed.returncode}")
+    return {"status": "bootstrapped"}
+
+
+def kickstart_launch_agent(
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+    uid: int | None = None,
+) -> dict[str, object]:
+    service = f"{launchctl_domain(uid)}/{LAUNCH_AGENT_LABEL}"
+    completed = _run_launchctl(["kickstart", "-k", service], runner=runner)
+    if completed.returncode != 0:
+        raise InstallError(f"launchctl kickstart failed with exit code {completed.returncode}")
+    return {"status": "kickstarted"}
+
+
+def _health_payload(paths: RuntimePaths, timeout: float = 0.6) -> dict[str, object]:
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req: object, fp: object, code: int, msg: str, headers: object, newurl: str) -> None:
+            return None
+
+    try:
+        port = read_runtime_config(paths)["port"]
+        url = f"http://127.0.0.1:{port}/health"
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(url, timeout=timeout) as response:
+            if response.status != 200 or response.geturl() != url:
+                return {"ok": False}
+            raw = response.read(4097)
+            if len(raw) > 4096:
+                return {"ok": False}
+        value = json.loads(raw.decode("utf-8"))
+        return value if isinstance(value, dict) else {"ok": False}
+    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError):
+        return {"ok": False}
+
+
+def activate_launch_agent(
+    paths: RuntimePaths,
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+    health: Callable[[], dict[str, object]] | None = None,
+    expected_version: str | None = None,
+    uid: int | None = None,
+    attempts: int = 20,
+    delay: float = 0.1,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> dict[str, object]:
+    """Replace the user service and require an identity-bound health response."""
+    if attempts < 1:
+        raise InstallError("health attempts must be positive")
+    expected = expected_version or str(read_runtime_config(paths)["app_version"])
+    bootout_launch_agent(runner=runner, uid=uid)
+    bootstrapped = False
+    try:
+        bootstrap_launch_agent(paths, runner=runner, uid=uid)
+        bootstrapped = True
+        kickstart_launch_agent(runner=runner, uid=uid)
+        probe = health or (lambda: _health_payload(paths))
+        for attempt in range(attempts):
+            payload = probe()
+            if (
+                isinstance(payload, dict)
+                and payload.get("ok") is True
+                and payload.get("service") == "vibe-memory"
+                and payload.get("app_version") == expected
+            ):
+                return {"status": "healthy", "service": LAUNCH_AGENT_LABEL, "health": payload}
+            if attempt + 1 < attempts:
+                sleeper(delay)
+        raise InstallError("launch agent health check failed")
+    except Exception:
+        if bootstrapped:
+            try:
+                bootout_launch_agent(runner=runner, uid=uid)
+            except InstallError:
+                pass
+        raise
+
+
+def smoke_managed_hooks(
+    paths: RuntimePaths,
+    clients: list[str],
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+) -> dict[str, dict[str, object]]:
+    """Run each installed hook entry point with harmless empty JSON."""
+    results: dict[str, dict[str, object]] = {}
+    for client in clients:
+        if client not in {"codex", "claude-code"}:
+            raise InstallError(f"unsupported managed hook client: {client}")
+        command = [
+            str(paths.launcher), "hook", "--agent", client, "--event", "SessionStart"
+        ]
+        try:
+            completed = runner(
+                command,
+                input="{}",
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise InstallError(f"{client} hook smoke test failed") from error
+        if not isinstance(completed, subprocess.CompletedProcess) or completed.returncode != 0:
+            raise InstallError(f"{client} hook smoke test failed")
+        try:
+            payload = json.loads(completed.stdout)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise InstallError(f"{client} hook smoke test returned invalid JSON") from error
+        if not isinstance(payload, dict):
+            raise InstallError(f"{client} hook smoke test returned invalid JSON")
+        results["claude" if client == "claude-code" else client] = {
+            "ok": True,
+            "status": payload.get("status", "ok"),
+        }
+    return results
 
 
 def probe_python(executable: str) -> tuple[int, int] | None:
@@ -2136,7 +2326,11 @@ def update(
     """Install a new runtime release, validate it, then switch current."""
     previous_version = _current_version(paths)
     runtime_config = pathlib.Path(paths.install_root) / "config.json"
-    config_before = _snapshot_regular_file(runtime_config)
+    state_path = install_state_path(paths)
+    clients = installed_clients or _installed_clients(paths)
+    managed_paths = [runtime_config, pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), state_path]
+    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     selected_port = _runtime_port(paths, port)
     selected_python = _runtime_python(paths)
     try:
@@ -2151,16 +2345,17 @@ def update(
         install_launcher(paths, python_executable=selected_python)
         control_plane = _validate_control_plane(paths, validation)
         _activate_managed_version(paths, new_version)
-        clients = installed_clients
-        if clients is None:
-            state = read_install_state(paths)
-            clients = [
-                item
-                for item in state.get("installed_clients", ["codex"])
-                if item in {"codex", "claude-code"}
-            ]
         if not clients:
             clients = ["codex"]
+        install_launch_agent(
+            paths,
+            render_launch_agent(paths, port=selected_port, python_executable=selected_python),
+        )
+        import vibe_memory_hooks
+        for hook_path, agent, _label in (
+            _hook_target_for_client(paths, client) for client in clients
+        ):
+            vibe_memory_hooks.repair(hook_path, agent, paths.launcher)
         write_install_state(
             paths,
             _install_state_document(
@@ -2171,16 +2366,29 @@ def update(
                 python_executable=selected_python,
             ),
         )
+        service = activate_launch_agent(paths, expected_version=new_version)
+        hook_smoke = smoke_managed_hooks(paths, clients)
         return {
             "status": "updated",
             "current_version": new_version,
             "previous_version": previous_version,
             "control_plane": control_plane,
+            "service": service,
+            "hook_smoke": hook_smoke,
         }
     except Exception as error:
-        _restore_regular_file(runtime_config, config_before)
+        try:
+            bootout_launch_agent()
+        except InstallError:
+            pass
+        for path, snapshot in snapshots.items():
+            _restore_regular_file(path, snapshot)
         if previous_version is not None:
             _activate_managed_version(paths, previous_version)
+            try:
+                activate_launch_agent(paths, expected_version=previous_version)
+            except InstallError as restart_error:
+                raise InstallError("update failed and previous service could not be restarted") from restart_error
         if isinstance(error, InstallError):
             raise
         raise InstallError("update failed") from error
@@ -2193,28 +2401,49 @@ def rollback(paths: RuntimePaths) -> dict[str, Any]:
     if not isinstance(previous_version, str) or not previous_version:
         raise InstallError("no previous runtime version is recorded")
     current_version = _current_version(paths) or state.get("current_version")
+    managed_paths = [
+        pathlib.Path(paths.install_root) / "config.json",
+        pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), install_state_path(paths),
+    ]
+    clients = _installed_clients(paths)
+    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     _activate_managed_version(paths, previous_version)
     port = int(state.get("port", 8897))
-    clients = [
-        item
-        for item in state.get("installed_clients", ["codex"])
-        if item in {"codex", "claude-code"}
-    ] or ["codex"]
-    write_install_state(
-        paths,
-        _install_state_document(
+    try:
+        python = state.get("python_executable") if isinstance(state.get("python_executable"), str) else _runtime_python(paths)
+        install_runtime_config(paths, port=port, app_version=previous_version, python_executable=python)
+        install_launcher(paths, python_executable=python)
+        install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python))
+        import vibe_memory_hooks
+        for hook_path, agent, _label in (_hook_target_for_client(paths, client) for client in clients):
+            vibe_memory_hooks.repair(hook_path, agent, paths.launcher)
+        write_install_state(paths, _install_state_document(
             current_version=previous_version,
             previous_version=current_version if isinstance(current_version, str) else None,
             port=port,
             installed_clients=clients,
-            python_executable=state.get("python_executable") if isinstance(state.get("python_executable"), str) else _runtime_python(paths),
-        ),
-    )
+            python_executable=python,
+        ))
+        service = activate_launch_agent(paths, expected_version=previous_version)
+        smoke_managed_hooks(paths, clients)
+    except Exception as error:
+        try:
+            bootout_launch_agent()
+        except InstallError:
+            pass
+        for path, snapshot in snapshots.items():
+            _restore_regular_file(path, snapshot)
+        if isinstance(current_version, str):
+            _activate_managed_version(paths, current_version)
+            activate_launch_agent(paths, expected_version=current_version)
+        raise InstallError("rollback failed") from error
     return {
         "status": "rolled_back",
         "current_version": previous_version,
         "previous_version": current_version,
         "data_retained": True,
+        "service": service,
     }
 
 
@@ -2242,18 +2471,45 @@ def repair(paths: RuntimePaths) -> dict[str, Any]:
     runtime = pathlib.Path(paths.install_root) / "current"
     if not runtime.is_symlink():
         raise InstallError("current runtime is not installed")
-    port = int(read_runtime_config(paths)["port"])
-    launcher = install_launcher(paths)
-    launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port))
-    hook_results = {}
-    for path, agent, label in (_hook_target_for_client(paths, client) for client in _installed_clients(paths)):
-        hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)
+    current_version = _current_version(paths)
+    if current_version is None:
+        raise InstallError("current runtime is not installed")
+    clients = _installed_clients(paths)
+    managed_paths = [
+        pathlib.Path(paths.install_root) / "config.json", pathlib.Path(paths.launch_agent),
+        pathlib.Path(paths.launcher), install_state_path(paths),
+    ]
+    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
+    try:
+        port = int(read_runtime_config(paths)["port"])
+        launcher = install_launcher(paths)
+        launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port))
+        hook_results = {}
+        for path, agent, label in (_hook_target_for_client(paths, client) for client in clients):
+            hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)
+        service = activate_launch_agent(paths, expected_version=current_version)
+        smoke = smoke_managed_hooks(paths, clients)
+    except Exception as error:
+        try:
+            bootout_launch_agent()
+        except InstallError:
+            pass
+        for path, snapshot in snapshots.items():
+            _restore_regular_file(path, snapshot)
+        try:
+            activate_launch_agent(paths, expected_version=current_version)
+        except InstallError as restart_error:
+            raise InstallError("repair failed and previous service could not be restarted") from restart_error
+        raise InstallError("repair failed") from error
     return {
         "status": "repaired",
         "launch_agent": launch_agent,
         "launcher": launcher,
         "hooks": hook_results,
         "data_retained": True,
+        "service": service,
+        "hook_smoke": smoke,
     }
 
 
@@ -2318,6 +2574,8 @@ def uninstall(
     import vibe_memory_hooks
 
     removed: list[str] = []
+    service = bootout_launch_agent()
+    state = read_install_state(paths)
     hook_results = {}
     for client in ("codex", "claude-code"):
         path, _agent, label = _hook_target_for_client(paths, client)
@@ -2340,6 +2598,20 @@ def uninstall(
     for path in (pathlib.Path(paths.install_root) / "config.json", install_state_path(paths)):
         if _unlink_regular_file(path):
             removed.append(str(path))
+    release_versions = {
+        value for value in (state.get("current_version"), state.get("previous_version"))
+        if isinstance(value, str)
+    }
+    releases_root = pathlib.Path(paths.install_root) / "releases"
+    for version in sorted(release_versions):
+        release = releases_root / version
+        if release.is_symlink():
+            raise InstallError(f"managed release must not be a symlink: {release}")
+        if release.exists():
+            if not release.is_dir():
+                raise InstallError(f"managed release must be a directory: {release}")
+            shutil.rmtree(release)
+            removed.append(str(release))
     deleted_data: list[str] = []
     if remove_data:
         allowed = {
@@ -2357,4 +2629,5 @@ def uninstall(
         "hooks": hook_results,
         "data_retained": not remove_data,
         "deleted_data": deleted_data,
+        "service": service,
     }

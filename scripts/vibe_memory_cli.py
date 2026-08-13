@@ -336,6 +336,7 @@ def install_command(args: argparse.Namespace) -> int:
     hooks: dict[str, dict[str, object]] = {}
     rollback_paths: set[pathlib.Path] = set()
     attempted_hook_targets: set[pathlib.Path] = set()
+    lifecycle_attempted = False
     try:
         installed = vibe_memory_install.install_runtime(pathlib.Path(args.source_root), paths)
         data = vibe_memory_install.prepare_data(paths)
@@ -377,6 +378,11 @@ def install_command(args: argparse.Namespace) -> int:
                 python_executable=python_executable,
             ),
         )
+        lifecycle_attempted = True
+        service = vibe_memory_install.activate_launch_agent(
+            paths, expected_version=installed["version"]
+        )
+        smoke = vibe_memory_install.smoke_managed_hooks(paths, clients)
         _json({
             "status": "installed",
             "runtime": installed,
@@ -387,10 +393,17 @@ def install_command(args: argparse.Namespace) -> int:
             "data": data,
             "launch_agent": plist_result,
             "hooks": hooks,
+            "service": service,
+            "hook_smoke": smoke,
         })
         return 0
     except Exception:
         rollback_errors = []
+        if lifecycle_attempted:
+            try:
+                vibe_memory_install.bootout_launch_agent()
+            except Exception:
+                rollback_errors.append("launchctl bootout")
         for target in rollback_paths:
             try:
                 _restore_managed_file(target, snapshots[target])
@@ -545,6 +558,35 @@ def uninstall_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def hooks_command(args: argparse.Namespace) -> int:
+    paths = vibe_memory_paths.for_home()
+    state = vibe_memory_install.read_install_state(paths)
+    clients = [
+        client for client in state.get("installed_clients", ["codex"])
+        if client in {"codex", "claude-code"}
+    ] or ["codex"]
+    results: dict[str, object] = {}
+    for client in clients:
+        target, agent, label = vibe_memory_install._hook_target_for_client(paths, client)
+        if args.hooks_command == "status":
+            results[label] = vibe_memory_hooks.status(target, agent, paths.launcher)
+        else:
+            results[label] = vibe_memory_hooks.repair(target, agent, paths.launcher)
+    if args.hooks_command == "repair":
+        vibe_memory_install.smoke_managed_hooks(paths, clients)
+    current = all(
+        isinstance(result, dict) and result.get("status") == "current"
+        for result in results.values()
+    )
+    _json({
+        "status": "current" if args.hooks_command == "status" and current else (
+            "needs_repair" if args.hooks_command == "status" else "repaired"
+        ),
+        "hooks": results,
+    })
+    return 0 if args.hooks_command == "repair" or current else 1
+
+
 def hook_command(args: argparse.Namespace) -> int:
     try:
         router = importlib.import_module("vibe_memory_router")
@@ -641,6 +683,12 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--approved-data-deletion", action="store_true")
     uninstall.add_argument("--data-path", action="append", default=[])
     uninstall.set_defaults(command_handler=uninstall_command)
+
+    hooks = subcommands.add_parser("hooks", help="Inspect or repair managed hooks")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", required=True)
+    hooks_sub.add_parser("status")
+    hooks_sub.add_parser("repair")
+    hooks.set_defaults(command_handler=hooks_command)
     return parser
 
 

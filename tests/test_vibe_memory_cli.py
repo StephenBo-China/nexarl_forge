@@ -33,8 +33,20 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.home = pathlib.Path(self.temporary.name) / "home"
         self.home.mkdir()
         self.paths = vibe_memory_cli.vibe_memory_paths.for_home(self.home)
+        self.lifecycle = mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            return_value={"status": "healthy"},
+        )
+        self.smoke = mock.patch(
+            "vibe_memory_cli.vibe_memory_install.smoke_managed_hooks",
+            return_value={"codex": {"ok": True}},
+        )
+        self.lifecycle.start()
+        self.smoke.start()
 
     def tearDown(self) -> None:
+        self.smoke.stop()
+        self.lifecycle.stop()
         self.temporary.cleanup()
 
     def invoke(self, argv: list[str]) -> tuple[int, object, str]:
@@ -227,7 +239,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(result["runtime"]["status"], "python_error")
         self.assertFalse(marker.exists())
 
-    def test_install_delegates_runtime_plist_and_hooks_without_launchctl(self) -> None:
+    def test_install_activates_service_and_smoke_tests_managed_hooks_after_commit(self) -> None:
         runtime = self.paths.install_root / "current"
         launcher = self.paths.launcher
         args = ["install", "--source-root", "/portable/source", "--with-claude-hooks"]
@@ -243,6 +255,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 mock.patch("vibe_memory_cli.vibe_memory_install.render_launcher", return_value="#!/bin/sh\n") as render_launcher, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launcher", return_value={"changed": True, "path": "launcher"}) as install_launcher, \
                 mock.patch("vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True, "path": "agent"}) as write, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}) as activate, \
+                mock.patch("vibe_memory_cli.vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}, "claude": {"ok": True}}) as smoke, \
                 mock.patch("vibe_memory_cli.vibe_memory_migration.validate_control_plane", return_value={"projects": "ok"}) as validate_control, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.preview", return_value={"status": "missing"}) as preview, \
                 mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", side_effect=[{"status": "created", "changed": True}, {"status": "created", "changed": True}]) as repair, \
@@ -280,6 +294,8 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         )
         write_state.assert_called_once_with(self.paths, {"state": True})
         write.assert_called_once()
+        activate.assert_called_once_with(self.paths, expected_version="1.0.0")
+        smoke.assert_called_once_with(self.paths, ["codex", "claude-code"])
         validate_control.assert_called_once()
         self.assertIs(validate_control.call_args.args[0], self.paths)
         self.assertEqual(repair.call_args_list, [
@@ -289,6 +305,25 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(preview.call_count, 2)
         run.assert_not_called()
         self.assertEqual(output["status"], "installed")
+
+    def test_install_health_failure_restores_files_and_boots_out_failed_service(self) -> None:
+        plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
+        plist.parent.mkdir(parents=True)
+        plist.write_text("old plist\n", encoding="utf-8")
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            side_effect=vibe_memory_cli.vibe_memory_install.InstallError("health failed"),
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.bootout_launch_agent"
+        ) as bootout:
+            code, output, stderr = self.invoke(["install", "--source-root", str(ROOT)])
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["phase"], "commit")
+        self.assertTrue(output["rollback"]["ok"])
+        self.assertEqual(plist.read_text(encoding="utf-8"), "old plist\n")
+        self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
+        bootout.assert_called_once_with()
 
     def test_install_error_is_nonzero_and_not_hook_degraded(self) -> None:
         with mock.patch("vibe_memory_cli.vibe_memory_install.validate_runtime_source", side_effect=ValueError("unsafe source")):
@@ -497,28 +532,16 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             source,
             ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
         )
+        code, _installed, stderr = self.invoke(["install", "--source-root", str(source)])
+        self.assertEqual(code, 0, stderr)
+        shutil.rmtree(source)
+
         environment = os.environ.copy()
         environment.update({
             "HOME": str(self.home),
             "VIBE_MEMORY_PYTHON": sys.executable,
             "PYTHONDONTWRITEBYTECODE": "1",
         })
-        installed = subprocess.run(
-            [
-                sys.executable,
-                str(source / "scripts/vibe_memory_cli.py"),
-                "install",
-                "--source-root",
-                str(source),
-            ],
-            cwd=source,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        self.assertEqual(installed.returncode, 0, installed.stderr)
-        shutil.rmtree(source)
 
         status = subprocess.run(
             [str(self.paths.launcher), "status"],
@@ -745,6 +768,25 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             approved_data_deletion=False,
             data_paths=[],
         )
+
+    def test_hooks_status_and_repair_use_installed_clients_and_runtime_home(self) -> None:
+        state = {"installed_clients": ["codex", "claude-code"]}
+        with mock.patch("vibe_memory_cli.vibe_memory_install.read_install_state", return_value=state), \
+                mock.patch("vibe_memory_cli.vibe_memory_hooks.status", return_value={"status": "current"}) as status:
+            code, output, stderr = self.invoke(["hooks", "status"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "current")
+        self.assertEqual(status.call_args_list, [
+            mock.call(self.home / ".codex/hooks.json", "codex", self.paths.launcher),
+            mock.call(self.home / ".claude/settings.json", "claude-code", self.paths.launcher),
+        ])
+
+        with mock.patch("vibe_memory_cli.vibe_memory_install.read_install_state", return_value=state), \
+                mock.patch("vibe_memory_cli.vibe_memory_hooks.repair", return_value={"status": "current"}) as repair:
+            code, output, stderr = self.invoke(["hooks", "repair"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "repaired")
+        self.assertEqual(repair.call_count, 2)
 
 
 class InstallScriptContractTest(unittest.TestCase):

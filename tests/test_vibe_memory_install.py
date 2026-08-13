@@ -2363,7 +2363,9 @@ class RuntimeInstallTest(unittest.TestCase):
             memory.parent.mkdir(parents=True)
             memory.write_text("approved after upgrade\n", encoding="utf-8")
 
-            result = vibe_memory_install.rollback(paths)
+            with mock.patch("vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}), \
+                    mock.patch("vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}):
+                result = vibe_memory_install.rollback(paths)
 
             self.assertEqual(result["current_version"], "1.0.0")
             self.assertTrue(result["data_retained"])
@@ -2442,6 +2444,182 @@ class RuntimeInstallTest(unittest.TestCase):
                 {"runtime", "codex_hooks", "claude_hooks", "service", "data"},
             )
             self.assertNotIn("/Users/stephenbo", completed.stdout)
+
+
+class FakeLaunchctlRunner:
+    def __init__(self, results: list[subprocess.CompletedProcess[str]] | None = None) -> None:
+        self.results = list(results or [])
+        self.commands: list[list[str]] = []
+
+    def __call__(self, command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        self.commands.append(command)
+        if self.results:
+            return self.results.pop(0)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+
+class LaunchAgentLifecycleTest(unittest.TestCase):
+    def make_paths(self, root: pathlib.Path) -> vibe_memory_paths.RuntimePaths:
+        return vibe_memory_paths.for_home(root / "home")
+
+    def test_launchctl_domain_uses_explicit_or_current_uid(self) -> None:
+        self.assertEqual(vibe_memory_install.launchctl_domain(501), "gui/501")
+        with mock.patch("vibe_memory_install.os.getuid", return_value=777):
+            self.assertEqual(vibe_memory_install.launchctl_domain(), "gui/777")
+
+    def test_activate_boots_out_absent_service_then_bootstraps_kickstarts_and_checks_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner([
+                subprocess.CompletedProcess([], 3, "", "Boot-out failed: 3: No such process"),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ])
+            health = mock.Mock(return_value={
+                "ok": True, "service": "vibe-memory", "app_version": "1.0.0"
+            })
+
+            result = vibe_memory_install.activate_launch_agent(
+                paths, runner=runner, health=health, expected_version="1.0.0", uid=501,
+                attempts=1, sleeper=lambda _delay: None,
+            )
+
+            self.assertEqual(result["status"], "healthy")
+            self.assertEqual(runner.commands, [
+                ["/bin/launchctl", "bootout", "gui/501/com.noema.vibe-memory"],
+                ["/bin/launchctl", "bootstrap", "gui/501", str(paths.launch_agent)],
+                ["/bin/launchctl", "kickstart", "-k", "gui/501/com.noema.vibe-memory"],
+            ])
+
+    def test_bootout_rejects_non_absent_failure(self) -> None:
+        runner = FakeLaunchctlRunner([
+            subprocess.CompletedProcess([], 5, "", "Boot-out failed: 5: Input/output error")
+        ])
+        with self.assertRaisesRegex(vibe_memory_install.InstallError, "bootout"):
+            vibe_memory_install.bootout_launch_agent(runner=runner, uid=501)
+
+    def test_activate_health_failure_boots_out_new_service(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner()
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "health"):
+                vibe_memory_install.activate_launch_agent(
+                    paths, runner=runner,
+                    health=lambda: {"ok": True, "service": "other", "app_version": "1.0.0"},
+                    expected_version="1.0.0", uid=501, attempts=2,
+                    sleeper=lambda _delay: None,
+                )
+            self.assertEqual(runner.commands[-1], [
+                "/bin/launchctl", "bootout", "gui/501/com.noema.vibe-memory"
+            ])
+
+    def test_smoke_managed_hooks_passes_harmless_json_without_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{"status":"ok"}\n', ""))
+            result = vibe_memory_install.smoke_managed_hooks(
+                paths, ["codex", "claude-code"], runner=runner
+            )
+            self.assertTrue(result["codex"]["ok"])
+            self.assertTrue(result["claude"]["ok"])
+            self.assertEqual([call.args[0][-5:] for call in runner.call_args_list], [
+                ["hook", "--agent", "codex", "--event", "SessionStart"],
+                ["hook", "--agent", "claude-code", "--event", "SessionStart"],
+            ])
+            self.assertTrue(all(call.kwargs["input"] == "{}" for call in runner.call_args_list))
+
+    def test_update_renders_matching_assets_restarts_and_smokes_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(root, {**MANIFEST, "app_version": "1.1.0"})
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.0.0", python_executable=sys.executable)
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(
+                current_version="1.0.0", previous_version=None, port=9123,
+                installed_clients=["codex"], python_executable=sys.executable,
+            ))
+            with mock.patch("vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}) as activate, \
+                    mock.patch("vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}) as smoke, \
+                    mock.patch("vibe_memory_hooks.repair", return_value={"status": "created"}):
+                result = vibe_memory_install.update(source, paths, validation={"control": "ok"})
+            self.assertEqual(result["current_version"], "1.1.0")
+            activate.assert_called_once_with(paths, expected_version="1.1.0")
+            smoke.assert_called_once_with(paths, ["codex"])
+            self.assertEqual(vibe_memory_install.read_runtime_config(paths)["app_version"], "1.1.0")
+            self.assertIn("/current/scripts/memory_review_server.py", paths.launch_agent.read_text(encoding="utf-8"))
+
+    def test_uninstall_boots_out_before_removing_owned_releases_and_runtime_home_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            home = paths.personal_memory.parents[1]
+            release = paths.install_root / "releases/1.0.0"
+            release.mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(
+                current_version="1.0.0", previous_version=None, port=9123,
+                installed_clients=["codex"], python_executable=sys.executable,
+            ))
+            hook = home / ".codex/hooks.json"
+            hook.parent.mkdir(parents=True)
+            hook.write_text(json.dumps(vibe_memory_hooks.merge_document({"hooks": {}}, "codex", paths.launcher)), encoding="utf-8")
+            order: list[str] = []
+            with mock.patch("vibe_memory_install.bootout_launch_agent", side_effect=lambda: order.append("bootout")), \
+                    mock.patch("vibe_memory_hooks.uninstall", side_effect=lambda path: order.append(str(path)) or {"status": "removed"}):
+                result = vibe_memory_install.uninstall(paths)
+            self.assertEqual(order[0], "bootout")
+            self.assertIn(str(hook), order)
+            self.assertFalse(release.exists())
+            self.assertTrue(result["data_retained"])
+
+    def test_repair_health_failure_restores_all_managed_files_and_restarts_old_service(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.0.0", python_executable=sys.executable)
+            vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+            vibe_memory_install.install_launch_agent(paths, vibe_memory_install.render_launch_agent(paths, port=9123, python_executable=sys.executable))
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(
+                current_version="1.0.0", previous_version=None, port=9123,
+                installed_clients=["codex"], python_executable=sys.executable,
+            ))
+            hook = paths.personal_memory.parents[1] / ".codex/hooks.json"
+            hook.parent.mkdir(parents=True)
+            hook.write_text('{"custom":true}\n', encoding="utf-8")
+            managed = [paths.install_root / "config.json", paths.launcher, paths.launch_agent, hook, vibe_memory_install.install_state_path(paths)]
+            before = {path: path.read_bytes() for path in managed}
+            with mock.patch("vibe_memory_install.activate_launch_agent", side_effect=[
+                vibe_memory_install.InstallError("health failed"), {"status": "healthy"}
+            ]) as activate:
+                with self.assertRaisesRegex(vibe_memory_install.InstallError, "repair failed"):
+                    vibe_memory_install.repair(paths)
+            self.assertEqual(before, {path: path.read_bytes() for path in managed})
+            self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.0.0"))
+
+    def test_rollback_health_failure_restores_assets_state_current_and_restarts_original(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            for version in ("1.0.0", "1.1.0"):
+                (paths.install_root / "releases" / version).mkdir(parents=True)
+            current = paths.install_root / "current"
+            current.symlink_to("releases/1.1.0")
+            vibe_memory_install.install_runtime_config(paths, port=9123, app_version="1.1.0", python_executable=sys.executable)
+            vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+            vibe_memory_install.install_launch_agent(paths, vibe_memory_install.render_launch_agent(paths, port=9123, python_executable=sys.executable))
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(current_version="1.1.0", previous_version="1.0.0", port=9123, installed_clients=["codex"], python_executable=sys.executable))
+            hook = paths.personal_memory.parents[1] / ".codex/hooks.json"
+            hook.parent.mkdir(parents=True)
+            hook.write_text('{"custom":true}\n', encoding="utf-8")
+            managed = [paths.install_root / "config.json", paths.launcher, paths.launch_agent, hook, vibe_memory_install.install_state_path(paths)]
+            before = {path: path.read_bytes() for path in managed}
+            with mock.patch("vibe_memory_install.activate_launch_agent", side_effect=[vibe_memory_install.InstallError("health failed"), {"status": "healthy"}]) as activate:
+                with self.assertRaisesRegex(vibe_memory_install.InstallError, "rollback failed"):
+                    vibe_memory_install.rollback(paths)
+            self.assertEqual(os.readlink(current), "releases/1.1.0")
+            self.assertEqual(before, {path: path.read_bytes() for path in managed})
+            self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.1.0"))
 
 
 if __name__ == "__main__":

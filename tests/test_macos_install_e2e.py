@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -25,17 +27,22 @@ def create_legacy_install(base: pathlib.Path):
     return build_complete_legacy_fixture(base)
 
 
-def _run_install(home: pathlib.Path, *, with_claude_hooks: bool) -> subprocess.CompletedProcess[str]:
+def _free_port() -> int:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+    except PermissionError as error:
+        raise unittest.SkipTest("sandbox does not allow disposable loopback listeners") from error
+
+
+def _run_install(home: pathlib.Path, *, with_claude_hooks: bool, port: int) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["HOME"] = str(home)
     command = [
-        sys.executable,
-        str(ROOT / "scripts" / "vibe_memory_cli.py"),
-        "install",
-        "--source-root",
-        str(ROOT),
+        str(ROOT / "install.sh"),
         "--port",
-        "18997",
+        str(port),
     ]
     if with_claude_hooks:
         command.append("--with-claude-hooks")
@@ -73,12 +80,37 @@ def _business_data_digest(home: pathlib.Path) -> str:
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS installer contract")
 class MacOSInstallE2ETest(unittest.TestCase):
+    service = f"gui/{os.getuid()}/com.noema.vibe-memory"
+
+    def setUp(self) -> None:
+        existing = subprocess.run(
+            ["/bin/launchctl", "print", self.service],
+            capture_output=True, text=True, check=False,
+        )
+        if existing.returncode == 0:
+            self.skipTest("fixed product LaunchAgent label is already loaded; refusing to disturb it")
+
+    def tearDown(self) -> None:
+        subprocess.run(
+            ["/bin/launchctl", "bootout", self.service],
+            capture_output=True, text=True, check=False,
+        )
+        for _attempt in range(20):
+            printed = subprocess.run(
+                ["/bin/launchctl", "print", self.service],
+                capture_output=True, text=True, check=False,
+            )
+            if printed.returncode != 0:
+                break
+            time.sleep(0.05)
+
     def test_clean_install_codex_only(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             home = pathlib.Path(value) / "home"
             home.mkdir()
+            port = _free_port()
 
-            result = _run_install(home, with_claude_hooks=False)
+            result = _run_install(home, with_claude_hooks=False, port=port)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             paths = vibe_memory_paths.for_home(home)
@@ -94,11 +126,18 @@ class MacOSInstallE2ETest(unittest.TestCase):
                 memory_review_server.server_address(
                     {
                         "MEMORY_REVIEW_HOST": "127.0.0.1",
-                        "MEMORY_REVIEW_PORT": "18997",
+                        "MEMORY_REVIEW_PORT": str(port),
                     }
                 ),
-                ("127.0.0.1", 18997),
+                ("127.0.0.1", port),
             )
+            doctor = subprocess.run(
+                [str(paths.launcher), "doctor", "--json"],
+                env={**os.environ, "HOME": str(home)}, capture_output=True,
+                text=True, check=False,
+            )
+            self.assertEqual(doctor.returncode, 0, doctor.stdout + doctor.stderr)
+            self.assertTrue(json.loads(doctor.stdout)["service"]["ok"])
 
     def test_legacy_install_preserves_every_control_plane(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -106,8 +145,9 @@ class MacOSInstallE2ETest(unittest.TestCase):
             fixture = create_legacy_install(base)
             home = fixture.paths.personal_memory.parents[1]
             before = _business_data_digest(home)
+            port = _free_port()
 
-            result = _run_install(home, with_claude_hooks=True)
+            result = _run_install(home, with_claude_hooks=True, port=port)
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(_business_data_digest(home), before)
