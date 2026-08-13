@@ -75,6 +75,9 @@ vibe-memory start && vibe-memory open
 
 The manual plist sets both `RunAtLoad=false` and `KeepAlive=false`, so it does
 not start at the next login and does not automatically relaunch after exit.
+If login startup is enabled, `vibe-memory start` preserves both lifecycle keys
+as true. In either mode it starts the current session without changing the
+saved preference.
 
 ## Register and initialize a workspace
 

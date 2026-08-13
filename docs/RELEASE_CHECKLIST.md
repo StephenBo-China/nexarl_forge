@@ -40,6 +40,9 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
   plist with both `RunAtLoad=false` and `KeepAlive=false`, starts a healthy
   current service, does not change the persisted preference, and has no
   simulated next-login auto-start or automatic relaunch semantics.
+- [ ] With login startup enabled, run `vibe-memory start`; prove the persisted
+  plist keeps both `RunAtLoad=true` and `KeepAlive=true`, the current service
+  becomes healthy, and the saved preference remains enabled.
 - [ ] Run `vibe-memory uninstall`; prove runtime, launcher, LaunchAgent, and
   managed hooks are removed while memories, review/audit state, projects,
   design state, UI Skills, Loop state, logs, and backups remain.

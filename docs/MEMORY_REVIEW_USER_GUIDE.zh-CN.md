@@ -60,6 +60,8 @@ vibe-memory start && vibe-memory open
 
 手动 plist 同时使用 `RunAtLoad=false` 和 `KeepAlive=false`，因此下次登录不会
 自动启动，进程退出后也不会自动重启。
+若登录启动本来已启用，`vibe-memory start` 会保持两个键均为 true；两种模式都
+只启动当前会话，不改写已保存的偏好。
 
 ## 3. 注册与初始化项目边界
 

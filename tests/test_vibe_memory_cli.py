@@ -1037,6 +1037,45 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             ]
         )
 
+    def test_start_preserves_login_launch_agent_and_enabled_setting(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": True,
+                "service_port": 9123,
+            },
+        )
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent",
+            return_value={"changed": True},
+        ) as install_plist, mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            return_value={"status": "healthy"},
+        ) as activate:
+            code, output, stderr = self.invoke(["start"])
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "healthy")
+        lifecycle = plistlib.loads(
+            install_plist.call_args.args[1].encode("utf-8")
+        )
+        self.assertTrue(lifecycle["RunAtLoad"])
+        self.assertTrue(lifecycle["KeepAlive"])
+        activate.assert_called_once_with(self.paths, expected_version="1.0.0")
+        self.assertTrue(
+            vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)[
+                "start_at_login"
+            ]
+        )
+
     def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
         with mock.patch(
             "vibe_memory_cli.vibe_memory_install.update",
