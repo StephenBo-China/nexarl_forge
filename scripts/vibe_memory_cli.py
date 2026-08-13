@@ -449,7 +449,7 @@ def install_command(args: argparse.Namespace) -> int:
         rollback_errors = []
         if lifecycle_attempted:
             try:
-                vibe_memory_install.bootout_launch_agent()
+                vibe_memory_install.bootout_launch_agent(paths)
             except Exception:
                 rollback_errors.append("launchctl bootout")
         for target in rollback_paths:

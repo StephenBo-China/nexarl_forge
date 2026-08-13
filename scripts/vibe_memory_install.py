@@ -131,12 +131,45 @@ def _service_absent(result: subprocess.CompletedProcess[str]) -> bool:
     )
 
 
+def _launch_agent_identity(
+    paths: RuntimePaths,
+    *,
+    runner: LaunchctlRunner = subprocess.run,
+    uid: int | None = None,
+) -> str:
+    service = f"{launchctl_domain(uid)}/{LAUNCH_AGENT_LABEL}"
+    completed = _run_launchctl(["print", service], runner=runner)
+    if completed.returncode != 0:
+        if _service_absent(completed):
+            return "absent"
+        raise InstallError(f"launchctl print failed with exit code {completed.returncode}")
+    output = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+    if len(output.encode("utf-8")) > 64 * 1024:
+        raise InstallError("launchctl print output is too large")
+    expected_plist = str(paths.launch_agent)
+    expected_server = str(pathlib.Path(paths.install_root) / "current/scripts/memory_review_server.py")
+    home = str(pathlib.Path(paths.personal_memory).parents[1])
+    lines = {line.strip() for line in output.splitlines()}
+    plist_matches = f"path = {expected_plist}" in lines
+    server_matches = expected_server in lines or f"program = {expected_server}" in lines
+    home_matches = f"HOME => {home}" in lines or f"HOME = {home}" in lines
+    if plist_matches or (server_matches and home_matches):
+        return "managed"
+    return "foreign"
+
+
 def bootout_launch_agent(
+    paths: RuntimePaths,
     *,
     runner: LaunchctlRunner = subprocess.run,
     uid: int | None = None,
 ) -> dict[str, object]:
     service = f"{launchctl_domain(uid)}/{LAUNCH_AGENT_LABEL}"
+    identity = _launch_agent_identity(paths, runner=runner, uid=uid)
+    if identity == "absent":
+        return {"status": "absent", "absent": True}
+    if identity != "managed":
+        raise InstallError("foreign launch agent occupies the fixed service label")
     completed = _run_launchctl(["bootout", service], runner=runner)
     if completed.returncode == 0:
         return {"status": "booted_out", "absent": False}
@@ -207,7 +240,16 @@ def activate_launch_agent(
     if attempts < 1:
         raise InstallError("health attempts must be positive")
     expected = expected_version or str(read_runtime_config(paths)["app_version"])
-    bootout_launch_agent(runner=runner, uid=uid)
+    initial_identity = _launch_agent_identity(paths, runner=runner, uid=uid)
+    if initial_identity == "foreign":
+        raise InstallError("foreign launch agent occupies the fixed service label")
+    if initial_identity == "managed":
+        bootout_launch_agent(paths, runner=runner, uid=uid)
+    second_identity = _launch_agent_identity(paths, runner=runner, uid=uid)
+    if second_identity == "foreign":
+        raise InstallError("foreign launch agent appeared before activation")
+    if second_identity == "managed":
+        bootout_launch_agent(paths, runner=runner, uid=uid)
     bootstrapped = False
     try:
         bootstrap_launch_agent(paths, runner=runner, uid=uid)
@@ -229,7 +271,7 @@ def activate_launch_agent(
     except Exception:
         if bootstrapped:
             try:
-                bootout_launch_agent(runner=runner, uid=uid)
+                bootout_launch_agent(paths, runner=runner, uid=uid)
             except InstallError:
                 pass
         raise
@@ -2493,7 +2535,7 @@ def update(
     except Exception as error:
         restart_error: InstallError | None = None
         try:
-            bootout_launch_agent()
+            bootout_launch_agent(paths)
         except InstallError:
             pass
         rollback_errors: list[str] = []
@@ -2564,7 +2606,7 @@ def rollback(paths: RuntimePaths) -> dict[str, Any]:
         smoke_managed_hooks(paths, clients)
     except Exception as error:
         try:
-            bootout_launch_agent()
+            bootout_launch_agent(paths)
         except InstallError:
             pass
         rollback_errors: list[str] = []
@@ -2682,7 +2724,7 @@ def repair(paths: RuntimePaths) -> dict[str, Any]:
         smoke = smoke_managed_hooks(paths, clients)
     except Exception as error:
         try:
-            bootout_launch_agent()
+            bootout_launch_agent(paths)
         except InstallError:
             pass
         rollback_errors: list[str] = []
@@ -2764,6 +2806,7 @@ def _remove_explicit_data_path(path: pathlib.Path, allowed: set[pathlib.Path]) -
 def uninstall(
     paths: RuntimePaths,
     *,
+    runner: LaunchctlRunner = subprocess.run,
     remove_data: bool = False,
     approved_data_deletion: bool = False,
     data_paths: list[pathlib.Path] | None = None,
@@ -2776,7 +2819,7 @@ def uninstall(
     import vibe_memory_hooks
 
     removed: list[str] = []
-    service = bootout_launch_agent()
+    service = bootout_launch_agent(paths, runner=runner)
     releases_root = pathlib.Path(paths.install_root) / "releases"
     owned_releases: list[pathlib.Path] = []
     preserved_releases: list[pathlib.Path] = []

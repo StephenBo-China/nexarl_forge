@@ -348,7 +348,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertTrue(output["rollback"]["ok"], output)
         self.assertEqual(plist.read_text(encoding="utf-8"), "old plist\n")
         self.assertFalse(os.path.lexists(self.paths.install_root / "current"))
-        bootout.assert_called_once_with()
+        bootout.assert_called_once_with(self.paths)
 
     def test_existing_install_health_failure_restores_current_and_removes_only_new_release(self) -> None:
         old = self.paths.install_root / "releases/0.9.0"

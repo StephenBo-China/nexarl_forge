@@ -125,7 +125,9 @@ def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths, generation
     if not _service_action_matches(paths, generation, False):
         return
     try:
-        vibe_memory_settings.vibe_memory_install.bootout_launch_agent()
+        vibe_memory_settings.vibe_memory_install.bootout_launch_agent(
+            vibe_memory_paths.for_home()
+        )
     except Exception as error:  # Persist a retry-visible diagnostic.
         if _service_action_matches(paths, generation, False):
             value = read_service_action(paths)

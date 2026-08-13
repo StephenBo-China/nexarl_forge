@@ -225,7 +225,7 @@ class UIDesignServerTest(unittest.TestCase):
         ) as bootout:
             server.scheduled_bootout_worker(paths, stale["generation"])
             server.scheduled_bootout_worker(paths, current["generation"])
-        bootout.assert_called_once_with()
+        bootout.assert_called_once_with(vibe_memory_paths.for_home())
 
     def test_bootout_and_true_transaction_serialize_on_shared_lifecycle_lock(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "serialized-home")
@@ -233,7 +233,7 @@ class UIDesignServerTest(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         order: list[str] = []
-        def bootout() -> None:
+        def bootout(_paths: vibe_memory_paths.RuntimePaths) -> None:
             order.append("bootout-start")
             entered.set()
             release.wait(2)

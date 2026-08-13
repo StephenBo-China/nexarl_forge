@@ -550,7 +550,7 @@ def apply_first_run(
             }
         except Exception as original_error:
             try:
-                vibe_memory_install.bootout_launch_agent()
+                vibe_memory_install.bootout_launch_agent(paths)
             except vibe_memory_install.InstallError:
                 pass
             failed_paths: list[str] = []

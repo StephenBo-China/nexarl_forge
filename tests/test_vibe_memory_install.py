@@ -2507,11 +2507,101 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
         with mock.patch("vibe_memory_install.os.getuid", return_value=777):
             self.assertEqual(vibe_memory_install.launchctl_domain(), "gui/777")
 
+    def launchctl_print(self, paths: vibe_memory_paths.RuntimePaths, *, managed: bool) -> subprocess.CompletedProcess[str]:
+        path = paths.launch_agent if managed else pathlib.Path("/tmp/foreign.plist")
+        return subprocess.CompletedProcess([], 0, f"path = {path}\n", "")
+
+    def absent_print(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess([], 113, "", "Could not find service")
+
+    def test_bootout_prints_identity_and_refuses_foreign_without_bootout(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner([self.launchctl_print(paths, managed=False)])
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "foreign"):
+                vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
+            self.assertEqual(runner.commands, [[
+                "/bin/launchctl", "print", "gui/501/com.noema.vibe-memory"
+            ]])
+
+    def test_bootout_refuses_path_prefix_collision_without_bootout(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner([subprocess.CompletedProcess(
+                [], 0, f"path = {paths.launch_agent}.foreign\n", ""
+            )])
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "foreign"):
+                vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
+            self.assertEqual([command[1] for command in runner.commands], ["print"])
+
+    def test_bootout_managed_print_then_bootout_and_absent_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            managed = FakeLaunchctlRunner([
+                self.launchctl_print(paths, managed=True),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ])
+            self.assertEqual(vibe_memory_install.bootout_launch_agent(paths, runner=managed, uid=501)["status"], "booted_out")
+            self.assertEqual([command[1] for command in managed.commands], ["print", "bootout"])
+            absent = FakeLaunchctlRunner([self.absent_print()])
+            self.assertTrue(vibe_memory_install.bootout_launch_agent(paths, runner=absent, uid=501)["absent"])
+            self.assertEqual(len(absent.commands), 1)
+
+    def test_bootout_fails_closed_for_ambiguous_or_failed_identity_print(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            cases = (
+                ("ambiguous", subprocess.CompletedProcess([], 0, "", ""), "foreign"),
+                ("unexpected return code", subprocess.CompletedProcess([], 5, "", "Input/output error"), "print failed"),
+            )
+            for name, result, message in cases:
+                runner = FakeLaunchctlRunner([result])
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, message
+                ):
+                    vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
+                self.assertEqual([command[1] for command in runner.commands], ["print"])
+
+    def test_bootout_fails_closed_when_identity_print_times_out(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = mock.Mock(side_effect=subprocess.TimeoutExpired("launchctl print", 15))
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "launchctl print failed"):
+                vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
+            self.assertEqual(runner.call_count, 1)
+
+    def test_activate_absent_precheck_then_foreign_race_never_boots_out(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner([
+                self.absent_print(),
+                self.launchctl_print(paths, managed=False),
+            ])
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "foreign"):
+                vibe_memory_install.activate_launch_agent(
+                    paths, runner=runner, expected_version="1.0.0", uid=501,
+                    attempts=1, sleeper=lambda _delay: None,
+                )
+            self.assertEqual([command[1] for command in runner.commands], ["print", "print"])
+
+    def test_uninstall_foreign_service_refuses_before_removing_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            release = paths.install_root / "releases/1.0.0/release.json"
+            runner = FakeLaunchctlRunner([self.launchctl_print(paths, managed=False)])
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "foreign"):
+                vibe_memory_install.uninstall(paths, runner=runner)
+            self.assertTrue(release.exists())
+            self.assertEqual([command[1] for command in runner.commands], ["print"])
+
     def test_activate_boots_out_absent_service_then_bootstraps_kickstarts_and_checks_identity(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
             runner = FakeLaunchctlRunner([
-                subprocess.CompletedProcess([], 3, "", "Boot-out failed: 3: No such process"),
+                self.absent_print(),
+                self.absent_print(),
                 subprocess.CompletedProcess([], 0, "", ""),
                 subprocess.CompletedProcess([], 0, "", ""),
             ])
@@ -2526,22 +2616,33 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "healthy")
             self.assertEqual(runner.commands, [
-                ["/bin/launchctl", "bootout", "gui/501/com.noema.vibe-memory"],
+                ["/bin/launchctl", "print", "gui/501/com.noema.vibe-memory"],
+                ["/bin/launchctl", "print", "gui/501/com.noema.vibe-memory"],
                 ["/bin/launchctl", "bootstrap", "gui/501", str(paths.launch_agent)],
                 ["/bin/launchctl", "kickstart", "-k", "gui/501/com.noema.vibe-memory"],
             ])
 
     def test_bootout_rejects_non_absent_failure(self) -> None:
-        runner = FakeLaunchctlRunner([
-            subprocess.CompletedProcess([], 5, "", "Boot-out failed: 5: Input/output error")
-        ])
-        with self.assertRaisesRegex(vibe_memory_install.InstallError, "bootout"):
-            vibe_memory_install.bootout_launch_agent(runner=runner, uid=501)
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner([
+                self.launchctl_print(paths, managed=True),
+                subprocess.CompletedProcess([], 5, "", "Boot-out failed: 5: Input/output error"),
+            ])
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "bootout"):
+                vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
 
     def test_activate_health_failure_boots_out_new_service(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
-            runner = FakeLaunchctlRunner()
+            runner = FakeLaunchctlRunner([
+                self.absent_print(),
+                self.absent_print(),
+                subprocess.CompletedProcess([], 0, "", ""),
+                subprocess.CompletedProcess([], 0, "", ""),
+                self.launchctl_print(paths, managed=True),
+                subprocess.CompletedProcess([], 0, "", ""),
+            ])
             with self.assertRaisesRegex(vibe_memory_install.InstallError, "health"):
                 vibe_memory_install.activate_launch_agent(
                     paths, runner=runner,
@@ -2687,7 +2788,7 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             hook.parent.mkdir(parents=True)
             hook.write_text(json.dumps(vibe_memory_hooks.merge_document({"hooks": {}}, "codex", paths.launcher)), encoding="utf-8")
             order: list[str] = []
-            with mock.patch("vibe_memory_install.bootout_launch_agent", side_effect=lambda: order.append("bootout")), \
+            with mock.patch("vibe_memory_install.bootout_launch_agent", side_effect=lambda _paths, **_kwargs: order.append("bootout")), \
                     mock.patch("vibe_memory_hooks.uninstall", side_effect=lambda path, _runtime: order.append(str(path)) or {"status": "removed"}):
                 result = vibe_memory_install.uninstall(paths)
             self.assertEqual(order[0], "bootout")
