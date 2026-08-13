@@ -21,6 +21,7 @@ import ui_skill_publisher
 import ui_skill_registry as skills
 import vibe_memory_paths
 import vibe_memory_migration as migration
+import vibe_memory_settings
 
 
 EXPECTED_AREAS = {
@@ -66,6 +67,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
     home = base / "home"
     home.mkdir()
     paths = vibe_memory_paths.for_home(home)
+    _write_json(paths.install_root / "config.json", vibe_memory_settings.default_settings())
 
     _write_text(paths.personal_memory / "long.md", "## Long\n\n### Memory\nApproved.\n")
     _write_text(paths.personal_memory / "short.md", "## Short\n\n### Note\nTemporary.\n")
@@ -210,12 +212,14 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                     },
                     "task-beta": {
                         "repository": str(second_root),
-                        "status": "cleaned",
+                        "status": "ready_for_user_acceptance",
+                        "worktree": str(base / "worktrees" / "beta"),
                     },
                 },
             },
         )
         (base / "worktrees" / "alpha").mkdir(parents=True)
+        (base / "worktrees" / "beta").mkdir(parents=True)
 
         with mock.patch.dict(
             os.environ, {"UI_DESIGN_HOME": str(paths.ui_design_home)}
@@ -285,6 +289,37 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             self.assertIsInstance(result[area]["records"], list, area)
         self.assertEqual(result["projects"]["registered"], 2)
         self.assertEqual(result["ui_skills"]["published"], 1)
+        for area in (
+            "personal_memory", "projects", "memory_review", "policy",
+            "design_preferences", "ui_design_packages", "ui_design_approvals",
+            "ui_design_audit", "ui_skills", "ui_skill_digests",
+            "ui_skill_deployments", "ui_skill_audit", "loop", "worktrees",
+            "active_worktrees", "pending_worktrees", "legacy_hooks",
+        ):
+            self.assertTrue(result[area]["present"], area)
+            self.assertTrue(result[area]["records"], area)
+        approval_records = result["ui_design_approvals"]["records"]
+        self.assertTrue(any(item.get("task_id") == "design-1" for item in approval_records))
+
+    def test_readable_empty_optional_source_is_present_without_records(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            _write_json(paths.ui_design_home / "registry.json", {
+                "schema_version": 1, "drafts": {}, "packages": {},
+                "deployments": {}, "idempotency": {},
+            })
+            (paths.ui_design_home / "audit.jsonl").write_text("", encoding="utf-8")
+            result = migration.inventory(
+                paths, {"schema_version": 1, "projects": [], "current_project": ""}
+            )
+        self.assertTrue(result["ui_skills"]["present"])
+        self.assertEqual(result["ui_skills"]["records"], [])
+        self.assertTrue(result["ui_skill_audit"]["present"])
+        self.assertEqual(result["ui_skill_audit"]["records"], [])
+        self.assertFalse(result["ui_design_audit"]["present"])
+        self.assertEqual(result["ui_design_audit"]["errors"], [])
 
     def test_empty_optional_control_plane_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as value:

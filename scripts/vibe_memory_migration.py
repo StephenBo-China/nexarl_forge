@@ -1094,6 +1094,12 @@ def inspect_personal(personal_root: pathlib.Path) -> dict[str, Any]:
         "files": files,
         "sections": total_sections,
         "errors": errors,
+        "present": any(item.get("status") == "ok" for item in files.values()),
+        "records": [
+            {"name": name, **summary}
+            for name, summary in files.items()
+            if summary.get("status") == "ok"
+        ],
     }
 
 
@@ -1157,6 +1163,8 @@ def inspect_projects(
         "registered": len(project_roots),
         "projects": items,
         "errors": errors,
+        "present": isinstance(projects_value, list) and not errors,
+        "records": items,
     }
 
 
@@ -1235,6 +1243,13 @@ def inspect_review_state(project_roots: list[pathlib.Path]) -> dict[str, Any]:
         "state_items": total_state_items,
         "counts": total_counts,
         "errors": errors,
+        "present": any(
+            item["proposals"].get("status") == "ok"
+            or pathlib.Path(item["queue"]["path"]).is_file()
+            or pathlib.Path(item["state"]["path"]).is_file()
+            for item in projects
+        ),
+        "records": projects,
     }
 
 
@@ -1310,11 +1325,22 @@ def inspect_design_preferences(
             "schema_versions": schema_versions,
         },
         "errors": errors,
+        "present": global_summary.get("status") == "ok"
+        or any(item["preferences"].get("status") == "ok" for item in project_items),
+        "records": (
+            ([{"scope": "global", **global_summary}] if global_summary.get("status") == "ok" else [])
+            + [
+                {"scope": "project", **item}
+                for item in project_items
+                if item["preferences"].get("status") == "ok"
+            ]
+        ),
     }
 
 
 def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     package_approvals = 0
     project_global_approvals = 0
@@ -1350,6 +1376,8 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
                     else:
                         if package["digest"] != approval["digest"]:
                             errors.append(_issue(package_root / str(task_id), ValueError("design approval digest mismatch")))
+                    if isinstance(approval, dict):
+                        records.append({"root": str(root), "task_id": str(task_id), **approval})
                 idempotency = value.get("idempotency", {})
                 if not isinstance(idempotency, dict):
                     errors.append(_issue(path, ValueError("approval idempotency must be an object")))
@@ -1370,6 +1398,8 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
         "package_approvals": package_approvals,
         "project_global_approvals": project_global_approvals,
         "errors": errors,
+        "present": any(pathlib.Path(item["approvals"]["path"]).is_file() for item in items),
+        "records": records,
     }
 
 
@@ -1446,6 +1476,18 @@ def inspect_ui_skills(ui_design_home: pathlib.Path) -> dict[str, Any]:
         "deployments": len(deployments),
         "idempotency": len(idempotency),
         "errors": [],
+        "present": True,
+        "records": [
+            {"kind": "draft", "id": key, **item}
+            for key, item in drafts.items() if isinstance(item, dict)
+        ] + [
+            {"kind": "package", "name": name, **item}
+            for name, versions in packages.items() if isinstance(versions, list)
+            for item in versions if isinstance(item, dict)
+        ] + [
+            {"kind": "deployment", "transaction_id": key, **item}
+            for key, item in deployments.items() if isinstance(item, dict)
+        ],
     }
 
 
@@ -1487,6 +1529,8 @@ def inspect_loop(project_roots: list[pathlib.Path]) -> dict[str, Any]:
         "configured": configured,
         "schema_versions": schema_versions,
         "errors": errors,
+        "present": any(item["config"].get("status") == "ok" for item in items),
+        "records": [item for item in items if item["config"].get("status") == "ok"],
     }
 
 
@@ -1549,6 +1593,11 @@ def inspect_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
         "repositories": len(repositories),
         "statuses": status_counts,
         "errors": errors,
+        "present": value is not None and not errors,
+        "records": [
+            {"task_id": task_id, **item}
+            for task_id, item in tasks.items() if isinstance(item, dict)
+        ],
     }
 
 
@@ -1621,6 +1670,8 @@ def inspect_legacy_hooks(project_roots: list[pathlib.Path]) -> dict[str, Any]:
         "documents": config_documents,
         "references": references,
         "errors": errors,
+        "present": bool(script_files or config_documents),
+        "records": projects,
     }
 
 
@@ -1657,10 +1708,12 @@ def inspect_policy(paths: RuntimePaths) -> dict[str, Any]:
 def inspect_ui_design_packages(project_roots: list[pathlib.Path]) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    present = False
     for root in project_roots:
         package_root = root / "codex/ui_design/design-packages"
         if not package_root.exists():
             continue
+        present = True
         if not package_root.is_dir():
             errors.append(_issue(package_root, ValueError("design-packages must be a directory")))
             continue
@@ -1674,7 +1727,7 @@ def inspect_ui_design_packages(project_roots: list[pathlib.Path]) -> dict[str, A
                 errors.append(_issue(item, error))
             else:
                 records.append({"root": str(root), "task_id": item.name, "path": str(item), "digest": package["digest"]})
-    return _area({"projects": len(project_roots), "errors": errors}, records, bool(records))
+    return _area({"projects": len(project_roots), "errors": errors}, records, present and not errors)
 
 
 def _inspect_jsonl(paths: list[pathlib.Path], label: str) -> dict[str, Any]:
@@ -1862,7 +1915,8 @@ def inventory(paths: RuntimePaths, registry: Mapping[str, object]) -> dict[str, 
             continue
         value["errors"] = _messages(value.get("errors", []))
         value.setdefault("records", [])
-        value.setdefault("present", bool(value.get("records")))
+        value.setdefault("present", False)
+    snapshot["projects"]["present"] = paths.project_registry.is_file() and not snapshot["projects"]["errors"]
     return snapshot
 
 
