@@ -14,6 +14,7 @@ import contextlib
 import fcntl
 import hashlib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import memory_project
@@ -37,6 +38,23 @@ _LEGACY_HOOK_DOCUMENTS = (
         pathlib.Path(".claude/hooks/shared_memory_hook.py"),
     ),
 )
+
+
+@dataclass(frozen=True)
+class ProjectHandle:
+    root_path: pathlib.Path
+    root_fd: int
+    identity: tuple[int, int]
+    lock_fd: int
+
+
+def _assert_project_handle(handle: ProjectHandle) -> None:
+    current = handle.root_path.stat(follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != handle.identity
+    ):
+        raise ValueError(f"project root binding changed: {handle.root_path}")
 
 
 def _issue(path: pathlib.Path, error: Exception) -> dict[str, str]:
@@ -312,7 +330,15 @@ def _project_lock(root: pathlib.Path):
     )
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        info = os.fstat(descriptor)
+        handle = ProjectHandle(
+            root_path=root,
+            root_fd=descriptor,
+            identity=(info.st_dev, info.st_ino),
+            lock_fd=descriptor,
+        )
+        _assert_project_handle(handle)
+        yield handle
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
@@ -322,12 +348,17 @@ def _project_lock(root: pathlib.Path):
 def _open_project_dirs(
     root: pathlib.Path,
     layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    handle: ProjectHandle | None = None,
 ):
     """Pin the project and every known migration directory without symlinks."""
-    root_fd = os.open(
-        root,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
+    if handle is not None:
+        _assert_project_handle(handle)
+        root_fd = os.dup(handle.root_fd)
+    else:
+        root_fd = os.open(
+            root,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
     opened = [root_fd]
     directories: dict[str, int] = {"": root_fd}
     try:
@@ -341,6 +372,8 @@ def _open_project_dirs(
         ):
             parent_name, _, name = relative.rpartition("/")
             parent_fd = directories[parent_name]
+            if handle is not None:
+                _assert_project_handle(handle)
             if parent_fd < 0:
                 directories[relative] = -1
                 continue
@@ -371,19 +404,16 @@ def _validate_bound_directories(root: pathlib.Path) -> None:
         pass
 
 
-def _layout_identities(root: pathlib.Path) -> dict[pathlib.Path, tuple[int, int]]:
+def _layout_identities(
+    root: pathlib.Path, handle: ProjectHandle | None = None
+) -> dict[pathlib.Path, tuple[int, int]]:
     identities: dict[pathlib.Path, tuple[int, int]] = {}
-    for relative in (
-        "", ".codex", ".codex/hooks", ".claude", ".claude/hooks",
-        "codex", "codex/migration_audits",
-    ):
-        path = root / relative
-        if not path.exists():
-            continue
-        before = path.stat(follow_symlinks=False)
-        if not stat.S_ISDIR(before.st_mode) or path.is_symlink():
-            raise ValueError(f"unsafe project directory layout: {path}")
-        identities[path] = (before.st_dev, before.st_ino)
+    with _open_project_dirs(root, handle=handle) as directories:
+        for relative, descriptor in directories.items():
+            if descriptor < 0:
+                continue
+            info = os.fstat(descriptor)
+            identities[root / relative] = (info.st_dev, info.st_ino)
     return identities
 
 
@@ -435,34 +465,76 @@ def _file_fingerprint_at(
         os.close(descriptor)
 
 
-def _legacy_state_digest(root: pathlib.Path) -> str:
+def _transaction_backups(
+    root: pathlib.Path,
+    stamp: str,
+    *,
+    layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    handle: ProjectHandle | None = None,
+) -> list[str]:
+    backups: list[str] = []
+    with _open_project_dirs(root, layout=layout, handle=handle) as directories:
+        for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+            for relative in (document_relative, script_relative):
+                if handle is not None:
+                    _assert_project_handle(handle)
+                directory_fd = directories[str(relative.parent)]
+                if directory_fd < 0:
+                    continue
+                prefix = f"{relative.name}.bak.{stamp}"
+                for backup_name in os.listdir(directory_fd):
+                    if not backup_name.startswith(prefix):
+                        continue
+                    if _file_fingerprint_at(directory_fd, backup_name) is not None:
+                        backups.append(
+                            str((root / relative).with_name(backup_name))
+                        )
+    return backups
+
+
+def _legacy_state_digest(
+    root: pathlib.Path, handle: ProjectHandle | None = None
+) -> str:
     digest = hashlib.sha256()
-    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
-        for relative in (document_relative, script_relative):
-            path = root / relative
-            digest.update(str(relative).encode("utf-8"))
-            if path.is_symlink():
-                digest.update(b"symlink\0" + os.readlink(path).encode("utf-8"))
-            elif path.is_file():
-                digest.update(b"file\0" + path.read_bytes())
-            else:
-                digest.update(b"missing\0")
+    with _open_project_dirs(root, handle=handle) as directories:
+        for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+            for relative in (document_relative, script_relative):
+                if handle is not None:
+                    _assert_project_handle(handle)
+                digest.update(str(relative).encode("utf-8"))
+                directory_fd = directories[str(relative.parent)]
+                if directory_fd < 0:
+                    digest.update(b"missing\0")
+                    continue
+                try:
+                    content, _mode = _read_regular_at(directory_fd, relative.name)
+                except FileNotFoundError:
+                    digest.update(b"missing\0")
+                except OSError:
+                    digest.update(b"unsafe\0")
+                else:
+                    digest.update(b"file\0" + content)
     return digest.hexdigest()
 
 
-def _snapshot_legacy_files(root: pathlib.Path) -> dict[pathlib.Path, tuple[bytes, int] | None]:
+def _snapshot_legacy_files(
+    root: pathlib.Path, handle: ProjectHandle | None = None
+) -> dict[pathlib.Path, tuple[bytes, int] | None]:
     snapshots: dict[pathlib.Path, tuple[bytes, int] | None] = {}
-    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
-        for relative in (document_relative, script_relative):
-            path = root / relative
-            if path.is_symlink():
-                raise ValueError(f"legacy migration refuses symlink target: {path}")
-            if not path.exists():
-                snapshots[path] = None
-                continue
-            if not path.is_file():
-                raise ValueError(f"legacy migration target must be a regular file: {path}")
-            snapshots[path] = (path.read_bytes(), path.stat().st_mode & 0o777)
+    with _open_project_dirs(root, handle=handle) as directories:
+        for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+            for relative in (document_relative, script_relative):
+                if handle is not None:
+                    _assert_project_handle(handle)
+                path = root / relative
+                directory_fd = directories[str(relative.parent)]
+                if directory_fd < 0:
+                    snapshots[path] = None
+                    continue
+                try:
+                    snapshots[path] = _read_regular_at(directory_fd, relative.name)
+                except FileNotFoundError:
+                    snapshots[path] = None
     return snapshots
 
 
@@ -486,10 +558,13 @@ def _restore_legacy_snapshot(
     backups: list[str],
     written: Mapping[pathlib.Path, tuple[int, int, int, str] | None] | None = None,
     layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    handle: ProjectHandle | None = None,
 ) -> list[str]:
     conflicts: list[str] = []
-    with _open_project_dirs(root, layout=layout) as directories:
+    with _open_project_dirs(root, layout=layout, handle=handle) as directories:
         for path, snapshot in snapshots.items():
+            if handle is not None:
+                _assert_project_handle(handle)
             relative = path.relative_to(root)
             directory_fd = directories[str(relative.parent)]
             if directory_fd < 0:
@@ -542,6 +617,7 @@ def _write_migration_audit(
     result: str,
     conflict_paths: list[str] | None = None,
     layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    handle: ProjectHandle | None = None,
 ) -> pathlib.Path:
     audit = root / "codex" / "migration_audits" / f"legacy-hooks-{stamp}.json"
     document = {
@@ -553,7 +629,7 @@ def _write_migration_audit(
             "result": result,
             "conflict_paths": conflict_paths or [],
         }
-    with _open_project_dirs(root, layout=layout) as directories:
+    with _open_project_dirs(root, layout=layout, handle=handle) as directories:
         codex_fd = directories["codex"]
         if codex_fd < 0:
             raise ValueError("project codex directory is missing")
@@ -590,8 +666,10 @@ def _owned_legacy_script(
     return True, None
 
 
-def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
-    project_root = pathlib.Path(root).expanduser().resolve()
+def _legacy_hook_preview_for_project(
+    root: pathlib.Path, handle: ProjectHandle | None = None
+) -> dict[str, Any]:
+    project_root = pathlib.Path(root).expanduser().absolute()
     managed: set[str] = set()
     custom: set[str] = set()
     targets: list[str] = []
@@ -599,8 +677,9 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     script_targets: set[pathlib.Path] = set()
     try:
-        _validate_bound_directories(project_root)
-    except OSError as error:
+        directories_context = _open_project_dirs(project_root, handle=handle)
+        directories = directories_context.__enter__()
+    except (OSError, ValueError):
         return {
             "root": str(project_root),
             "status": "error",
@@ -611,16 +690,25 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
             "documents": [],
             "errors": [_issue(project_root, ValueError("unsafe project directory layout"))],
         }
-    for index, (document_relative, script_relative) in enumerate(_LEGACY_HOOK_DOCUMENTS):
+    try:
+      for index, (document_relative, script_relative) in enumerate(_LEGACY_HOOK_DOCUMENTS):
+        if handle is not None:
+            _assert_project_handle(handle)
         document_path = project_root / document_relative
         script_path = project_root / script_relative
-        value, issue = _read_json(document_path)
-        if issue is not None:
-            errors.append(issue)
-            documents.append({"path": str(document_path), "status": "error"})
-            continue
-        if value is None:
+        document_fd = directories[str(document_relative.parent)]
+        if document_fd < 0:
             documents.append({"path": str(document_path), "status": "missing"})
+            continue
+        try:
+            raw, _mode = _read_regular_at(document_fd, document_relative.name)
+            value = json.loads(raw.decode("utf-8"))
+        except FileNotFoundError:
+            documents.append({"path": str(document_path), "status": "missing"})
+            continue
+        except Exception as error:
+            errors.append(_issue(document_path, error))
+            documents.append({"path": str(document_path), "status": "error"})
             continue
         if not isinstance(value, dict):
             error = _issue(document_path, ValueError("JSON root must be an object"))
@@ -636,9 +724,25 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
             for handler in group["hooks"]
             if isinstance(handler, dict) and handler.get("type") == "command"
         ) if isinstance(value.get("hooks"), dict) else False
-        owned, ownership_error = _owned_legacy_script(
-            project_root, script_path, "codex" if index == 0 else "claude"
-        ) if has_reference else (False, None)
+        owned, ownership_error = (False, None)
+        if has_reference:
+            script_fd = directories[str(script_relative.parent)]
+            if script_fd < 0:
+                ownership_error = "referenced managed legacy script is missing"
+                errors.append(_issue(script_path, ValueError(ownership_error)))
+                script_fd = -1
+            try:
+                if script_fd < 0:
+                    raise FileNotFoundError(script_relative.name)
+                script_raw, _mode = _read_regular_at(script_fd, script_relative.name)
+                expected = memory_project.hook_script(
+                    project_root, "codex" if index == 0 else "claude"
+                ).encode("utf-8")
+                owned = script_raw == expected
+                if not owned:
+                    ownership_error = "referenced script does not match a known manager-owned version"
+            except Exception as error:
+                ownership_error = str(error)
         if has_reference and not owned:
             errors.append(_issue(script_path, ValueError(ownership_error or "unowned script")))
         try:
@@ -663,6 +767,8 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
                 "custom_entries": len(document_custom),
             }
         )
+    finally:
+        directories_context.__exit__(None, None, None)
     return {
         "root": str(project_root),
         "status": "error" if errors else "preview",
@@ -680,10 +786,11 @@ def preview_legacy_hooks(
 ) -> list[dict[str, Any]]:
     """Return a read-only legacy project memory-hook migration preview."""
     runtime_paths = paths or memory_project.RUNTIME_PATHS
-    return [
-        _legacy_hook_preview_for_project(root)
-        for root in _selected_registered_roots(project_roots, runtime_paths)
-    ]
+    results: list[dict[str, Any]] = []
+    for root in _selected_registered_roots(project_roots, runtime_paths):
+        with _project_lock(root) as handle:
+            results.append(_legacy_hook_preview_for_project(root, handle))
+    return results
 
 
 def apply_legacy_hooks(
@@ -705,8 +812,9 @@ def apply_legacy_hooks(
     results: list[dict[str, Any]] = []
     for project_root in selected:
         try:
-            with _project_lock(project_root):
-                preview = _legacy_hook_preview_for_project(project_root)
+            with _project_lock(project_root) as handle:
+                preview = _legacy_hook_preview_for_project(project_root, handle)
+                _assert_project_handle(handle)
                 if preview["errors"]:
                     results.append({
                         "root": str(project_root),
@@ -715,26 +823,28 @@ def apply_legacy_hooks(
                         "audit": "",
                     })
                     continue
-                snapshots = _snapshot_legacy_files(project_root)
-                layout = _layout_identities(project_root)
-                before_digest = _legacy_state_digest(project_root)
+                snapshots = _snapshot_legacy_files(project_root, handle)
+                layout = _layout_identities(project_root, handle)
+                before_digest = _legacy_state_digest(project_root, handle)
                 cleanup: dict[str, Any] = {
                     "backups": [], "changed_paths": [], "removed_handlers": 0
                 }
                 written_state: dict[
                     pathlib.Path, tuple[int, int, int, str] | None
                 ] = {}
-                if _snapshot_legacy_files(project_root) != snapshots:
+                if _snapshot_legacy_files(project_root, handle) != snapshots:
                     raise ValueError("legacy hook state changed before execution")
+                _assert_project_handle(handle)
                 _assert_layout_identities(layout)
                 try:
                     cleanup = _archive_project_legacy_hooks(
                         project_root,
                         stamp=stamp,
                         layout=layout,
+                        handle=handle,
                         written_state=written_state,
                     )
-                    after_digest = _legacy_state_digest(project_root)
+                    after_digest = _legacy_state_digest(project_root, handle)
                     result_status = "applied" if cleanup["changed_paths"] else "unchanged"
                     audit = _write_migration_audit(
                         project_root,
@@ -745,19 +855,19 @@ def apply_legacy_hooks(
                         backups=cleanup["backups"],
                         result=result_status,
                         layout=layout,
+                        handle=handle,
                     )
                 except BaseException:
-                    transaction_backups = [
-                        str(path)
-                        for path in project_root.rglob(f"*.bak.{stamp}*")
-                        if path.is_file() and not path.is_symlink()
-                    ]
+                    transaction_backups = _transaction_backups(
+                        project_root, stamp, layout=layout, handle=handle
+                    )
                     conflicts = _restore_legacy_snapshot(
                         project_root,
                         snapshots,
                         transaction_backups,
                         written_state,
                         layout,
+                        handle,
                     )
                     audit_text = ""
                     try:
@@ -765,12 +875,13 @@ def apply_legacy_hooks(
                             project_root,
                             stamp,
                             before_digest=before_digest,
-                            after_digest=_legacy_state_digest(project_root),
+                            after_digest=_legacy_state_digest(project_root, handle),
                             changed_paths=[],
                             backups=[],
                             result="failed",
                             conflict_paths=conflicts,
                             layout=layout,
+                            handle=handle,
                         ))
                     except Exception:
                         pass
@@ -803,6 +914,7 @@ def _archive_project_legacy_hooks(
     *,
     stamp: str,
     layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    handle: ProjectHandle | None = None,
     written_state: dict[
         pathlib.Path, tuple[int, int, int, str] | None
     ] | None = None,
@@ -812,10 +924,12 @@ def _archive_project_legacy_hooks(
     removed_handlers = 0
     written = written_state if written_state is not None else {}
     referenced_scripts: set[pathlib.Path] = set()
-    with _open_project_dirs(project_root) as directories:
+    with _open_project_dirs(project_root, layout=layout, handle=handle) as directories:
         for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
             if layout is not None:
                 _assert_layout_identities(layout)
+            if handle is not None:
+                _assert_project_handle(handle)
             document_path = project_root / document_relative
             script_path = project_root / script_relative
             document_dir = str(document_relative.parent)
@@ -836,13 +950,17 @@ def _archive_project_legacy_hooks(
             _write_bytes_at(document_fd, backup_name, raw, mode)
             backups.append(str(document_path.with_name(backup_name)))
             _write_json_at(document_fd, document_relative.name, updated, mode)
-            written[document_path] = _file_fingerprint(document_path)
+            written[document_path] = _file_fingerprint_at(
+                document_fd, document_relative.name
+            )
             changed_paths.append(str(document_path))
             referenced_scripts.add(script_path)
             removed_handlers += removed
         for script_path in sorted(referenced_scripts):
             if layout is not None:
                 _assert_layout_identities(layout)
+            if handle is not None:
+                _assert_project_handle(handle)
             script_relative = script_path.relative_to(project_root)
             script_fd = directories[str(script_relative.parent)]
             if script_fd < 0:
@@ -871,13 +989,13 @@ def prepare_legacy_hook_cleanup(project_root: pathlib.Path) -> dict[str, Any]:
     root = pathlib.Path(project_root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"project root is not a directory: {root}")
-    with _project_lock(root):
-        preview = _legacy_hook_preview_for_project(root)
+    with _project_lock(root) as handle:
+        preview = _legacy_hook_preview_for_project(root, handle)
         if preview["errors"]:
             first = preview["errors"][0]
             raise ValueError(f"legacy hook cleanup preflight failed: {first['path']}: {first['error']}")
-        snapshots = _snapshot_legacy_files(root)
-        layout = _layout_identities(root)
+        snapshots = _snapshot_legacy_files(root, handle)
+        layout = _layout_identities(root, handle)
     return {"root": root, "snapshots": snapshots, "layout": layout}
 
 
@@ -887,9 +1005,10 @@ def execute_legacy_hook_cleanup(plan: Mapping[str, Any]) -> dict[str, Any]:
     snapshots = plan["snapshots"]
     layout = plan["layout"]
     stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
-    with _project_lock(root):
-        if _snapshot_legacy_files(root) != snapshots:
+    with _project_lock(root) as handle:
+        if _snapshot_legacy_files(root, handle) != snapshots:
             raise ValueError("legacy hook state changed after preflight")
+        _assert_project_handle(handle)
         _assert_layout_identities(layout)
         cleanup: dict[str, Any] = {
             "backups": [], "changed_paths": [], "removed_handlers": 0,
@@ -903,17 +1022,16 @@ def execute_legacy_hook_cleanup(plan: Mapping[str, Any]) -> dict[str, Any]:
                 root,
                 stamp=stamp,
                 layout=layout,
+                handle=handle,
                 written_state=written_state,
             )
             return cleanup
         except BaseException:
-            transaction_backups = [
-                str(path)
-                for path in root.rglob(f"*.bak.{stamp}*")
-                if path.is_file() and not path.is_symlink()
-            ]
+            transaction_backups = _transaction_backups(
+                root, stamp, layout=layout, handle=handle
+            )
             conflicts = _restore_legacy_snapshot(
-                root, snapshots, transaction_backups, written_state, layout
+                root, snapshots, transaction_backups, written_state, layout, handle
             )
             if conflicts:
                 return {

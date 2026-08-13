@@ -527,9 +527,9 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             real_snapshot = migration._snapshot_legacy_files
             calls = 0
 
-            def replace_after_snapshot(root: pathlib.Path):
+            def replace_after_snapshot(root: pathlib.Path, *args: object):
                 nonlocal calls
-                value = real_snapshot(root)
+                value = real_snapshot(root, *args)
                 calls += 1
                 if calls == 1:
                     script.write_text("# concurrent custom replacement\n", encoding="utf-8")
@@ -555,9 +555,9 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             real_snapshot = migration._snapshot_legacy_files
             calls = 0
 
-            def rebind_after_snapshot(root: pathlib.Path):
+            def rebind_after_snapshot(root: pathlib.Path, *args: object):
                 nonlocal calls
-                result = real_snapshot(root)
+                result = real_snapshot(root, *args)
                 calls += 1
                 if calls == 1:
                     project.rename(original)
@@ -571,6 +571,32 @@ class VibeMemoryMigrationTest(unittest.TestCase):
 
             self.assertEqual(result["status"], "failed")
             self.assertEqual((project / "sentinel").read_text(encoding="utf-8"), "keep\n")
+
+    def test_root_rebind_after_preview_does_not_migrate_valid_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project, replacement = fixture.project_roots
+            original = project.with_name("alpha-original")
+            before_project = _snapshot_tree(project)
+            before_replacement = _snapshot_tree(replacement)
+            real_preview = migration._legacy_hook_preview_for_project
+
+            def rebind_after_preview(root: pathlib.Path, *args: object, **kwargs: object):
+                result = real_preview(root, *args, **kwargs)
+                project.rename(original)
+                replacement.rename(project)
+                return result
+
+            with mock.patch.object(
+                migration,
+                "_legacy_hook_preview_for_project",
+                side_effect=rebind_after_preview,
+            ):
+                result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(_snapshot_tree(original), before_project)
+            self.assertEqual(_snapshot_tree(project), before_replacement)
 
 
 if __name__ == "__main__":
