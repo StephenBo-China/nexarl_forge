@@ -318,6 +318,13 @@ def _restore_current(path: pathlib.Path, before: str | None, installed_version: 
 
 def install_command(args: argparse.Namespace) -> int:
     paths = vibe_memory_paths.for_home()
+    with vibe_memory_settings.lifecycle_lock(paths):
+        return _install_command_locked(args, paths)
+
+
+def _install_command_locked(
+    args: argparse.Namespace, paths: vibe_memory_paths.RuntimePaths
+) -> int:
     runtime = paths.install_root / "current"
     launcher = paths.launcher
     home = _home(paths)
@@ -333,8 +340,13 @@ def install_command(args: argparse.Namespace) -> int:
         validated = vibe_memory_install.validate_runtime_source(pathlib.Path(args.source_root))
         release_path = paths.install_root / "releases" / validated["version"]
         release_preexisted = release_path.exists()
+        settings = vibe_memory_settings.load_settings(paths)
+        desired_start_at_login = bool(settings["start_at_login"])
         plist = vibe_memory_install.render_launch_agent(
-            paths, port=args.port, python_executable=python_executable
+            paths,
+            port=args.port,
+            python_executable=python_executable,
+            run_at_load=desired_start_at_login,
         )
         vibe_memory_install.render_runtime_config(
             args.port, validated["version"], python_executable=python_executable
@@ -362,6 +374,8 @@ def install_command(args: argparse.Namespace) -> int:
     rollback_paths: set[pathlib.Path] = set()
     attempted_hook_targets: set[pathlib.Path] = set()
     lifecycle_attempted = False
+    previous_action: dict[str, object] | None = None
+    transitional_action: dict[str, object] | None = None
     release_identity: tuple[int, int] | None = None
     written: dict[pathlib.Path, ManagedFileSnapshot | None] = {}
     try:
@@ -426,11 +440,22 @@ def install_command(args: argparse.Namespace) -> int:
             )
         finally:
             written[install_state_path] = _snapshot_managed_file(install_state_path)
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        transitional_action = vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired_start_at_login,
+            status="install_pending",
+        )
         lifecycle_attempted = True
         service = vibe_memory_install.activate_launch_agent(
             paths, expected_version=installed["version"]
         )
         smoke = vibe_memory_install.smoke_managed_hooks(paths, clients)
+        vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired_start_at_login,
+            status="active" if desired_start_at_login else "current_session_active",
+        )
         _json({
             "status": "installed",
             "runtime": installed,
@@ -447,6 +472,15 @@ def install_command(args: argparse.Namespace) -> int:
         return 0
     except Exception:
         rollback_errors = []
+        if previous_action is not None and transitional_action is not None:
+            try:
+                vibe_memory_settings.restore_service_action_if_generation(
+                    paths,
+                    expected_generation=str(transitional_action["generation"]),
+                    previous=previous_action,
+                )
+            except Exception:
+                rollback_errors.append("service action state")
         if lifecycle_attempted:
             try:
                 vibe_memory_install.bootout_launch_agent(paths)

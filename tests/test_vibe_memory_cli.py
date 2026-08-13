@@ -296,7 +296,10 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         activate_version.assert_called_once_with(self.paths, "1.0.0")
         prepare.assert_called_once_with(self.paths)
         render.assert_called_once_with(
-            self.paths, port=8897, python_executable="/opt/homebrew/bin/python3"
+            self.paths,
+            port=8897,
+            python_executable="/opt/homebrew/bin/python3",
+            run_at_load=True,
         )
         render_config.assert_called_once_with(
             8897, "1.0.0", python_executable="/opt/homebrew/bin/python3"
@@ -333,6 +336,147 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(preview.call_count, 2)
         run.assert_not_called()
         self.assertEqual(output["status"], "installed")
+
+    def test_install_and_uninstall_serialize_on_shared_lifecycle_lock(self) -> None:
+        install_entered = threading.Event()
+        allow_install = threading.Event()
+        uninstall_entered = threading.Event()
+        errors: list[BaseException] = []
+
+        def install_transaction(_args: object, _paths: object) -> int:
+            install_entered.set()
+            if not allow_install.wait(2):
+                raise AssertionError("timed out waiting for uninstall interleave")
+            return 0
+
+        def uninstall(_paths: object, **_kwargs: object) -> dict[str, object]:
+            uninstall_entered.set()
+            return {"status": "uninstalled"}
+
+        def run_install() -> None:
+            try:
+                vibe_memory_cli.install_command(argparse.Namespace())
+            except BaseException as error:
+                errors.append(error)
+
+        def run_uninstall() -> None:
+            try:
+                vibe_memory_cli.uninstall_command(
+                    argparse.Namespace(
+                        remove_data=False,
+                        approved_data_deletion=False,
+                        data_path=[],
+                    )
+                )
+            except BaseException as error:
+                errors.append(error)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch.object(
+            vibe_memory_cli, "_install_command_locked", side_effect=install_transaction
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.uninstall", side_effect=uninstall
+        ), mock.patch.object(vibe_memory_cli, "_json"):
+            install_thread = threading.Thread(target=run_install)
+            install_thread.start()
+            self.assertTrue(install_entered.wait(1))
+            uninstall_thread = threading.Thread(target=run_uninstall)
+            uninstall_thread.start()
+            self.assertFalse(uninstall_entered.wait(0.05))
+            allow_install.set()
+            install_thread.join(2)
+            uninstall_thread.join(2)
+
+        self.assertEqual(errors, [])
+        self.assertTrue(uninstall_entered.is_set())
+
+    def test_successful_reinstall_preserves_manual_setting_and_invalidates_old_worker(self) -> None:
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+            },
+        )
+        stale = memory_review_server.write_service_action(self.paths, desired=False)
+        rendered: list[bool] = []
+
+        def render(_paths: object, **kwargs: object) -> str:
+            rendered.append(bool(kwargs["run_at_load"]))
+            return "<plist/>"
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.discover_python",
+            return_value=sys.executable,
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.validate_runtime_source",
+            return_value={"version": "1.0.0"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_runtime",
+            return_value={"version": "1.0.0"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install._activate_managed_version"
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.prepare_data", return_value={"files": []}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.render_launch_agent", side_effect=render
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.render_runtime_config", return_value="{}\n"
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_runtime_config", return_value={"changed": True}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launcher", return_value={"changed": True}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent", return_value={"changed": True}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.write_install_state"
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent", return_value={"status": "healthy"}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.smoke_managed_hooks", return_value={"codex": {"ok": True}}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.validate_control_plane", return_value={"projects": "ok"}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.preview", return_value={"status": "missing"}
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", return_value={"status": "created"}
+        ):
+            code, _, stderr = self.invoke(
+                ["install", "--source-root", "/portable/source"]
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(rendered, [False])
+        action = memory_review_server.read_service_action(self.paths)
+        self.assertNotEqual(action["generation"], stale["generation"])
+        self.assertFalse(action["desired_start_at_login"])
+        self.assertEqual(action["status"], "current_session_active")
+        with mock.patch.object(
+            memory_review_server.vibe_memory_settings.vibe_memory_install,
+            "bootout_launch_agent",
+        ) as bootout:
+            memory_review_server.scheduled_bootout_worker(
+                self.paths, str(stale["generation"])
+            )
+        bootout.assert_not_called()
+
+    def test_install_smoke_failure_restores_previous_action_generation(self) -> None:
+        previous = memory_review_server.write_service_action(self.paths, desired=False)
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.smoke_managed_hooks",
+            side_effect=vibe_memory_cli.vibe_memory_install.InstallError("smoke failed"),
+        ):
+            code, output, stderr = self.invoke(
+                ["install", "--source-root", str(ROOT)]
+            )
+
+        self.assertEqual(code, 1, stderr)
+        self.assertEqual(output["phase"], "commit")
+        action = memory_review_server.read_service_action(self.paths)
+        self.assertEqual(action["generation"], previous["generation"])
+        self.assertEqual(action["status"], "bootout_pending")
 
     def test_install_health_failure_restores_files_and_boots_out_failed_service(self) -> None:
         plist = self.home / "Library/LaunchAgents/com.noema.vibe-memory.plist"
@@ -1535,6 +1679,7 @@ class InstallScriptContractTest(unittest.TestCase):
         self.assertIn('command -v python3', text)
         self.assertIn('sys.version_info >= (3, 10)', text)
         self.assertIn('"$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py"', text)
+        self.assertIn('install --source-root "${SOURCE_ROOT}"', text)
         self.assertIn('"$HOME/.local/bin/vibe-memory" doctor --json', text)
         self.assertNotIn('exec /usr/bin/python3', text)
         self.assertTrue(os.access(script, os.X_OK))
