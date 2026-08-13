@@ -280,13 +280,86 @@ def _installed_e2e_http(
         return response.status, response.geturl(), value
 
 
-def _installed_e2e_bootout() -> None:
-    subprocess.run(
-        ["/bin/launchctl", "bootout", _INSTALLED_E2E_SERVICE],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def _cleanup_installed_release_e2e(
+    root: pathlib.Path,
+    home: pathlib.Path,
+    paths: vibe_memory_paths.RuntimePaths,
+) -> list[str]:
+    """Uninstall while HOME exists, then prove the test-owned service is absent."""
+    errors: list[str] = []
+    launcher = pathlib.Path(paths.launcher)
+    current = pathlib.Path(paths.install_root) / "current"
+    launch_agent = pathlib.Path(paths.launch_agent)
+    if launcher.is_file():
+        try:
+            completed = _installed_e2e_process(
+                [launcher, "uninstall"], home=home, cwd=root
+            )
+            if completed.returncode:
+                errors.append(f"installed uninstall exited {completed.returncode}")
+            else:
+                try:
+                    payload = json.loads(completed.stdout)
+                except (TypeError, json.JSONDecodeError):
+                    payload = {}
+                if payload.get("status") not in {
+                    "uninstalled",
+                    "absent",
+                    "already_absent",
+                }:
+                    errors.append("installed uninstall returned an invalid status")
+        except (OSError, subprocess.SubprocessError) as error:
+            errors.append(f"installed uninstall failed: {error}")
+    for path, label in (
+        (launcher, "launcher"),
+        (current, "current runtime"),
+        (launch_agent, "LaunchAgent plist"),
+    ):
+        if os.path.lexists(path):
+            errors.append(f"installed uninstall kept {label}")
+
+    try:
+        subprocess.run(
+            ["/bin/launchctl", "bootout", _INSTALLED_E2E_SERVICE],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        errors.append(f"launchctl bootout failed: {error}")
+    service_absent = False
+    for attempt in range(20):
+        try:
+            printed = subprocess.run(
+                ["/bin/launchctl", "print", _INSTALLED_E2E_SERVICE],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as error:
+            errors.append(f"launchctl print failed: {error}")
+            break
+        if printed.returncode != 0:
+            service_absent = True
+            break
+        if attempt + 1 < 20:
+            time.sleep(0.05)
+    if not service_absent:
+        errors.append("test LaunchAgent is still loaded after cleanup")
+    return errors
+
+
+def _installed_e2e_result(
+    primary_error: str | None, cleanup_errors: list[str]
+) -> str:
+    if primary_error is None and not cleanup_errors:
+        return "ok"
+    details = []
+    if primary_error is not None:
+        details.append(primary_error)
+    if cleanup_errors:
+        details.append("cleanup: " + "; ".join(cleanup_errors))
+    return "failed: " + " | ".join(details)
 
 
 def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
@@ -302,13 +375,17 @@ def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
     )
     if existing.returncode == 0:
         return "skipped: fixed product LaunchAgent label is already loaded"
-    home: pathlib.Path | None = None
-    launcher: pathlib.Path | None = None
-    try:
-        with tempfile.TemporaryDirectory(prefix="vibe-memory-installed-e2e-") as value:
+    with tempfile.TemporaryDirectory(prefix="vibe-memory-installed-e2e-") as value:
+        primary_error: str | None = None
+        cleanup_errors: list[str] = []
+        fixture_base = pathlib.Path(value)
+        home = fixture_base / "home"
+        paths = vibe_memory_paths.for_home(home)
+        try:
             fixture_base = pathlib.Path(value)
             fixture = build_complete_legacy_fixture(fixture_base)
             home = fixture.paths.personal_memory.parents[1]
+            paths = fixture.paths
             workspace = fixture.project_roots[0]
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
                 reservation.bind(("127.0.0.1", 0))
@@ -443,26 +520,11 @@ def _run_installed_release_e2e(root: pathlib.Path | str) -> str:
                 or (workspace / ".codex/hooks/shared_memory_hook.py").exists()
             ):
                 raise RuntimeError("migration audit or ownership boundary is invalid")
-            return "ok"
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError, urllib.error.URLError, subprocess.SubprocessError) as error:
-        return f"failed: {str(error)[:500]}"
-    finally:
-        if launcher is not None and home is not None and launcher.is_file():
-            try:
-                _installed_e2e_process([launcher, "uninstall"], home=home, cwd=base)
-            except (OSError, subprocess.SubprocessError):
-                pass
-        _installed_e2e_bootout()
-        for _attempt in range(20):
-            printed = subprocess.run(
-                ["/bin/launchctl", "print", _INSTALLED_E2E_SERVICE],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if printed.returncode != 0:
-                break
-            time.sleep(0.05)
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError, urllib.error.URLError, subprocess.SubprocessError) as error:
+            primary_error = str(error)[:500]
+        finally:
+            cleanup_errors = _cleanup_installed_release_e2e(base, home, paths)
+        return _installed_e2e_result(primary_error, cleanup_errors)
 
 
 def checks(root: pathlib.Path | str) -> dict[str, str]:

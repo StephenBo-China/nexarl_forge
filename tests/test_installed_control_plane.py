@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -101,3 +102,84 @@ class InstalledControlPlaneTest(unittest.TestCase):
 
         self.assertEqual(result["install_e2e"], "ok")
         patches["_run_installed_release_e2e"].assert_called_once_with(ROOT.resolve())
+
+    def test_installed_e2e_cleanup_uninstalls_before_temporary_home_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            paths = vibe_memory_paths.for_home(home)
+            for path in (paths.launcher, paths.launch_agent):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("managed\n", encoding="utf-8")
+            current = paths.install_root / "current"
+            current.parent.mkdir(parents=True, exist_ok=True)
+            current.symlink_to("releases/1.0.0")
+
+            def uninstall_while_home_exists(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                self.assertTrue(home.is_dir())
+                self.assertTrue(paths.launcher.is_file())
+                paths.launcher.unlink()
+                paths.launch_agent.unlink()
+                current.unlink()
+                return subprocess.CompletedProcess([], 0, '{"status":"uninstalled"}\n', "")
+
+            absent = subprocess.CompletedProcess([], 1, "", "not found")
+            with mock.patch.object(
+                verify_release, "_installed_e2e_process", side_effect=uninstall_while_home_exists
+            ) as uninstall, mock.patch.object(
+                verify_release.subprocess, "run", return_value=absent
+            ):
+                errors = verify_release._cleanup_installed_release_e2e(
+                    ROOT, home, paths
+                )
+
+        self.assertEqual(errors, [])
+        uninstall.assert_called_once_with(
+            [paths.launcher, "uninstall"], home=home, cwd=ROOT
+        )
+
+    def test_installed_e2e_cleanup_reports_uninstall_and_residual_service_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            paths = vibe_memory_paths.for_home(home)
+            paths.launcher.parent.mkdir(parents=True, exist_ok=True)
+            paths.launcher.write_text("managed\n", encoding="utf-8")
+            failed_uninstall = subprocess.CompletedProcess([], 1, "", "uninstall failed")
+            residual = subprocess.CompletedProcess([], 0, "loaded", "")
+            with mock.patch.object(
+                verify_release, "_installed_e2e_process", return_value=failed_uninstall
+            ), mock.patch.object(
+                verify_release.subprocess, "run", return_value=residual
+            ), mock.patch.object(verify_release.time, "sleep"):
+                errors = verify_release._cleanup_installed_release_e2e(
+                    ROOT, home, paths
+                )
+
+        self.assertTrue(any("uninstall" in error for error in errors))
+        self.assertTrue(any("still loaded" in error for error in errors))
+
+    def test_installed_e2e_cleanup_accepts_label_disappearing_after_poll(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            paths = vibe_memory_paths.for_home(home)
+            absent = subprocess.CompletedProcess([], 1, "", "not found")
+            loaded = subprocess.CompletedProcess([], 0, "loaded", "")
+            with mock.patch.object(
+                verify_release.subprocess, "run", side_effect=[loaded, absent]
+            ), mock.patch.object(verify_release.time, "sleep"):
+                errors = verify_release._cleanup_installed_release_e2e(
+                    ROOT, home, paths
+                )
+
+        self.assertEqual(errors, [])
+
+    def test_installed_e2e_result_combines_primary_and_cleanup_failures(self) -> None:
+        result = verify_release._installed_e2e_result(
+            "health probe failed",
+            ["installed uninstall exited 1", "test LaunchAgent is still loaded"],
+        )
+
+        self.assertEqual(
+            result,
+            "failed: health probe failed | cleanup: installed uninstall exited 1; "
+            "test LaunchAgent is still loaded",
+        )
