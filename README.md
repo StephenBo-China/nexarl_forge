@@ -73,6 +73,9 @@ Start it only for the current login session, without changing that preference:
 vibe-memory start && vibe-memory open
 ```
 
+The manual plist sets both `RunAtLoad=false` and `KeepAlive=false`, so it does
+not start at the next login and does not automatically relaunch after exit.
+
 ## Register and initialize a workspace
 
 A workspace may be a code repository or any other directory. Registration and

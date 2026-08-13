@@ -1024,7 +1024,12 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(code, 0, stderr)
         self.assertEqual(output["status"], "healthy")
         plist = install_plist.call_args.args[1]
-        self.assertFalse(plistlib.loads(plist.encode("utf-8"))["RunAtLoad"])
+        lifecycle = plistlib.loads(plist.encode("utf-8"))
+        self.assertFalse(lifecycle["RunAtLoad"])
+        self.assertFalse(lifecycle["KeepAlive"])
+        # A fresh login must not auto-load or continuously relaunch the manual
+        # service from the plist left on disk by the previous login session.
+        self.assertFalse(lifecycle["RunAtLoad"] or lifecycle["KeepAlive"])
         activate.assert_called_once_with(self.paths, expected_version="1.0.0")
         self.assertFalse(
             vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)[

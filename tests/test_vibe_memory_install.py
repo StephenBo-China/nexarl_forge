@@ -2285,6 +2285,22 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertIn("&amp;", text)
             self.assertNotIn("/Users/stephenbo", text)
 
+    def test_manual_launch_agent_has_no_next_login_or_keepalive_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            manual = plistlib.loads(
+                vibe_memory_install.render_launch_agent(
+                    paths,
+                    port=9123,
+                    python_executable=sys.executable,
+                    run_at_load=False,
+                ).encode("utf-8")
+            )
+
+        self.assertFalse(manual["RunAtLoad"])
+        self.assertFalse(manual["KeepAlive"])
+        self.assertFalse(manual["RunAtLoad"] or manual["KeepAlive"])
+
     def test_template_retains_runtime_and_port_variables(self) -> None:
         template = (ROOT / "templates/macos/com.noema.vibe-memory.plist").read_text(encoding="utf-8")
         self.assertIn("${PYTHON}", template)

@@ -1445,7 +1445,7 @@ def _validate_launch_agent(
     if plist.get("EnvironmentVariables") != expected_environment:
         raise ValueError("launch agent environment is invalid")
     if (
-        plist.get("KeepAlive") is not True
+        plist.get("KeepAlive") is not run_at_load
         or plist.get("RunAtLoad") is not run_at_load
     ):
         raise ValueError("launch agent lifecycle settings are invalid")
@@ -1496,6 +1496,7 @@ def render_launch_agent(
     except Exception as error:
         raise ValueError("rendered launch agent is not a valid plist") from error
     if not run_at_load:
+        plist["KeepAlive"] = False
         plist["RunAtLoad"] = False
         rendered = plistlib.dumps(plist, fmt=plistlib.FMT_XML).decode("utf-8")
     _validate_launch_agent(plist, runtime, port, run_at_load=run_at_load)

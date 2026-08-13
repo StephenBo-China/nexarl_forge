@@ -37,8 +37,9 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
   restart behavior.
 - [ ] With login startup disabled, run
   `vibe-memory start && vibe-memory open`; prove it recreates a manual
-  `RunAtLoad=false` plist, starts a healthy current service, and does not change
-  the persisted preference.
+  plist with both `RunAtLoad=false` and `KeepAlive=false`, starts a healthy
+  current service, does not change the persisted preference, and has no
+  simulated next-login auto-start or automatic relaunch semantics.
 - [ ] Run `vibe-memory uninstall`; prove runtime, launcher, LaunchAgent, and
   managed hooks are removed while memories, review/audit state, projects,
   design state, UI Skills, Loop state, logs, and backups remain.
