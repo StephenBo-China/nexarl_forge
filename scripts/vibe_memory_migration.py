@@ -30,6 +30,9 @@ from vibe_memory_paths import RuntimePaths
 
 _MARKDOWN_SECTION_RE = re.compile(r"(?m)^#{2,6}\s+")
 _MAX_CONTROL_FILE_BYTES = 4 * 1024 * 1024
+_MAX_PACKAGE_FILES = 4096
+_MAX_PACKAGE_FILE_BYTES = 16 * 1024 * 1024
+_MAX_PACKAGE_TOTAL_BYTES = 64 * 1024 * 1024
 _LEGACY_MEMORY_HOOK_RE = re.compile(
     r"(^|[/\\\"'\s])\.(?:codex|claude)[/\\]hooks[/\\]"
     r"shared_memory_hook\.py($|[\"'\s])"
@@ -86,6 +89,72 @@ def _read_json(path: pathlib.Path) -> tuple[Any | None, dict[str, str] | None]:
         return json.loads(text), None
     except json.JSONDecodeError as error:
         return None, _issue(path, error)
+
+
+def safe_tree_digest(
+    root: pathlib.Path,
+    *,
+    max_files: int = _MAX_PACKAGE_FILES,
+    max_total_bytes: int = _MAX_PACKAGE_TOTAL_BYTES,
+    max_file_bytes: int = _MAX_PACKAGE_FILE_BYTES,
+) -> str:
+    """Hash a package with the canonical tree protocol using descriptor-relative reads."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, flags)
+    files: list[tuple[str, int, int]] = []
+    opened: list[int] = [root_fd]
+    total = 0
+    try:
+        def walk(directory_fd: int, prefix: str) -> None:
+            nonlocal total
+            for name in sorted(os.listdir(directory_fd)):
+                relative = f"{prefix}/{name}" if prefix else name
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise ValueError("package symlinks are not allowed")
+                if stat.S_ISDIR(metadata.st_mode):
+                    child = os.open(name, flags, dir_fd=directory_fd)
+                    opened.append(child)
+                    walk(child, relative)
+                elif stat.S_ISREG(metadata.st_mode):
+                    if metadata.st_size > max_file_bytes:
+                        raise ValueError("package file exceeds size limit")
+                    total += metadata.st_size
+                    if total > max_total_bytes:
+                        raise ValueError("package exceeds aggregate size limit")
+                    files.append((relative, directory_fd, metadata.st_size))
+                    if len(files) > max_files:
+                        raise ValueError("package exceeds file count limit")
+                else:
+                    raise ValueError("package contains a special file")
+
+        walk(root_fd, "")
+        digest = hashlib.sha256()
+        for relative, parent_fd, expected_size in sorted(files):
+            encoded = relative.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            digest.update(expected_size.to_bytes(8, "big"))
+            file_fd = os.open(relative.rsplit("/", 1)[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            try:
+                actual = os.fstat(file_fd)
+                if not stat.S_ISREG(actual.st_mode) or actual.st_size != expected_size:
+                    raise ValueError("package file changed during inspection")
+                remaining = expected_size
+                while remaining:
+                    chunk = os.read(file_fd, min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError("package file changed during inspection")
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if os.read(file_fd, 1):
+                    raise ValueError("package file changed during inspection")
+            finally:
+                os.close(file_fd)
+        return digest.hexdigest()
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
 
 
 def _markdown_summary(path: pathlib.Path) -> dict[str, Any]:
@@ -1383,6 +1452,11 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
                     if not isinstance(approval, dict) or not isinstance(approval.get("digest"), str):
                         errors.append(_issue(path, ValueError(f"invalid package approval {task_id}")))
                         continue
+                    if approval.get("status") not in {
+                        "pending_approval", "approved", "rejected",
+                        "revision_requested", "invalidated",
+                    }:
+                        errors.append(_issue(path, ValueError(f"invalid package approval status {task_id}")))
                     try:
                         package = ui_design_gate.get_design_package(root, str(task_id))
                     except Exception:
@@ -1595,6 +1669,8 @@ def inspect_worktrees(worktree_manager: pathlib.Path) -> dict[str, Any]:
         }
     tasks = value.get("tasks", {})
     errors: list[dict[str, str]] = []
+    if value.get("schema_version") != 1:
+        errors.append(_issue(path, ValueError("worktree registry schema_version must be 1")))
     if not isinstance(tasks, dict):
         errors.append(_issue(path, ValueError("tasks must be an object")))
         tasks = {}
@@ -1839,7 +1915,7 @@ def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
                 if not package_path.is_dir():
                     errors.append(_issue(package_path, FileNotFoundError("referenced UI skill package is missing")))
                     continue
-                actual = ui_design_store.tree_digest(package_path)
+                actual = safe_tree_digest(package_path)
                 if actual != record["digest"]:
                     errors.append(_issue(package_path, ValueError("UI skill package digest mismatch")))
                 records.append({"name": name, "version_id": record.get("version_id"), "path": str(package_path), "digest": record["digest"], "actual_digest": actual})
@@ -1860,6 +1936,8 @@ def inspect_ui_skill_deployments(ui_design_home: pathlib.Path) -> dict[str, Any]
                 continue
             if (record.get("name"), record.get("version_id")) not in packages:
                 errors.append(_issue(ui_design_home / "registry.json", ValueError(f"deployment {transaction_id} references missing package")))
+            if record.get("status") not in {"published", "disabled", "publish_failed"}:
+                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid deployment status {transaction_id}")))
             report = ui_design_home / "deployments" / f"{transaction_id}.json"
             expected_package = next(
                 (

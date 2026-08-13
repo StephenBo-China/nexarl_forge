@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import memory_project
 import ui_design_gate
+import ui_design_store
 import ui_design_preferences as preferences
 import ui_skill_publisher
 import ui_skill_registry as skills
@@ -388,6 +389,48 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             result = migration.validate_control_plane(paths, {"schema_version": 1, "projects": [], "current_project": ""})
         self.assertEqual(result["ui_skills"], "error")
         self.assertEqual(result["ui_skill_digests"], "error")
+
+    def test_evil_known_shape_statuses_and_schema_versions_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            approvals_path = project / "codex/ui_design/approvals.json"
+            approvals = json.loads(approvals_path.read_text())
+            approvals["package_approvals"]["design-1"]["status"] = "evil"
+            _write_json(approvals_path, approvals)
+            registry_path = fixture.paths.ui_design_home / "registry.json"
+            registry = json.loads(registry_path.read_text())
+            deployment = next(iter(registry["deployments"].values()))
+            deployment["status"] = "evil"
+            report_path = fixture.paths.ui_design_home / "deployments" / f"{deployment['transaction_id']}.json"
+            report = json.loads(report_path.read_text())
+            report["status"] = "evil"
+            _write_json(report_path, report)
+            _write_json(registry_path, registry)
+            tasks = json.loads((fixture.paths.worktree_manager / "tasks.json").read_text())
+            tasks["schema_version"] = 999
+            _write_json(fixture.paths.worktree_manager / "tasks.json", tasks)
+            result = migration.validate_control_plane(fixture.paths, fixture.registry)
+        self.assertEqual(result["ui_design_approvals"], "error")
+        self.assertEqual(result["ui_skill_deployments"], "error")
+        self.assertEqual(result["worktrees"], "error")
+
+    def test_safe_tree_digest_matches_canonical_and_rejects_limits_and_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value) / "package"
+            root.mkdir()
+            (root / "SKILL.md").write_text("hello", encoding="utf-8")
+            nested = root / "nested"
+            nested.mkdir()
+            (nested / "asset.bin").write_bytes(b"abc")
+            self.assertEqual(migration.safe_tree_digest(root), ui_design_store.tree_digest(root))
+            with self.assertRaises(ValueError):
+                migration.safe_tree_digest(root, max_total_bytes=3)
+            outside = pathlib.Path(value) / "outside"
+            outside.write_text("secret", encoding="utf-8")
+            (root / "link").symlink_to(outside)
+            with self.assertRaises(ValueError):
+                migration.safe_tree_digest(root)
 
     def test_empty_optional_control_plane_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as value:
