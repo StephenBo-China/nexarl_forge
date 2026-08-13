@@ -876,7 +876,10 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertIsNone(output)
         self.assertIn("--approved", stderr)
 
-        expected = [{"root": str(project.resolve()), "backups": ["backup"]}]
+        expected = {
+            "status": "applied",
+            "projects": [{"root": str(project.resolve()), "result": "applied"}],
+        }
         with mock.patch(
             "vibe_memory_cli.vibe_memory_migration.apply_legacy_hooks",
             return_value=expected,
@@ -888,6 +891,27 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(output, expected)
         apply.assert_called_once_with([project.absolute()], paths=self.paths)
+
+    def test_migrate_apply_partial_prints_payload_and_returns_nonzero(self) -> None:
+        project = pathlib.Path(self.temporary.name) / "project"
+        project.mkdir()
+        expected = {
+            "status": "partial",
+            "projects": [
+                {"root": str(project), "result": "applied"},
+                {"root": str(project / "beta"), "result": "failed", "error": "ownership_conflict"},
+            ],
+        }
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_migration.apply_legacy_hooks",
+            return_value=expected,
+        ):
+            code, output, _ = self.invoke([
+                "migrate", "apply", "--approved", str(project)
+            ])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(output, expected)
 
     def test_migrate_cli_preserves_symlink_identity_for_validation(self) -> None:
         project = pathlib.Path(self.temporary.name) / "project"

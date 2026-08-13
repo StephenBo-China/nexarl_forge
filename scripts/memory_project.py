@@ -448,6 +448,8 @@ def unregister_project(root: str | pathlib.Path) -> dict[str, Any]:
         _write_registry_at(parent_fd, data)
         try:
             cleanup = vibe_memory_migration.execute_legacy_hook_cleanup(cleanup_plan)
+            if cleanup.get("result") == "failed":
+                raise RuntimeError("legacy hook cleanup failed")
         except BaseException:
             _write_registry_at(parent_fd, before_registry)
             raise

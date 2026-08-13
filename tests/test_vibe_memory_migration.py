@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import sys
 import tempfile
 import unittest
@@ -280,7 +281,9 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             fixture = build_complete_legacy_fixture(pathlib.Path(value))
             project = fixture.project_roots[0]
 
-            result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+            envelope = migration.apply_legacy_hooks([project], paths=fixture.paths)
+            result = envelope["projects"]
+            self.assertEqual(envelope["status"], "applied")
 
             codex_hooks = (project / ".codex" / "hooks.json").read_text(encoding="utf-8")
             claude_hooks = (project / ".claude" / "settings.json").read_text(encoding="utf-8")
@@ -307,9 +310,10 @@ class VibeMemoryMigrationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as value:
             fixture = build_complete_legacy_fixture(pathlib.Path(value))
 
-            results = migration.apply_legacy_hooks(
+            envelope = migration.apply_legacy_hooks(
                 list(fixture.project_roots), paths=fixture.paths
             )
+            results = envelope["projects"]
 
             audits = [pathlib.Path(item["audit"]) for item in results]
             self.assertEqual(len(set(audits)), 2)
@@ -333,8 +337,8 @@ class VibeMemoryMigrationTest(unittest.TestCase):
                 with self.subTest(root=root):
                     with self.assertRaises(ValueError):
                         migration.preview_legacy_hooks([root], paths=fixture.paths)
-                    with self.assertRaises(ValueError):
-                        migration.apply_legacy_hooks([root], paths=fixture.paths)
+                    result = migration.apply_legacy_hooks([root], paths=fixture.paths)
+                    self.assertEqual(result["status"], "failed")
 
     def test_custom_command_with_same_basename_is_not_manager_owned(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -350,7 +354,10 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             })
             _write_json(path, document)
 
-            migration.apply_legacy_hooks([project], paths=fixture.paths)
+            self.assertEqual(
+                migration.apply_legacy_hooks([project], paths=fixture.paths)["status"],
+                "applied",
+            )
 
             current = path.read_text(encoding="utf-8")
             self.assertIn("/opt/custom/shared_memory_hook.py", current)
@@ -364,8 +371,10 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             before = _snapshot_tree(project)
 
             preview = migration.preview_legacy_hooks([project], paths=fixture.paths)
-            with self.assertRaises(ValueError):
-                migration.apply_legacy_hooks([project], paths=fixture.paths)
+            self.assertEqual(
+                migration.apply_legacy_hooks([project], paths=fixture.paths)["status"],
+                "failed",
+            )
 
             self.assertEqual(_snapshot_tree(project), before)
             self.assertTrue(preview[0]["errors"])
@@ -378,8 +387,10 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             before = _snapshot_tree(project)
 
             preview = migration.preview_legacy_hooks([project], paths=fixture.paths)
-            with self.assertRaises(ValueError):
-                migration.apply_legacy_hooks([project], paths=fixture.paths)
+            self.assertEqual(
+                migration.apply_legacy_hooks([project], paths=fixture.paths)["status"],
+                "failed",
+            )
 
             self.assertEqual(_snapshot_tree(project), before)
             self.assertTrue(preview[0]["errors"])
@@ -396,8 +407,10 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             before = _snapshot_tree(project)
             before_backups = set(project.rglob("*.bak.*"))
 
-            with self.assertRaises(ValueError):
-                migration.apply_legacy_hooks([project], paths=fixture.paths)
+            self.assertEqual(
+                migration.apply_legacy_hooks([project], paths=fixture.paths)["status"],
+                "failed",
+            )
 
             self.assertEqual(_snapshot_tree(project), before)
             self.assertEqual(set(project.rglob("*.bak.*")), before_backups)
@@ -416,13 +429,17 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             real_replace = migration.os.replace
 
             def fail_second_script(source: object, target: object, *args: object, **kwargs: object):
-                if str(source).endswith(".claude/hooks/shared_memory_hook.py"):
+                if str(source).endswith("shared_memory_hook.py") and kwargs.get("src_dir_fd") is not None and calls[0] == 1:
                     raise OSError("injected rename failure")
+                if str(source).endswith("shared_memory_hook.py") and kwargs.get("src_dir_fd") is not None:
+                    calls[0] += 1
                 return real_replace(source, target, *args, **kwargs)
 
+            calls = [0]
+
             with mock.patch.object(migration.os, "replace", side_effect=fail_second_script):
-                with self.assertRaises(OSError):
-                    migration.apply_legacy_hooks([project], paths=fixture.paths)
+                result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+                self.assertEqual(result["status"], "failed")
 
             self.assertEqual(
                 {path: (path.read_bytes(), path.stat().st_mode) for path in active_paths},
@@ -452,10 +469,108 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             with mock.patch.object(
                 migration, "_write_migration_audit", side_effect=OSError("audit failure")
             ):
-                with self.assertRaises(OSError):
-                    migration.apply_legacy_hooks([project], paths=fixture.paths)
+                result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+                self.assertEqual(result["status"], "failed")
 
             self.assertEqual({path: path.read_bytes() for path in active_paths}, before)
+
+    def test_multi_root_returns_applied_and_failed_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            alpha, beta = fixture.project_roots
+            (beta / ".codex/hooks/shared_memory_hook.py").write_text(
+                "# custom\n", encoding="utf-8"
+            )
+
+            result = migration.apply_legacy_hooks([alpha, beta], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(
+                [item["root"] for item in result["projects"]],
+                [str(alpha.resolve()), str(beta.resolve())],
+            )
+            self.assertEqual([item["result"] for item in result["projects"]], ["applied", "failed"])
+
+    def test_intermediate_symlink_targets_are_rejected_without_outside_write(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            outside = pathlib.Path(value) / "outside"
+            outside.mkdir()
+            shutil.rmtree(project / ".codex")
+            (project / ".codex").symlink_to(outside, target_is_directory=True)
+
+            result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_audit_directory_symlink_is_rejected_without_outside_write(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            outside = pathlib.Path(value) / "outside"
+            outside.mkdir()
+            audits = project / "codex/migration_audits"
+            audits.symlink_to(outside, target_is_directory=True)
+
+            result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_lock_window_custom_replacement_is_preserved_as_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            script = project / ".codex/hooks/shared_memory_hook.py"
+            real_snapshot = migration._snapshot_legacy_files
+            calls = 0
+
+            def replace_after_snapshot(root: pathlib.Path):
+                nonlocal calls
+                value = real_snapshot(root)
+                calls += 1
+                if calls == 1:
+                    script.write_text("# concurrent custom replacement\n", encoding="utf-8")
+                return value
+
+            with mock.patch.object(
+                migration, "_snapshot_legacy_files", side_effect=replace_after_snapshot
+            ):
+                result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(script.read_text(encoding="utf-8"), "# concurrent custom replacement\n")
+
+    def test_root_rebind_during_lock_window_fails_without_touching_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            replacement = pathlib.Path(value) / "replacement"
+            replacement.mkdir()
+            marker = replacement / "sentinel"
+            marker.write_text("keep\n", encoding="utf-8")
+            original = project.with_name("alpha-original")
+            real_snapshot = migration._snapshot_legacy_files
+            calls = 0
+
+            def rebind_after_snapshot(root: pathlib.Path):
+                nonlocal calls
+                result = real_snapshot(root)
+                calls += 1
+                if calls == 1:
+                    project.rename(original)
+                    replacement.rename(project)
+                return result
+
+            with mock.patch.object(
+                migration, "_snapshot_legacy_files", side_effect=rebind_after_snapshot
+            ):
+                result = migration.apply_legacy_hooks([project], paths=fixture.paths)
+
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual((project / "sentinel").read_text(encoding="utf-8"), "keep\n")
 
 
 if __name__ == "__main__":

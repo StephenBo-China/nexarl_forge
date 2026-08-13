@@ -596,7 +596,7 @@ def migrate_command(args: argparse.Namespace) -> int:
             raise LifecycleError("migrate apply requires --approved")
         value = vibe_memory_migration.apply_legacy_hooks(roots, paths=paths)
     _json(value)
-    return 0
+    return 1 if isinstance(value, dict) and value.get("status") in {"partial", "failed"} else 0
 
 
 def update_command(args: argparse.Namespace) -> int:

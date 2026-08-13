@@ -7,6 +7,7 @@ import os
 import pathlib
 import re
 import shutil
+import stat
 import tempfile
 import datetime as _dt
 import contextlib
@@ -218,6 +219,54 @@ def _atomic_write_json(path: pathlib.Path, value: Mapping[str, object]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _read_regular_at(directory_fd: int, name: str) -> tuple[bytes, int]:
+    descriptor = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"migration target is not a regular file: {name}")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks), info.st_mode & 0o777
+    finally:
+        os.close(descriptor)
+
+
+def _write_bytes_at(directory_fd: int, name: str, content: bytes, mode: int) -> None:
+    temporary = f".{name}.tmp-{os.getpid()}-{_dt.datetime.now().timestamp():.6f}"
+    descriptor = os.open(
+        temporary,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        mode,
+        dir_fd=directory_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fchmod(descriptor, mode)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _write_json_at(directory_fd: int, name: str, value: Mapping[str, object], mode: int) -> None:
+    content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _write_bytes_at(directory_fd, name, content, mode)
+
+
 def _read_registry(paths: RuntimePaths) -> Mapping[str, object]:
     value, issue = _read_json(paths.project_registry)
     if issue is not None:
@@ -269,6 +318,123 @@ def _project_lock(root: pathlib.Path):
         os.close(descriptor)
 
 
+@contextlib.contextmanager
+def _open_project_dirs(
+    root: pathlib.Path,
+    layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+):
+    """Pin the project and every known migration directory without symlinks."""
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    opened = [root_fd]
+    directories: dict[str, int] = {"": root_fd}
+    try:
+        if layout is not None and (root / "") in layout:
+            root_info = os.fstat(root_fd)
+            if (root_info.st_dev, root_info.st_ino) != layout[root / ""]:
+                raise ValueError(f"project directory binding changed: {root}")
+        for relative in (
+            ".codex", ".codex/hooks", ".claude", ".claude/hooks",
+            "codex", "codex/migration_audits",
+        ):
+            parent_name, _, name = relative.rpartition("/")
+            parent_fd = directories[parent_name]
+            if parent_fd < 0:
+                directories[relative] = -1
+                continue
+            try:
+                descriptor = os.open(
+                    name,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                descriptor = -1
+            directories[relative] = descriptor
+            if descriptor >= 0:
+                path = root / relative
+                if layout is not None and path in layout:
+                    info = os.fstat(descriptor)
+                    if (info.st_dev, info.st_ino) != layout[path]:
+                        raise ValueError(f"project directory binding changed: {path}")
+                opened.append(descriptor)
+        yield directories
+    finally:
+        for descriptor in reversed(opened):
+            os.close(descriptor)
+
+
+def _validate_bound_directories(root: pathlib.Path) -> None:
+    with _open_project_dirs(root):
+        pass
+
+
+def _layout_identities(root: pathlib.Path) -> dict[pathlib.Path, tuple[int, int]]:
+    identities: dict[pathlib.Path, tuple[int, int]] = {}
+    for relative in (
+        "", ".codex", ".codex/hooks", ".claude", ".claude/hooks",
+        "codex", "codex/migration_audits",
+    ):
+        path = root / relative
+        if not path.exists():
+            continue
+        before = path.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(before.st_mode) or path.is_symlink():
+            raise ValueError(f"unsafe project directory layout: {path}")
+        identities[path] = (before.st_dev, before.st_ino)
+    return identities
+
+
+def _assert_layout_identities(identities: Mapping[pathlib.Path, tuple[int, int]]) -> None:
+    for path, expected in identities.items():
+        current = path.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != expected:
+            raise ValueError(f"project directory binding changed: {path}")
+
+
+def _file_fingerprint(path: pathlib.Path) -> tuple[int, int, int, str] | None:
+    try:
+        value = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(value.st_mode) or path.is_symlink():
+        return None
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode & 0o777,
+        hashlib.sha256(path.read_bytes()).hexdigest(),
+    )
+
+
+def _file_fingerprint_at(
+    directory_fd: int, name: str
+) -> tuple[int, int, int, str] | None:
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except FileNotFoundError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return (info.st_dev, info.st_ino, info.st_mode & 0o777, digest.hexdigest())
+    finally:
+        os.close(descriptor)
+
+
 def _legacy_state_digest(root: pathlib.Path) -> str:
     digest = hashlib.sha256()
     for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
@@ -315,19 +481,54 @@ def _atomic_write_bytes(path: pathlib.Path, content: bytes, mode: int) -> None:
 
 
 def _restore_legacy_snapshot(
-    snapshots: Mapping[pathlib.Path, tuple[bytes, int] | None], backups: list[str]
-) -> None:
-    for path, snapshot in snapshots.items():
-        if snapshot is None:
-            if path.exists() and path.is_file() and not path.is_symlink():
-                path.unlink()
-            continue
-        content, mode = snapshot
-        _atomic_write_bytes(path, content, mode)
-    for raw in backups:
-        backup = pathlib.Path(raw)
-        if backup.exists() and backup.is_file() and not backup.is_symlink():
-            backup.unlink()
+    root: pathlib.Path,
+    snapshots: Mapping[pathlib.Path, tuple[bytes, int] | None],
+    backups: list[str],
+    written: Mapping[pathlib.Path, tuple[int, int, int, str] | None] | None = None,
+    layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+) -> list[str]:
+    conflicts: list[str] = []
+    with _open_project_dirs(root, layout=layout) as directories:
+        for path, snapshot in snapshots.items():
+            relative = path.relative_to(root)
+            directory_fd = directories[str(relative.parent)]
+            if directory_fd < 0:
+                conflicts.append(str(path))
+                continue
+            if written is not None:
+                if path not in written:
+                    continue
+                if _file_fingerprint_at(directory_fd, relative.name) != written[path]:
+                    conflicts.append(str(path))
+                    continue
+            if snapshot is None:
+                try:
+                    info = os.stat(relative.name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    os.unlink(relative.name, dir_fd=directory_fd)
+                continue
+            content, mode = snapshot
+            _write_bytes_at(directory_fd, relative.name, content, mode)
+        for raw in backups:
+            backup = pathlib.Path(raw)
+            try:
+                relative = backup.relative_to(root)
+            except ValueError:
+                conflicts.append(str(backup))
+                continue
+            directory_fd = directories.get(str(relative.parent), -1)
+            if directory_fd < 0:
+                conflicts.append(str(backup))
+                continue
+            try:
+                info = os.stat(relative.name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                os.unlink(relative.name, dir_fd=directory_fd)
+    return conflicts
 
 
 def _write_migration_audit(
@@ -339,19 +540,37 @@ def _write_migration_audit(
     changed_paths: list[str],
     backups: list[str],
     result: str,
+    conflict_paths: list[str] | None = None,
+    layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
 ) -> pathlib.Path:
     audit = root / "codex" / "migration_audits" / f"legacy-hooks-{stamp}.json"
-    _atomic_write_json(
-        audit,
-        {
+    document = {
             "root": str(root),
             "before_digest": before_digest,
             "after_digest": after_digest,
             "changed_paths": changed_paths,
             "backups": backups,
             "result": result,
-        },
-    )
+            "conflict_paths": conflict_paths or [],
+        }
+    with _open_project_dirs(root, layout=layout) as directories:
+        codex_fd = directories["codex"]
+        if codex_fd < 0:
+            raise ValueError("project codex directory is missing")
+        audit_fd = directories["codex/migration_audits"]
+        if audit_fd < 0:
+            os.mkdir("migration_audits", 0o700, dir_fd=codex_fd)
+            audit_fd = os.open(
+                "migration_audits",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=codex_fd,
+            )
+            try:
+                _write_json_at(audit_fd, audit.name, document, 0o600)
+            finally:
+                os.close(audit_fd)
+        else:
+            _write_json_at(audit_fd, audit.name, document, 0o600)
     return audit
 
 
@@ -379,6 +598,19 @@ def _legacy_hook_preview_for_project(root: pathlib.Path) -> dict[str, Any]:
     documents: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     script_targets: set[pathlib.Path] = set()
+    try:
+        _validate_bound_directories(project_root)
+    except OSError as error:
+        return {
+            "root": str(project_root),
+            "status": "error",
+            "managed_entries": 0,
+            "custom_entries": 0,
+            "targets": [],
+            "script_targets": [],
+            "documents": [],
+            "errors": [_issue(project_root, ValueError("unsafe project directory layout"))],
+        }
     for index, (document_relative, script_relative) in enumerate(_LEGACY_HOOK_DOCUMENTS):
         document_path = project_root / document_relative
         script_path = project_root / script_relative
@@ -456,116 +688,181 @@ def preview_legacy_hooks(
 
 def apply_legacy_hooks(
     project_roots: list[pathlib.Path], *, paths: RuntimePaths | None = None
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """Remove old per-project memory hook entries after backing up touched files."""
     runtime_paths = paths or memory_project.RUNTIME_PATHS
-    selected = _selected_registered_roots(project_roots, runtime_paths)
-    previews = [_legacy_hook_preview_for_project(root) for root in selected]
-    errors = [
-        error
-        for project in previews
-        for error in project.get("errors", [])
-        if isinstance(error, dict)
-    ]
-    if errors:
-        first = errors[0]
-        raise ValueError(f"legacy hook migration preflight failed: {first.get('path')}: {first.get('error')}")
+    try:
+        selected = _selected_registered_roots(project_roots, runtime_paths)
+    except Exception:
+        return {
+            "status": "failed",
+            "projects": [
+                {"root": str(pathlib.Path(root).expanduser().absolute()), "result": "failed", "error": "invalid_root"}
+                for root in project_roots
+            ],
+        }
     stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     results: list[dict[str, Any]] = []
-    for preview in previews:
-        project_root = pathlib.Path(str(preview["root"]))
-        with _project_lock(project_root):
-            snapshots = _snapshot_legacy_files(project_root)
-            before_digest = _legacy_state_digest(project_root)
-            cleanup: dict[str, Any] = {
-                "backups": [], "changed_paths": [], "removed_handlers": 0
-            }
-            try:
-                cleanup = _archive_project_legacy_hooks(project_root, stamp=stamp)
-                after_digest = _legacy_state_digest(project_root)
-                result_status = "applied" if cleanup["changed_paths"] else "unchanged"
-                audit = _write_migration_audit(
-                    project_root,
-                    stamp,
-                    before_digest=before_digest,
-                    after_digest=after_digest,
-                    changed_paths=cleanup["changed_paths"],
-                    backups=cleanup["backups"],
-                    result=result_status,
-                )
-            except BaseException:
-                transaction_backups = [
-                    str(path)
-                    for path in project_root.rglob(f"*.bak.{stamp}*")
-                    if path.is_file() and not path.is_symlink()
-                ]
-                _restore_legacy_snapshot(snapshots, transaction_backups)
+    for project_root in selected:
+        try:
+            with _project_lock(project_root):
+                preview = _legacy_hook_preview_for_project(project_root)
+                if preview["errors"]:
+                    results.append({
+                        "root": str(project_root),
+                        "result": "failed",
+                        "error": "ownership_conflict",
+                        "audit": "",
+                    })
+                    continue
+                snapshots = _snapshot_legacy_files(project_root)
+                layout = _layout_identities(project_root)
+                before_digest = _legacy_state_digest(project_root)
+                cleanup: dict[str, Any] = {
+                    "backups": [], "changed_paths": [], "removed_handlers": 0
+                }
+                written_state: dict[
+                    pathlib.Path, tuple[int, int, int, str] | None
+                ] = {}
+                if _snapshot_legacy_files(project_root) != snapshots:
+                    raise ValueError("legacy hook state changed before execution")
+                _assert_layout_identities(layout)
                 try:
-                    _write_migration_audit(
+                    cleanup = _archive_project_legacy_hooks(
+                        project_root,
+                        stamp=stamp,
+                        layout=layout,
+                        written_state=written_state,
+                    )
+                    after_digest = _legacy_state_digest(project_root)
+                    result_status = "applied" if cleanup["changed_paths"] else "unchanged"
+                    audit = _write_migration_audit(
                         project_root,
                         stamp,
                         before_digest=before_digest,
-                        after_digest=_legacy_state_digest(project_root),
-                        changed_paths=[],
-                        backups=[],
-                        result="failed",
+                        after_digest=after_digest,
+                        changed_paths=cleanup["changed_paths"],
+                        backups=cleanup["backups"],
+                        result=result_status,
+                        layout=layout,
                     )
-                except Exception:
-                    pass
-                raise
-        results.append(
-            {
+                except BaseException:
+                    transaction_backups = [
+                        str(path)
+                        for path in project_root.rglob(f"*.bak.{stamp}*")
+                        if path.is_file() and not path.is_symlink()
+                    ]
+                    conflicts = _restore_legacy_snapshot(
+                        project_root,
+                        snapshots,
+                        transaction_backups,
+                        written_state,
+                        layout,
+                    )
+                    audit_text = ""
+                    try:
+                        audit_text = str(_write_migration_audit(
+                            project_root,
+                            stamp,
+                            before_digest=before_digest,
+                            after_digest=_legacy_state_digest(project_root),
+                            changed_paths=[],
+                            backups=[],
+                            result="failed",
+                            conflict_paths=conflicts,
+                            layout=layout,
+                        ))
+                    except Exception:
+                        pass
+                    results.append({
+                        "root": str(project_root), "result": "failed",
+                        "error": "conflict" if conflicts else "transaction_failed",
+                        "conflict_paths": conflicts,
+                        "audit": audit_text,
+                    })
+                    continue
+            results.append({
                 **preview,
                 "status": result_status,
+                "result": result_status,
                 **cleanup,
                 "audit": str(audit),
-            }
-        )
-    return results
+            })
+        except BaseException:
+            results.append({
+                "root": str(project_root), "result": "failed",
+                "error": "path_conflict", "audit": "",
+            })
+    failures = sum(item.get("result") == "failed" for item in results)
+    status = "failed" if failures == len(results) else "partial" if failures else "applied"
+    return {"status": status, "projects": results}
 
 
 def _archive_project_legacy_hooks(
-    project_root: pathlib.Path, *, stamp: str
+    project_root: pathlib.Path,
+    *,
+    stamp: str,
+    layout: Mapping[pathlib.Path, tuple[int, int]] | None = None,
+    written_state: dict[
+        pathlib.Path, tuple[int, int, int, str] | None
+    ] | None = None,
 ) -> dict[str, Any]:
     backups: list[str] = []
     changed_paths: list[str] = []
     removed_handlers = 0
+    written = written_state if written_state is not None else {}
     referenced_scripts: set[pathlib.Path] = set()
-    for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
-        document_path = project_root / document_relative
-        script_path = project_root / script_relative
-        value, issue = _read_json(document_path)
-        if issue is not None:
-            raise ValueError(
-                f"legacy hook migration failed while reading {document_path}: {issue['error']}"
+    with _open_project_dirs(project_root) as directories:
+        for document_relative, script_relative in _LEGACY_HOOK_DOCUMENTS:
+            if layout is not None:
+                _assert_layout_identities(layout)
+            document_path = project_root / document_relative
+            script_path = project_root / script_relative
+            document_dir = str(document_relative.parent)
+            document_fd = directories[document_dir]
+            if document_fd < 0:
+                continue
+            try:
+                raw, mode = _read_regular_at(document_fd, document_relative.name)
+            except FileNotFoundError:
+                continue
+            value = json.loads(raw.decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError(f"legacy hook migration target must be an object: {document_path}")
+            updated, removed = _remove_legacy_memory_entries(value)
+            if not removed:
+                continue
+            backup_name = _backup_path(document_path, stamp).name
+            _write_bytes_at(document_fd, backup_name, raw, mode)
+            backups.append(str(document_path.with_name(backup_name)))
+            _write_json_at(document_fd, document_relative.name, updated, mode)
+            written[document_path] = _file_fingerprint(document_path)
+            changed_paths.append(str(document_path))
+            referenced_scripts.add(script_path)
+            removed_handlers += removed
+        for script_path in sorted(referenced_scripts):
+            if layout is not None:
+                _assert_layout_identities(layout)
+            script_relative = script_path.relative_to(project_root)
+            script_fd = directories[str(script_relative.parent)]
+            if script_fd < 0:
+                raise ValueError(f"legacy script directory missing: {script_path.parent}")
+            _read_regular_at(script_fd, script_relative.name)
+            backup = _backup_path(script_path, stamp)
+            os.replace(
+                script_relative.name,
+                backup.name,
+                src_dir_fd=script_fd,
+                dst_dir_fd=script_fd,
             )
-        if value is None:
-            continue
-        if not isinstance(value, dict):
-            raise ValueError(f"legacy hook migration target must be an object: {document_path}")
-        updated, removed = _remove_legacy_memory_entries(value)
-        if not removed:
-            continue
-        if document_path.is_symlink():
-            raise ValueError(f"legacy hook migration refuses to edit symlink: {document_path}")
-        backups.append(str(_backup_file(document_path, stamp)))
-        _atomic_write_json(document_path, updated)
-        changed_paths.append(str(document_path))
-        referenced_scripts.add(script_path)
-        removed_handlers += removed
-    for script_path in sorted(referenced_scripts):
-        if not script_path.exists():
-            continue
-        if script_path.is_symlink():
-            raise ValueError(f"legacy hook migration refuses to archive symlink: {script_path}")
-        backup = _backup_path(script_path, stamp)
-        os.replace(script_path, backup)
-        backups.append(str(backup))
-        changed_paths.append(str(script_path))
+            written[script_path] = None
+            backups.append(str(backup))
+            changed_paths.append(str(script_path))
     return {
         "backups": backups,
         "changed_paths": changed_paths,
         "removed_handlers": removed_handlers,
+        "written": written,
     }
 
 
@@ -580,26 +877,53 @@ def prepare_legacy_hook_cleanup(project_root: pathlib.Path) -> dict[str, Any]:
             first = preview["errors"][0]
             raise ValueError(f"legacy hook cleanup preflight failed: {first['path']}: {first['error']}")
         snapshots = _snapshot_legacy_files(root)
-    return {"root": root, "snapshots": snapshots}
+        layout = _layout_identities(root)
+    return {"root": root, "snapshots": snapshots, "layout": layout}
 
 
 def execute_legacy_hook_cleanup(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Execute one prepared cleanup and restore the active state on failure."""
     root = pathlib.Path(plan["root"])
     snapshots = plan["snapshots"]
+    layout = plan["layout"]
     stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
     with _project_lock(root):
         if _snapshot_legacy_files(root) != snapshots:
             raise ValueError("legacy hook state changed after preflight")
+        _assert_layout_identities(layout)
+        cleanup: dict[str, Any] = {
+            "backups": [], "changed_paths": [], "removed_handlers": 0,
+            "written": {},
+        }
+        written_state: dict[
+            pathlib.Path, tuple[int, int, int, str] | None
+        ] = {}
         try:
-            return _archive_project_legacy_hooks(root, stamp=stamp)
+            cleanup = _archive_project_legacy_hooks(
+                root,
+                stamp=stamp,
+                layout=layout,
+                written_state=written_state,
+            )
+            return cleanup
         except BaseException:
             transaction_backups = [
                 str(path)
                 for path in root.rglob(f"*.bak.{stamp}*")
                 if path.is_file() and not path.is_symlink()
             ]
-            _restore_legacy_snapshot(snapshots, transaction_backups)
+            conflicts = _restore_legacy_snapshot(
+                root, snapshots, transaction_backups, written_state, layout
+            )
+            if conflicts:
+                return {
+                    "result": "failed",
+                    "error": "conflict",
+                    "conflict_paths": conflicts,
+                    "backups": transaction_backups,
+                    "changed_paths": [],
+                    "removed_handlers": 0,
+                }
             raise
 
 
