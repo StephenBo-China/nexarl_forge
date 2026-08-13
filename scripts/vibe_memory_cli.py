@@ -867,18 +867,34 @@ def _repair_hooks_transaction(
         committed = getattr(error, "_commit_snapshot", None)
         if committed is not None and attempted:
             written[attempted[-1]] = committed
-        conflicts = []
-        for target in reversed(attempted):
-            try:
-                if target in written:
-                    _restore_managed_file(target, snapshots[target], written[target])
-                elif _snapshot_managed_file(target) != snapshots[target]:
-                    raise ValueError("unowned hook target changed during repair")
-            except Exception:
-                conflicts.append(target.name)
+        conflicts = _rollback_repaired_hooks(attempted, snapshots, written)
         if conflicts:
             raise LifecycleError("hooks repair failed with rollback conflict") from error
         raise LifecycleError("hooks repair failed and changes were rolled back") from error
+    except BaseException as interruption:
+        committed = getattr(interruption, "_commit_snapshot", None)
+        if committed is not None and attempted:
+            written[attempted[-1]] = committed
+        conflicts = _rollback_repaired_hooks(attempted, snapshots, written)
+        interruption._rollback_conflicts = conflicts
+        raise
+
+
+def _rollback_repaired_hooks(
+    attempted: list[pathlib.Path],
+    snapshots: dict[pathlib.Path, ManagedFileSnapshot | None],
+    written: dict[pathlib.Path, ManagedFileSnapshot | None],
+) -> list[str]:
+    conflicts = []
+    for target in reversed(attempted):
+        try:
+            if target in written:
+                _restore_managed_file(target, snapshots[target], written[target])
+            elif _snapshot_managed_file(target) != snapshots[target]:
+                raise ValueError("unowned hook target changed during repair")
+        except Exception:
+            conflicts.append(target.name)
+    return conflicts
 
 
 def _hooks_operation(

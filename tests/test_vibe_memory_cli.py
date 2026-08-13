@@ -1846,6 +1846,65 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(stderr, "hooks failed: hooks repair failed with rollback conflict\n")
         self.assertEqual(codex.read_bytes(), concurrent)
 
+    def test_hooks_repair_rolls_back_owned_hooks_then_reraises_keyboard_interrupt(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        claude = self.home / ".claude/settings.json"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        codex.write_text('{"before":"codex"}\n', encoding="utf-8")
+        claude.write_text('{"before":"claude"}\n', encoding="utf-8")
+        before = {codex: codex.read_bytes(), claude: claude.read_bytes()}
+        interrupted = KeyboardInterrupt()
+
+        def repair(target: pathlib.Path, *_args: object, **_kwargs: object) -> dict[str, object]:
+            if target == claude:
+                raise interrupted
+            target.write_text('{"managed":true}\n', encoding="utf-8")
+            committed = vibe_memory_cli._snapshot_managed_file(target)
+            return {"status": "updated", "changed": True, "_commit_snapshot": committed}
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair
+        ), self.assertRaises(KeyboardInterrupt) as raised:
+            vibe_memory_cli._repair_hooks_transaction(
+                self.paths, ["codex", "claude-code"]
+            )
+
+        self.assertIs(raised.exception, interrupted)
+        self.assertEqual(before, {path: path.read_bytes() for path in before})
+        self.assertEqual(getattr(interrupted, "_rollback_conflicts", []), [])
+
+    def test_hooks_repair_preserves_conflict_and_reraises_system_exit(self) -> None:
+        codex = self.home / ".codex/hooks.json"
+        claude = self.home / ".claude/settings.json"
+        codex.parent.mkdir(parents=True)
+        claude.parent.mkdir(parents=True)
+        codex.write_text('{"before":"codex"}\n', encoding="utf-8")
+        claude.write_text('{"before":"claude"}\n', encoding="utf-8")
+        concurrent = b'{"third_party":true}\n'
+        interrupted = SystemExit(23)
+
+        def repair(target: pathlib.Path, *_args: object, **_kwargs: object) -> dict[str, object]:
+            if target == claude:
+                codex.write_bytes(concurrent)
+                raise interrupted
+            target.write_text('{"managed":true}\n', encoding="utf-8")
+            committed = vibe_memory_cli._snapshot_managed_file(target)
+            return {"status": "updated", "changed": True, "_commit_snapshot": committed}
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.repair", side_effect=repair
+        ), self.assertRaises(SystemExit) as raised:
+            vibe_memory_cli._repair_hooks_transaction(
+                self.paths, ["codex", "claude-code"]
+            )
+
+        self.assertIs(raised.exception, interrupted)
+        self.assertEqual(raised.exception.code, 23)
+        self.assertEqual(codex.read_bytes(), concurrent)
+        self.assertEqual(claude.read_text(encoding="utf-8"), '{"before":"claude"}\n')
+        self.assertEqual(getattr(interrupted, "_rollback_conflicts", []), ["hooks.json"])
+
 
 class InstallScriptContractTest(unittest.TestCase):
     def test_install_script_discovers_a_supported_python_without_usr_bin_hardcoding(self) -> None:

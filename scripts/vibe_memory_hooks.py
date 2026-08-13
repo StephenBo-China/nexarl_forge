@@ -979,6 +979,48 @@ def write_with_backup(
             except OSError:
                 pass
         raise
+    except BaseException as interruption:
+        cleanup_errors: list[str] = []
+        try:
+            if sys.platform == "darwin" and expected_source is not _NO_SOURCE_CHECK:
+                if temporary.exists():
+                    if manager_identity is not None and _path_matches(
+                        temporary, manager_identity, content
+                    ):
+                        if replaced:
+                            _preserve_manager_attempt(
+                                target,
+                                temporary,
+                                manager_identity,
+                                content,
+                                existing_mode,
+                            )
+                        else:
+                            temporary.unlink(missing_ok=True)
+                    else:
+                        promoted = _promote_unknown_or_report(target, temporary)
+                        if backup is None:
+                            backup = promoted
+            else:
+                temporary.unlink(missing_ok=True)
+                if not replaced and backup is not None and backup.exists():
+                    backup.unlink(missing_ok=True)
+                    _fsync_directory(target.parent)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(type(cleanup_error).__name__)
+        if (
+            _include_commit_snapshot
+            and manager_identity is not None
+            and _path_matches(target, manager_identity, content)
+        ):
+            interruption._commit_snapshot = (
+                manager_identity,
+                content,
+                existing_mode,
+            )
+        if cleanup_errors:
+            interruption._cleanup_errors = cleanup_errors
+        raise
     finally:
         if owns_descriptor and held_descriptor is not None:
             os.close(held_descriptor)

@@ -463,6 +463,64 @@ class DocumentIOTest(unittest.TestCase):
             self.assertEqual(backup.read_bytes(), original)
             self.assertNotEqual(path.read_bytes(), original)
 
+    def test_keyboard_interrupt_before_replace_closes_fd_and_removes_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "settings.json"
+            path.write_text('{"hooks": {}}\n', encoding="utf-8")
+            created_fd: int | None = None
+            real_mkstemp = tempfile.mkstemp
+
+            def track_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+                nonlocal created_fd
+                created_fd, name = real_mkstemp(*args, **kwargs)
+                return created_fd, name
+
+            with mock.patch(
+                "vibe_memory_hooks.tempfile.mkstemp", side_effect=track_mkstemp
+            ), mock.patch(
+                "vibe_memory_hooks.os.fsync", side_effect=KeyboardInterrupt()
+            ), self.assertRaises(KeyboardInterrupt):
+                hooks.write_with_backup(path, {"hooks": {"Stop": []}})
+
+            self.assertIsNotNone(created_fd)
+            with self.assertRaises(OSError):
+                os.fstat(created_fd)
+            self.assertEqual(path.read_text(encoding="utf-8"), '{"hooks": {}}\n')
+            self.assertEqual(list(root.glob(".settings.json.*")), [])
+            self.assertEqual(list(root.glob("settings.json.bak.*")), [])
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin swap path only")
+    def test_system_exit_after_commit_carries_token_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            path = root / "settings.json"
+            original = b'{"hooks": {}}\n'
+            path.write_bytes(original)
+            real_promote = hooks._promote_recovery_path
+            interrupted = SystemExit(31)
+
+            def interrupt_after_promote(*args: object, **kwargs: object) -> pathlib.Path:
+                real_promote(*args, **kwargs)
+                raise interrupted
+
+            with mock.patch(
+                "vibe_memory_hooks._promote_recovery_path",
+                side_effect=interrupt_after_promote,
+            ), self.assertRaises(SystemExit) as raised:
+                hooks.write_with_backup(
+                    path,
+                    {"hooks": {"Stop": []}},
+                    expected_source=original,
+                    _include_commit_snapshot=True,
+                )
+
+            self.assertIs(raised.exception, interrupted)
+            committed = getattr(interrupted, "_commit_snapshot", None)
+            self.assertIsNotNone(committed)
+            self.assertEqual(hooks._snapshot_path(path), committed)
+            self.assertEqual(list(root.glob(".settings.json.*")), [])
+
     def test_load_document_missing_and_malformed_content_do_not_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             path = pathlib.Path(value) / "settings.json"
