@@ -156,15 +156,15 @@ class UIDesignServerTest(unittest.TestCase):
         thread = mock.Mock()
         thread.start.side_effect = lambda: order.append("bootout")
         with mock.patch.object(
-            server, "save_first_run_settings", return_value={"bootout_after_response": True}
-        ), mock.patch.object(
-            server, "mark_bootout_pending"
+            server, "save_first_run_settings", return_value={
+                "bootout_after_response": True, "service_action_generation": "generation"
+            }
         ), mock.patch.object(server.threading, "Thread", return_value=thread) as make_thread:
             handler.do_POST()
         self.assertEqual(order, ["response", "bootout"])
         make_thread.assert_called_once_with(
             target=server.scheduled_bootout_worker,
-            args=(mock.ANY,),
+            args=(mock.ANY, "generation"),
             daemon=False,
         )
 
@@ -173,6 +173,8 @@ class UIDesignServerTest(unittest.TestCase):
             ({"Host": "evil.example", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
             ({"Host": "127.0.0.1:8897", "Content-Type": "text/plain", "Content-Length": "2"}, b"{}"),
             ({"Host": "127.0.0.1:8897", "Origin": "https://evil.example", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
+            ({"Host": "127.0.0.1:8897", "Origin": "http://localhost:8897", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
+            ({"Host": "127.0.0.1:8898", "Content-Type": "application/json", "Content-Length": "2"}, b"{}"),
             ({"Host": "127.0.0.1:8897", "Content-Type": "application/json", "Content-Length": str(65537)}, b""),
         )
         for headers, raw in cases:
@@ -196,9 +198,33 @@ class UIDesignServerTest(unittest.TestCase):
             server.vibe_memory_settings.vibe_memory_install, "bootout_launch_agent",
             side_effect=RuntimeError("launchctl failed"),
         ):
-            server.complete_scheduled_bootout()
+            action = server.write_service_action(paths, desired=False)
+            server.complete_scheduled_bootout(paths, str(action["generation"]))
         persisted = json.loads(server.service_action_path(paths).read_text(encoding="utf-8"))
         self.assertIn("launchctl failed", persisted["error"])
+
+    def test_stale_bootout_generation_cannot_stop_new_start_request(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "generation-home")
+        stale = server.write_service_action(paths, desired=False)
+        current = server.write_service_action(paths, desired=True)
+        with mock.patch.object(
+            server.vibe_memory_settings.vibe_memory_install, "bootout_launch_agent"
+        ) as bootout:
+            server.scheduled_bootout_worker(paths, stale["generation"])
+        bootout.assert_not_called()
+        self.assertEqual(server.read_service_action(paths)["generation"], current["generation"])
+        self.assertTrue(server.read_service_action(paths)["desired_start_at_login"])
+
+    def test_only_latest_false_generation_boots_out(self) -> None:
+        paths = vibe_memory_paths.for_home(self.temp / "two-worker-home")
+        stale = server.write_service_action(paths, desired=False)
+        current = server.write_service_action(paths, desired=False)
+        with mock.patch.object(
+            server.vibe_memory_settings.vibe_memory_install, "bootout_launch_agent"
+        ) as bootout:
+            server.scheduled_bootout_worker(paths, stale["generation"])
+            server.scheduled_bootout_worker(paths, current["generation"])
+        bootout.assert_called_once_with()
 
     def test_context_and_skill_routes_use_shared_domain_operations(self) -> None:
         context = server.ui_design_get(

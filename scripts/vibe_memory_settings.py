@@ -378,7 +378,10 @@ def prune_personal_short(
             chunks.append(record)
         cursor = end_end
         search = end_end
+    marker_tokens = (b"vibe-memory:short:begin", b"vibe-memory:short:end")
     if cursor:
+        if any(token in source[cursor:] for token in marker_tokens):
+            raise ValueError("malformed managed short envelope")
         chunks.append(source[cursor:])
         source_after_envelopes = b"".join(chunks)
         if envelope_changed:
@@ -386,7 +389,7 @@ def prune_personal_short(
             _backup_source(target, source, mode)
             _atomic_write_text(target, source_after_envelopes.decode("utf-8"), mode)
         return removed
-    if b"vibe-memory:short:begin" in source or b"vibe-memory:short:end" in source:
+    if any(token in source for token in marker_tokens):
         raise ValueError("malformed managed short envelope")
 
     changed = False
@@ -443,6 +446,7 @@ def _transaction_paths(paths: RuntimePaths) -> list[pathlib.Path]:
         pathlib.Path(paths.project_registry),
         pathlib.Path(paths.launch_agent),
         vibe_memory_install.install_state_path(paths),
+        pathlib.Path(paths.install_root) / "state" / "service-action.json",
         pathlib.Path(paths.personal_memory) / "short.md",
     ]
 
@@ -509,6 +513,16 @@ def apply_first_run(
                 registered = run_write(lambda: register_workspace(workspace), [registry_path])
             plist_path = pathlib.Path(paths.launch_agent)
             launch = run_write(lambda: reconcile_launch_agent(paths, saved), [plist_path])
+            action_path = pathlib.Path(paths.install_root) / "state" / "service-action.json"
+            service_action = {
+                "generation": uuid.uuid4().hex,
+                "desired_start_at_login": bool(saved["start_at_login"]),
+                "status": "active" if saved["start_at_login"] else "bootout_pending",
+            }
+            run_write(
+                lambda: vibe_memory_install._atomic_write_private_json(action_path, service_action),
+                [action_path],
+            )
             if saved["start_at_login"]:
                 runtime = vibe_memory_install.read_runtime_config(paths)
                 version = runtime.get("app_version")
@@ -522,6 +536,7 @@ def apply_first_run(
                 "registered_project": registered,
                 "launch_agent": launch,
                 "bootout_after_response": not bool(saved["start_at_login"]),
+                "service_action_generation": service_action["generation"],
             }
         except Exception as original_error:
             try:

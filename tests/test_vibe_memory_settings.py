@@ -416,6 +416,24 @@ keep exactly
             settings.prune_personal_short(self.short_memory, retention_days=0)
         self.assertEqual(self.short_memory.read_text(encoding="utf-8"), malformed)
 
+    def test_later_malformed_marker_makes_entire_retention_pass_read_only(self) -> None:
+        valid = settings.render_managed_short_envelope("valid", "body")
+        cases = (
+            "<!-- vibe-memory:short:begin length=x sha256=" + "0" * 64 + " -->\n",
+            "<!-- vibe-memory:short:begin length=4 sha256=" + "0" * 63 + " -->\nbody\n",
+            "<!-- vibe-memory:short:end -->\n",
+            "<!-- vibe-memory:short:begin length=4 sha256=" + "0" * 64 + " -->\nbody",
+        )
+        for suffix in cases:
+            with self.subTest(suffix=suffix[:30]):
+                original = (valid + suffix).encode("utf-8")
+                self.short_memory.write_bytes(original)
+                with self.assertRaisesRegex(ValueError, "malformed managed short"):
+                    settings.prune_personal_short(
+                        self.short_memory, today=dt.date(2026, 8, 13), retention_days=14
+                    )
+                self.assertEqual(self.short_memory.read_bytes(), original)
+
     def test_context_omits_candidate_reminder_when_automatic_checks_are_disabled(self) -> None:
         event = NormalizedEvent(
             agent="codex",

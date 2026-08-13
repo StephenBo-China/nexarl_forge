@@ -11,6 +11,7 @@ import pathlib
 import re
 import tempfile
 import threading
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -91,33 +92,59 @@ def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:
     return pathlib.Path(paths.install_root) / "state" / "service-action.json"
 
 
-def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths | None = None) -> None:
-    paths = vibe_memory_paths.for_home() if paths is None else paths
+def read_service_action(paths: vibe_memory_paths.RuntimePaths) -> dict[str, object]:
+    path = service_action_path(paths)
+    if path.is_symlink():
+        raise ValueError("service action state must not be a symlink")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("service action state must be an object")
+    return value
+
+
+def write_service_action(paths: vibe_memory_paths.RuntimePaths, *, desired: bool) -> dict[str, object]:
+    value = {
+        "generation": uuid.uuid4().hex,
+        "desired_start_at_login": desired,
+        "status": "active" if desired else "bootout_pending",
+    }
+    vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), value)
+    return value
+
+
+def _service_action_matches(paths: vibe_memory_paths.RuntimePaths, generation: str, desired: bool) -> bool:
+    value = read_service_action(paths)
+    return value.get("generation") == generation and value.get("desired_start_at_login") is desired
+
+
+def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths, generation: str) -> None:
     action_path = service_action_path(paths)
+    if not _service_action_matches(paths, generation, False):
+        return
     try:
         vibe_memory_settings.vibe_memory_install.bootout_launch_agent()
     except Exception as error:  # Persist a retry-visible diagnostic.
-        value = {"status": "bootout_pending", "error": str(error)[:500]}
-        vibe_memory_settings.vibe_memory_install._atomic_write_private_json(action_path, value)
+        if _service_action_matches(paths, generation, False):
+            value = read_service_action(paths)
+            value["error"] = str(error)[:500]
+            vibe_memory_settings.vibe_memory_install._atomic_write_private_json(action_path, value)
     else:
-        action_path.unlink(missing_ok=True)
+        if _service_action_matches(paths, generation, False):
+            action_path.unlink(missing_ok=True)
 
 
-def mark_bootout_pending(paths: vibe_memory_paths.RuntimePaths) -> None:
-    vibe_memory_settings.vibe_memory_install._atomic_write_private_json(
-        service_action_path(paths), {"status": "bootout_pending"}
-    )
-
-
-def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths) -> None:
+def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths, generation: str) -> None:
     try:
-        complete_scheduled_bootout(paths)
+        complete_scheduled_bootout(paths, generation)
     except Exception as error:  # Never leak a background traceback.
         try:
-            vibe_memory_settings.vibe_memory_install._atomic_write_private_json(
-                service_action_path(paths),
-                {"status": "bootout_pending", "error": str(error)[:500]},
-            )
+            if _service_action_matches(paths, generation, False):
+                value = read_service_action(paths)
+                value["error"] = str(error)[:500]
+                vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), value)
         except Exception:
             return
 
@@ -2508,9 +2535,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def read_json(self) -> dict:
         host = self.headers.get("Host", "")
-        allowed_hosts = {HOST, "127.0.0.1", "localhost", "::1"}
-        host_name = host.rsplit(":", 1)[0].strip("[]") if host else ""
-        if host_name not in allowed_hosts:
+        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        try:
+            parsed_host = urlparse(f"//{host}")
+            host_name = parsed_host.hostname
+            host_port = parsed_host.port or PORT
+        except ValueError as error:
+            raise ValueError("Host is invalid") from error
+        if host_name not in allowed_hosts or host_port != PORT:
             raise ValueError("Host must be loopback")
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
@@ -2518,10 +2550,16 @@ class Handler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin:
             parsed_origin = urlparse(origin)
-            if parsed_origin.scheme != "http" or parsed_origin.hostname not in allowed_hosts:
-                raise ValueError("Origin must be same-origin loopback")
-            if parsed_origin.port not in {None, PORT}:
-                raise ValueError("Origin port must match service")
+            try:
+                origin_port = parsed_origin.port or 80
+            except ValueError as error:
+                raise ValueError("Origin is invalid") from error
+            if (
+                parsed_origin.scheme != "http"
+                or parsed_origin.hostname != host_name
+                or origin_port != host_port
+            ):
+                raise ValueError("Origin must exactly match Host")
         raw_length = self.headers.get("Content-Length", "0") or "0"
         try:
             length = int(raw_length)
@@ -2581,12 +2619,12 @@ class Handler(BaseHTTPRequestHandler):
                 if result.get("bootout_after_response"):
                     result["service_action"] = "bootout_scheduled"
                     action_paths = vibe_memory_paths.for_home()
-                    mark_bootout_pending(action_paths)
+                    generation = str(result["service_action_generation"])
                 self.send_json(result)
                 if result.get("bootout_after_response"):
                     threading.Thread(
                         target=scheduled_bootout_worker,
-                        args=(action_paths,),
+                        args=(action_paths, generation),
                         daemon=False,
                     ).start()
                 return
