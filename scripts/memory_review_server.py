@@ -11,7 +11,6 @@ import pathlib
 import re
 import tempfile
 import threading
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -106,13 +105,11 @@ def read_service_action(paths: vibe_memory_paths.RuntimePaths) -> dict[str, obje
 
 
 def write_service_action(paths: vibe_memory_paths.RuntimePaths, *, desired: bool) -> dict[str, object]:
-    value = {
-        "generation": uuid.uuid4().hex,
-        "desired_start_at_login": desired,
-        "status": "active" if desired else "bootout_pending",
-    }
-    vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), value)
-    return value
+    return vibe_memory_settings.write_service_action(
+        paths,
+        desired_start_at_login=desired,
+        status="active" if desired else "bootout_pending",
+    )
 
 
 def _service_action_matches(paths: vibe_memory_paths.RuntimePaths, generation: str, desired: bool) -> bool:

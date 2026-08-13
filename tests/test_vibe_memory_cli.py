@@ -27,6 +27,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import vibe_memory_cli
 import vibe_memory_router
+import memory_review_server
 
 
 class VibeMemoryLifecycleTest(unittest.TestCase):
@@ -1037,6 +1038,87 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
                 "start_at_login"
             ]
         )
+
+    def test_start_invalidates_pending_bootout_for_manual_session(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        pending = memory_review_server.write_service_action(
+            self.paths, desired=False
+        )
+
+        code, output, stderr = self.invoke(["start"])
+
+        with mock.patch.object(
+            memory_review_server.vibe_memory_paths,
+            "for_home",
+            return_value=self.paths,
+        ), mock.patch.object(
+            memory_review_server.vibe_memory_settings.vibe_memory_install,
+            "bootout_launch_agent",
+        ) as bootout:
+            memory_review_server.scheduled_bootout_worker(
+                self.paths, str(pending["generation"])
+            )
+
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(output["status"], "healthy")
+        bootout.assert_not_called()
+        action = memory_review_server.read_service_action(self.paths)
+        self.assertNotEqual(action["generation"], pending["generation"])
+        self.assertFalse(action["desired_start_at_login"])
+        self.assertEqual(action["status"], "current_session_active")
+        settings = vibe_memory_cli.vibe_memory_settings.load_settings(self.paths)
+        self.assertFalse(settings["start_at_login"])
+        lifecycle = plistlib.loads(self.paths.launch_agent.read_bytes())
+        self.assertFalse(lifecycle["RunAtLoad"])
+        self.assertFalse(lifecycle["KeepAlive"])
+
+    def test_failed_start_preserves_pending_bootout_generation(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {
+                **vibe_memory_cli.vibe_memory_settings.default_settings(),
+                "first_run_complete": True,
+                "start_at_login": False,
+                "service_port": 9123,
+            },
+        )
+        pending = memory_review_server.write_service_action(
+            self.paths, desired=False
+        )
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            side_effect=vibe_memory_cli.vibe_memory_install.InstallError(
+                "activation failed"
+            ),
+        ):
+            code, _, stderr = self.invoke(["start"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "start failed; run doctor for actionable status\n")
+        action = memory_review_server.read_service_action(self.paths)
+        self.assertEqual(action["generation"], pending["generation"])
+        self.assertEqual(action["status"], "bootout_pending")
 
     def test_start_preserves_login_launch_agent_and_enabled_setting(self) -> None:
         vibe_memory_cli.vibe_memory_install.install_runtime_config(

@@ -78,6 +78,19 @@ def lifecycle_lock(paths: RuntimePaths):
         yield
 
 
+def write_service_action(
+    paths: RuntimePaths, *, desired_start_at_login: bool, status: str
+) -> dict[str, object]:
+    value = {
+        "generation": uuid.uuid4().hex,
+        "desired_start_at_login": desired_start_at_login,
+        "status": status,
+    }
+    action_path = pathlib.Path(paths.install_root) / "state" / "service-action.json"
+    vibe_memory_install._atomic_write_private_json(action_path, value)
+    return value
+
+
 def default_settings() -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -524,15 +537,16 @@ def apply_first_run(
             plist_path = pathlib.Path(paths.launch_agent)
             launch = run_write(lambda: reconcile_launch_agent(paths, saved), [plist_path])
             action_path = pathlib.Path(paths.install_root) / "state" / "service-action.json"
-            service_action = {
-                "generation": uuid.uuid4().hex,
-                "desired_start_at_login": bool(saved["start_at_login"]),
-                "status": "active" if saved["start_at_login"] else "bootout_pending",
-            }
-            run_write(
-                lambda: vibe_memory_install._atomic_write_private_json(action_path, service_action),
+            desired_start_at_login = bool(saved["start_at_login"])
+            service_action = run_write(
+                lambda: write_service_action(
+                    paths,
+                    desired_start_at_login=desired_start_at_login,
+                    status="active" if desired_start_at_login else "bootout_pending",
+                ),
                 [action_path],
             )
+            assert isinstance(service_action, dict)
             if saved["start_at_login"] and launch.get("changed", True) is not False:
                 runtime = vibe_memory_install.read_runtime_config(paths)
                 version = runtime.get("app_version")

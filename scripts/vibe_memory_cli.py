@@ -670,6 +670,12 @@ def start_command(_args: argparse.Namespace) -> int:
         result = vibe_memory_install.activate_launch_agent(
             paths, expected_version=version
         )
+        desired_start_at_login = bool(settings["start_at_login"])
+        vibe_memory_settings.write_service_action(
+            paths,
+            desired_start_at_login=desired_start_at_login,
+            status="active" if desired_start_at_login else "current_session_active",
+        )
     _json(result)
     return 0
 
