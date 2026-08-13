@@ -167,6 +167,7 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
                     "schema_version": 1,
                     "package_approvals": {},
                     "project_global_approval": {
+                        "task_id": "baseline",
                         "digest": "b" * 64,
                         "status": "approved",
                     },
@@ -431,6 +432,51 @@ class VibeMemoryMigrationTest(unittest.TestCase):
             (root / "link").symlink_to(outside)
             with self.assertRaises(ValueError):
                 migration.safe_tree_digest(root)
+
+    def test_skill_schema_global_approval_and_audit_evil_statuses_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            fixture = build_complete_legacy_fixture(pathlib.Path(value))
+            project = fixture.project_roots[0]
+            approvals_path = project / "codex/ui_design/approvals.json"
+            approvals = json.loads(approvals_path.read_text())
+            approvals["project_global_approval"] = {"status": "evil", "digest": "0" * 64}
+            _write_json(approvals_path, approvals)
+            (project / "codex/ui_design/audit.jsonl").write_text(
+                json.dumps({"at": "now", "event": "design_package_created", "task_id": "x", "digest": "0" * 64, "status": "evil"}) + "\n",
+                encoding="utf-8",
+            )
+            skill_path = fixture.paths.ui_design_home / "registry.json"
+            skill = json.loads(skill_path.read_text())
+            skill["schema_version"] = 999
+            _write_json(skill_path, skill)
+            (fixture.paths.ui_design_home / "audit.jsonl").write_text(
+                json.dumps({"at": "now", "event": "draft_created", "draft_id": "x", "digest": "0" * 64, "name": "x", "status": "evil"}) + "\n",
+                encoding="utf-8",
+            )
+            result = migration.validate_control_plane(fixture.paths, fixture.registry)
+        self.assertEqual(result["ui_design_approvals"], "error")
+        self.assertEqual(result["ui_design_audit"], "error")
+        self.assertEqual(result["ui_skills"], "error")
+        self.assertEqual(result["ui_skill_audit"], "error")
+
+    def test_skill_package_components_and_symlinked_name_are_rejected_without_outside_read(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            home = pathlib.Path(value) / "home"
+            home.mkdir()
+            paths = vibe_memory_paths.for_home(home)
+            packages = paths.ui_design_home / "packages"
+            packages.mkdir(parents=True)
+            outside = pathlib.Path(value) / "outside"
+            outside.mkdir()
+            (outside / "secret").write_text("never-read", encoding="utf-8")
+            (packages / "sample-ui").symlink_to(outside, target_is_directory=True)
+            _write_json(paths.ui_design_home / "registry.json", {
+                "schema_version": 1, "drafts": {}, "deployments": {}, "idempotency": {},
+                "packages": {"sample-ui": [{"version_id": "../outside", "package_path": str(outside), "digest": "0" * 64}]},
+            })
+            result = migration.inventory(paths, {"schema_version": 1, "projects": [], "current_project": ""})
+        self.assertTrue(result["ui_skill_digests"]["errors"])
+        self.assertNotIn("never-read", json.dumps(result))
 
     def test_empty_optional_control_plane_is_valid(self) -> None:
         with tempfile.TemporaryDirectory() as value:

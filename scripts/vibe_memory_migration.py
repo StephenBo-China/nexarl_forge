@@ -101,8 +101,27 @@ def safe_tree_digest(
     """Hash a package with the canonical tree protocol using descriptor-relative reads."""
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(root, flags)
+    try:
+        return _safe_tree_digest_fd(
+            root_fd,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+            max_file_bytes=max_file_bytes,
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _safe_tree_digest_fd(
+    root_fd: int,
+    *,
+    max_files: int = _MAX_PACKAGE_FILES,
+    max_total_bytes: int = _MAX_PACKAGE_TOTAL_BYTES,
+    max_file_bytes: int = _MAX_PACKAGE_FILE_BYTES,
+) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     files: list[tuple[str, int, int]] = []
-    opened: list[int] = [root_fd]
+    opened: list[int] = []
     total = 0
     try:
         def walk(directory_fd: int, prefix: str) -> None:
@@ -1472,6 +1491,14 @@ def inspect_ui_design_approvals(project_roots: list[pathlib.Path]) -> dict[str, 
                 project_global = value.get("project_global_approval")
                 if project_global is not None:
                     project_global_approvals += 1
+                    if (
+                        not isinstance(project_global, dict)
+                        or project_global.get("status") != "approved"
+                        or not isinstance(project_global.get("digest"), str)
+                        or len(project_global["digest"]) != 64
+                        or not isinstance(project_global.get("task_id"), str)
+                    ):
+                        errors.append(_issue(path, ValueError("invalid project_global_approval")))
                 summary = {
                     "path": str(path),
                     "status": "ok",
@@ -1516,7 +1543,7 @@ def inspect_ui_skills(ui_design_home: pathlib.Path) -> dict[str, Any]:
             "idempotency": 0,
             "errors": [],
         }
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or value.get("schema_version") != 1:
         return {
             "path": str(path),
             "status": "invalid",
@@ -1525,7 +1552,7 @@ def inspect_ui_skills(ui_design_home: pathlib.Path) -> dict[str, Any]:
             "published": 0,
             "deployments": 0,
             "idempotency": 0,
-            "errors": [_issue(path, ValueError("JSON root must be an object"))],
+            "errors": [_issue(path, ValueError("UI skill registry schema_version must be 1"))],
         }
     errors: list[dict[str, str]] = []
     drafts = value.get("drafts", {})
@@ -1860,6 +1887,21 @@ def _inspect_jsonl(paths: list[pathlib.Path], label: str) -> dict[str, Any]:
                 if not required.issubset(value):
                     errors.append(_issue(path, ValueError(f"{label} line {number} missing required fields")))
                     continue
+                status = value.get("status")
+                if label == "UI design audit":
+                    allowed_statuses = {
+                        "pending_approval", "approved", "rejected", "revision_requested",
+                        "invalidated", "design_package", "project_global", "configured",
+                        "enabled", "relocked", "passed", "failed",
+                    }
+                else:
+                    allowed_statuses = {
+                        "draft", "validated", "approved", "publishing", "published",
+                        "publish_failed", "disabled", "superseded", "rejected",
+                    }
+                if status not in allowed_statuses:
+                    errors.append(_issue(path, ValueError(f"{label} line {number} has invalid status")))
+                    continue
                 records.append({"path": str(path), **value})
     return _area({"errors": errors}, records, present and not errors)
 
@@ -1887,38 +1929,60 @@ def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
     registry, errors = _skill_registry(ui_design_home)
     records: list[dict[str, Any]] = []
     if registry:
-        for name, versions in registry["packages"].items():
-            if not isinstance(versions, list):
-                errors.append(_issue(ui_design_home / "registry.json", ValueError(f"packages.{name} must be an array")))
-                continue
-            for record in versions:
-                if not isinstance(record, dict) or not isinstance(record.get("package_path"), str) or not isinstance(record.get("digest"), str):
-                    errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid package record for {name}")))
-                    continue
-                package_path = pathlib.Path(record["package_path"])
-                version_id = record.get("version_id")
-                expected = ui_design_home / "packages" / str(name) / str(version_id)
-                try:
-                    canonical_package = package_path.resolve(strict=True)
-                    canonical_expected = expected.resolve(strict=True)
-                except (OSError, RuntimeError):
-                    canonical_package = None
-                    canonical_expected = None
-                if canonical_package is None or canonical_package != canonical_expected:
-                    errors.append(_issue(package_path, ValueError("UI skill package path is outside canonical package storage")))
-                    continue
-                if any(path.is_symlink() for path in (package_path, *package_path.parents)) or any(
-                    path.is_symlink() for path in package_path.rglob("*")
-                ):
-                    errors.append(_issue(package_path, ValueError("UI skill package symlinks are not allowed")))
-                    continue
-                if not package_path.is_dir():
-                    errors.append(_issue(package_path, FileNotFoundError("referenced UI skill package is missing")))
-                    continue
-                actual = safe_tree_digest(package_path)
-                if actual != record["digest"]:
-                    errors.append(_issue(package_path, ValueError("UI skill package digest mismatch")))
-                records.append({"name": name, "version_id": record.get("version_id"), "path": str(package_path), "digest": record["digest"], "actual_digest": actual})
+        packages_root = ui_design_home / "packages"
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            packages_fd = os.open(packages_root, flags)
+        except OSError as error:
+            errors.append(_issue(packages_root, error))
+        else:
+            root_identity = os.fstat(packages_fd)
+            try:
+                for name, versions in registry["packages"].items():
+                    if not ui_skill_registry.NAME_PATTERN.fullmatch(str(name)):
+                        errors.append(_issue(packages_root, ValueError("invalid package name component")))
+                        continue
+                    if not isinstance(versions, list):
+                        errors.append(_issue(ui_design_home / "registry.json", ValueError(f"packages.{name} must be an array")))
+                        continue
+                    for record in versions:
+                        version_id = record.get("version_id") if isinstance(record, dict) else None
+                        if (
+                            not isinstance(record, dict)
+                            or not isinstance(record.get("package_path"), str)
+                            or not isinstance(record.get("digest"), str)
+                            or not isinstance(version_id, str)
+                            or "/" in version_id or version_id in {".", ".."}
+                        ):
+                            errors.append(_issue(ui_design_home / "registry.json", ValueError(f"invalid package record for {name}")))
+                            continue
+                        expected = packages_root / name / version_id
+                        recorded_parts = pathlib.Path(record["package_path"]).parts
+                        expected_suffix = ("packages", name, version_id)
+                        if recorded_parts[-3:] != expected_suffix:
+                            errors.append(_issue(expected, ValueError("UI skill package path does not match canonical storage")))
+                            continue
+                        name_fd = version_fd = None
+                        try:
+                            name_fd = os.open(name, flags, dir_fd=packages_fd)
+                            version_fd = os.open(version_id, flags, dir_fd=name_fd)
+                            actual = _safe_tree_digest_fd(version_fd)
+                            current_root = packages_root.stat(follow_symlinks=False)
+                            if (current_root.st_dev, current_root.st_ino) != (root_identity.st_dev, root_identity.st_ino):
+                                raise ValueError("package storage root changed during inspection")
+                        except (OSError, ValueError) as error:
+                            errors.append(_issue(expected, error))
+                            continue
+                        finally:
+                            if version_fd is not None:
+                                os.close(version_fd)
+                            if name_fd is not None:
+                                os.close(name_fd)
+                        if actual != record["digest"]:
+                            errors.append(_issue(expected, ValueError("UI skill package digest mismatch")))
+                        records.append({"name": name, "version_id": version_id, "path": str(expected), "digest": record["digest"], "actual_digest": actual})
+            finally:
+                os.close(packages_fd)
     return _area({"errors": errors}, records, registry is not None and not errors)
 
 
