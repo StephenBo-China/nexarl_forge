@@ -3005,6 +3005,146 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(before, {path: path.read_bytes() for path in managed})
             self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.1.0"))
 
+    def test_rollback_restores_original_lifecycle_after_current_replace_fsync_failure(self) -> None:
+        failures = (
+            OSError("durability sync failed after replacement"),
+            KeyboardInterrupt(),
+            SystemExit(47),
+        )
+        real_fsync = os.fsync
+
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as value:
+                paths = self.make_paths(pathlib.Path(value))
+                releases = paths.install_root / "releases"
+                for version in ("0.9.0", "1.0.0"):
+                    (releases / version).mkdir(parents=True)
+                current = paths.install_root / "current"
+                current.symlink_to("releases/1.0.0")
+                vibe_memory_install.install_runtime_config(
+                    paths,
+                    port=9123,
+                    app_version="1.0.0",
+                    python_executable=sys.executable,
+                )
+                vibe_memory_install.install_launcher(paths, python_executable=sys.executable)
+                vibe_memory_install.install_launch_agent(
+                    paths,
+                    vibe_memory_install.render_launch_agent(
+                        paths,
+                        port=9123,
+                        python_executable=sys.executable,
+                    ),
+                )
+                vibe_memory_install.write_install_state(
+                    paths,
+                    vibe_memory_install._install_state_document(
+                        current_version="1.0.0",
+                        previous_version="0.9.0",
+                        port=9123,
+                        installed_clients=[],
+                        python_executable=sys.executable,
+                    ),
+                )
+                managed = [
+                    paths.install_root / "config.json",
+                    paths.launcher,
+                    paths.launch_agent,
+                    vibe_memory_install.install_state_path(paths),
+                ]
+                before = {path: path.read_bytes() for path in managed}
+                fsync_calls = 0
+
+                def fail_first_fsync(descriptor: int) -> None:
+                    nonlocal fsync_calls
+                    fsync_calls += 1
+                    if fsync_calls == 1:
+                        raise failure
+                    real_fsync(descriptor)
+
+                with mock.patch(
+                    "vibe_memory_install.os.fsync", side_effect=fail_first_fsync
+                ), mock.patch(
+                    "vibe_memory_install.bootout_launch_agent"
+                ), mock.patch(
+                    "vibe_memory_install.activate_launch_agent",
+                    return_value={"status": "healthy"},
+                ) as activate:
+                    if isinstance(failure, Exception):
+                        with self.assertRaises(vibe_memory_install.InstallError) as raised:
+                            vibe_memory_install.rollback(paths)
+                        self.assertIs(raised.exception.__cause__, failure)
+                    else:
+                        with self.assertRaises(type(failure)) as raised:
+                            vibe_memory_install.rollback(paths)
+                        self.assertIs(raised.exception, failure)
+
+                self.assertEqual(os.readlink(current), "releases/1.0.0")
+                self.assertEqual(before, {path: path.read_bytes() for path in managed})
+                self.assertEqual(
+                    activate.call_args_list,
+                    [mock.call(paths, expected_version="1.0.0")],
+                )
+                self.assertTrue((releases / "0.9.0").is_dir())
+                self.assertTrue((releases / "1.0.0").is_dir())
+
+    def test_rollback_cleanup_preserves_concurrent_current_after_replace_fsync_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            releases = paths.install_root / "releases"
+            for version in ("0.9.0", "1.0.0", "2.0.0"):
+                (releases / version).mkdir(parents=True)
+            current = paths.install_root / "current"
+            current.symlink_to("releases/1.0.0")
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0",
+                    previous_version="0.9.0",
+                    port=9123,
+                    installed_clients=[],
+                    python_executable=sys.executable,
+                ),
+            )
+            state_path = vibe_memory_install.install_state_path(paths)
+            original_state = state_path.read_bytes()
+            interruption = KeyboardInterrupt()
+            real_fsync = os.fsync
+            fsync_calls = 0
+
+            def replace_current_then_interrupt(descriptor: int) -> None:
+                nonlocal fsync_calls
+                fsync_calls += 1
+                if fsync_calls == 1:
+                    current.unlink()
+                    current.symlink_to("releases/2.0.0")
+                    raise interruption
+                real_fsync(descriptor)
+
+            with mock.patch(
+                "vibe_memory_install.os.fsync",
+                side_effect=replace_current_then_interrupt,
+            ), mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+                return_value={"status": "healthy"},
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    vibe_memory_install.rollback(paths)
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(os.readlink(current), "releases/2.0.0")
+            self.assertEqual(state_path.read_bytes(), original_state)
+            self.assertEqual(
+                getattr(interruption, "_rollback_conflicts", []),
+                ["version"],
+            )
+            self.assertIn(
+                "changed concurrently",
+                getattr(interruption, "_cleanup_failures", [""])[0],
+            )
+
     def test_lifecycle_hook_rollback_uses_immediate_commit_snapshots(self) -> None:
         operations = ("update", "rollback", "repair")
         failure_modes = (

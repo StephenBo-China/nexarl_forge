@@ -2262,22 +2262,47 @@ def write_install_state(paths: RuntimePaths, value: dict[str, Any]) -> None:
     _atomic_write_private_json(install_state_path(paths), value)
 
 
-def _current_version(paths: RuntimePaths) -> str | None:
-    current = pathlib.Path(paths.install_root) / "current"
+ManagedCurrentSnapshot = tuple[tuple[int, int], str]
+
+
+def _managed_current_snapshot_at(install_fd: int) -> ManagedCurrentSnapshot | None:
     try:
-        metadata = current.lstat()
+        metadata = os.stat("current", dir_fd=install_fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not stat.S_ISLNK(metadata.st_mode):
         raise InstallError("current runtime must be a managed symlink")
-    link = os.readlink(current)
+    link = os.readlink("current", dir_fd=install_fd)
     prefix = "releases/"
     if not link.startswith(prefix) or pathlib.PurePosixPath(link).name != link[len(prefix):]:
         raise InstallError("current runtime symlink is not managed")
-    return link[len(prefix):]
+    return _identity(metadata), link
 
 
-def _activate_managed_version(paths: RuntimePaths, version: str) -> None:
+def _snapshot_managed_current(paths: RuntimePaths) -> ManagedCurrentSnapshot | None:
+    install_root = pathlib.Path(paths.install_root)
+    _validate_install_ancestor_chain(install_root)
+    try:
+        install_fd = os.open(_canonical_install_path(install_root), _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        return None
+    try:
+        return _managed_current_snapshot_at(install_fd)
+    finally:
+        os.close(install_fd)
+
+
+def _current_version(paths: RuntimePaths) -> str | None:
+    snapshot = _snapshot_managed_current(paths)
+    return None if snapshot is None else snapshot[1][len("releases/"):]
+
+
+def _activate_managed_version(
+    paths: RuntimePaths,
+    version: str,
+    *,
+    expected_current: ManagedCurrentSnapshot | None | object = _NO_SNAPSHOT_CHECK,
+) -> ManagedCurrentSnapshot:
     if not isinstance(version, str) or not _VERSION_PATTERN.fullmatch(version):
         raise InstallError("rollback version must be a semantic version")
     release = pathlib.Path(paths.install_root) / "releases" / version
@@ -2289,22 +2314,63 @@ def _activate_managed_version(paths: RuntimePaths, version: str) -> None:
     temporary_name = f".current.tmp-{uuid.uuid4().hex}"
     try:
         os.symlink(f"releases/{version}", temporary_name, dir_fd=install_fd)
-        if _entry_exists(install_fd, "current"):
-            metadata = os.stat("current", dir_fd=install_fd, follow_symlinks=False)
-            if not stat.S_ISLNK(metadata.st_mode):
-                raise InstallError("current runtime target is not a symlink")
+        current = _managed_current_snapshot_at(install_fd)
+        if expected_current is not _NO_SNAPSHOT_CHECK and current != expected_current:
+            raise InstallError("current runtime changed concurrently during rollback")
         os.replace(
             temporary_name,
             "current",
             src_dir_fd=install_fd,
             dst_dir_fd=install_fd,
         )
-        os.fsync(install_fd)
+        committed = _managed_current_snapshot_at(install_fd)
+        if committed is None:
+            raise InstallError("current runtime disappeared after activation")
+        try:
+            os.fsync(install_fd)
+        except BaseException as error:
+            try:
+                setattr(error, "_current_commit_snapshot", committed)
+            except BaseException:
+                pass
+            raise
+        return committed
     finally:
         try:
             os.unlink(temporary_name, dir_fd=install_fd)
         except FileNotFoundError:
             pass
+        os.close(install_fd)
+
+
+def _restore_managed_current(
+    paths: RuntimePaths,
+    original: ManagedCurrentSnapshot | None,
+    committed: ManagedCurrentSnapshot | None,
+) -> None:
+    current = _snapshot_managed_current(paths)
+    if current == original:
+        return
+    if committed is None or current != committed:
+        raise InstallError("current runtime changed concurrently during rollback")
+    if original is not None:
+        version = original[1][len("releases/"):]
+        _activate_managed_version(
+            paths,
+            version,
+            expected_current=committed,
+        )
+        return
+
+    install_root = pathlib.Path(paths.install_root)
+    _validate_install_ancestor_chain(install_root)
+    install_fd = os.open(_canonical_install_path(install_root), _DIRECTORY_OPEN_FLAGS)
+    try:
+        if _managed_current_snapshot_at(install_fd) != committed:
+            raise InstallError("current runtime changed concurrently during rollback")
+        os.unlink("current", dir_fd=install_fd)
+        os.fsync(install_fd)
+    finally:
         os.close(install_fd)
 
 
@@ -2704,7 +2770,12 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
     previous_version = state.get("previous_version")
     if not isinstance(previous_version, str) or not previous_version:
         raise InstallError("no previous runtime version is recorded")
-    current_version = _current_version(paths) or state.get("current_version")
+    original_current = _snapshot_managed_current(paths)
+    current_version = (
+        original_current[1][len("releases/"):]
+        if original_current is not None
+        else state.get("current_version")
+    )
     managed_paths = [
         pathlib.Path(paths.install_root) / "config.json",
         pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), install_state_path(paths),
@@ -2715,6 +2786,7 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
     managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
+    committed_current: ManagedCurrentSnapshot | None = None
 
     def cleanup_rollback() -> list[LifecycleCleanupFailure]:
         failures: list[LifecycleCleanupFailure] = []
@@ -2726,12 +2798,16 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
                 snapshots, written, exact_paths=hook_paths
             )
         )
+        _record_lifecycle_cleanup(
+            failures,
+            "version",
+            lambda: _restore_managed_current(
+                paths,
+                original_current,
+                committed_current,
+            ),
+        )
         if isinstance(current_version, str):
-            _record_lifecycle_cleanup(
-                failures,
-                "version",
-                lambda: _activate_managed_version(paths, current_version),
-            )
             _record_lifecycle_cleanup(
                 failures,
                 "service",
@@ -2741,9 +2817,21 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
             )
         return failures
 
-    _activate_managed_version(paths, previous_version)
     port = int(state.get("port", 8897))
     try:
+        try:
+            committed_current = _activate_managed_version(
+                paths,
+                previous_version,
+                expected_current=original_current,
+            )
+        except BaseException as activation_error:
+            committed_current = getattr(
+                activation_error,
+                "_current_commit_snapshot",
+                None,
+            )
+            raise
         python = state.get("python_executable") if isinstance(state.get("python_executable"), str) else _runtime_python(paths)
         install_runtime_config(paths, port=port, app_version=previous_version, python_executable=python)
         install_launcher(paths, python_executable=python)
