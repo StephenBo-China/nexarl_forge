@@ -606,7 +606,7 @@ def split_memory_sections(text: str) -> list[dict]:
 
 
 def active_memory_sources() -> list[dict]:
-    return [
+    project_sources = [
         {
             "id": "project_long",
             "label": "项目长期记忆",
@@ -623,6 +623,8 @@ def active_memory_sources() -> list[dict]:
             "latest_first": True,
             "limit": 120,
         },
+    ]
+    personal_sources = [
         {
             "id": "personal_long",
             "label": "个人长期记忆",
@@ -640,6 +642,7 @@ def active_memory_sources() -> list[dict]:
             "limit": None,
         },
     ]
+    return project_sources + personal_sources if review.PROJECT_ROOT else personal_sources
 
 
 def active_memory_source(source_id: str) -> dict:

@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _dt
+import hashlib
 import io
 import json
 import os
 import pathlib
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -24,34 +26,74 @@ import memory_review as review_cli
 import memory_review_queue as review
 import loop_superpowers
 import ui_design_preferences as preferences
+import vibe_memory_install
+import vibe_memory_paths
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
     def test_start_script_without_project_does_not_promote_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             temp = pathlib.Path(value)
-            runtime = temp / "releases" / "1.0.0"
-            runtime.mkdir(parents=True)
-            capture = temp / "project-root.txt"
-            fake_bin = temp / "bin"
-            fake_bin.mkdir()
-            python = fake_bin / "python3"
-            python.write_text(
-                "#!/bin/sh\nprintf '%s' \"${MEMORY_REVIEW_PROJECT_ROOT-}\" > \"$CAPTURE\"\n",
+            home = temp / "home"
+            paths = vibe_memory_paths.for_home(home)
+            vibe_memory_install.install_runtime(ROOT, paths)
+            runtime = paths.install_root / "releases" / "1.0.0"
+            registry = temp / "projects.json"
+            registry.write_text(
+                json.dumps({"current_project": "", "projects": []}),
                 encoding="utf-8",
             )
-            python.chmod(0o755)
+            capture = temp / "project-root.txt"
+            shim = temp / "shim"
+            shim.mkdir()
+            (shim / "sitecustomize.py").write_text(
+                "import json, os, pathlib, subprocess, urllib.error, urllib.request\n"
+                "_popen = subprocess.Popen\n"
+                "_health_calls = 0\n"
+                "class _Response:\n"
+                "    status = 200\n"
+                "    def __enter__(self): return self\n"
+                "    def __exit__(self, *_args): return False\n"
+                "def _urlopen(*_args, **_kwargs):\n"
+                "    global _health_calls\n"
+                "    _health_calls += 1\n"
+                "    if _health_calls == 1: raise urllib.error.URLError('not running')\n"
+                "    return _Response()\n"
+                "def _capture_popen(*args, **kwargs):\n"
+                "    child = _popen(*args, **kwargs)\n"
+                "    pathlib.Path(os.environ['CAPTURE']).write_text(json.dumps({\n"
+                "        'command': [str(value) for value in args[0]],\n"
+                "        'cwd': kwargs.get('cwd'),\n"
+                "        'project_root': kwargs.get('env', {}).get('MEMORY_REVIEW_PROJECT_ROOT'),\n"
+                "        'pid': child.pid,\n"
+                "    }), encoding='utf-8')\n"
+                "    return child\n"
+                "urllib.request.urlopen = _urlopen\n"
+                "subprocess.Popen = _capture_popen\n",
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(runtime).as_posix(): (
+                    stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
+                    hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "",
+                )
+                for path in runtime.rglob("*")
+            }
             environment = os.environ.copy()
             environment.update(
                 {
                     "CAPTURE": str(capture),
-                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "HOME": str(home),
+                    "MEMORY_REVIEW_PORT": "0",
+                    "MEMORY_REVIEW_PROJECT_REGISTRY": str(registry),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONPATH": str(shim),
                 }
             )
             environment.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
 
             completed = subprocess.run(
-                [str(ROOT / "scripts" / "start_memory_review.sh")],
+                ["/bin/bash", str(runtime / "scripts" / "start_memory_review.sh")],
                 cwd=runtime,
                 env=environment,
                 text=True,
@@ -60,7 +102,26 @@ class MemoryReviewQualityTest(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(capture.read_text(encoding="utf-8"), "")
+            started = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertIsNone(started["project_root"])
+            self.assertEqual(pathlib.Path(started["cwd"]).resolve(), runtime.resolve())
+            self.assertEqual(
+                pathlib.Path(started["command"][1]).resolve(),
+                (runtime / "scripts" / "memory_review_server.py").resolve(),
+            )
+            try:
+                os.kill(started["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            after = {
+                path.relative_to(runtime).as_posix(): (
+                    stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
+                    hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "",
+                )
+                for path in runtime.rglob("*")
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(vibe_memory_install._managed_release_version(runtime), "1.0.0")
 
     def test_empty_registry_builds_personal_only_queue_without_touching_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -78,6 +139,19 @@ class MemoryReviewQualityTest(unittest.TestCase):
             home = temp / "home"
             personal = home / ".codex" / "personal_memory"
             personal.mkdir(parents=True)
+            (personal / "long.md").write_text(
+                "# Personal Long\n\n## Approved\n\nOriginal personal memory.\n",
+                encoding="utf-8",
+            )
+            (personal / "short.md").write_text(
+                "# Personal Short\n\n## Current\n\nShort personal memory.\n",
+                encoding="utf-8",
+            )
+            project_alias = personal / "codex_long_memory.md"
+            project_alias.write_text(
+                "# Alias\n\n## Must Stay\n\nDo not mutate this file.\n",
+                encoding="utf-8",
+            )
             (personal / "proposals.md").write_text(
                 "# Proposals\n\n"
                 "### M-personal\n\n"
@@ -113,11 +187,25 @@ class MemoryReviewQualityTest(unittest.TestCase):
                     "memory_review_server as server; "
                     "queue = review.build_queue(); "
                     "project_payload = server.project_payload(); "
+                    "active = server.active_memory_payload(); "
+                    "project_error = ''; "
+                    "project_delete_error = ''; "
+                    "\ntry: server.update_active_memory('project_long', 'project_long-0', "
+                    "'## Changed\\n\\nShould be rejected.')\n"
+                    "except ValueError as error: project_error = str(error)\n"
+                    "try: server.update_active_memory('project_long', 'project_long-0', "
+                    "None, delete=True)\n"
+                    "except ValueError as error: project_delete_error = str(error)\n"
+                    "server.update_active_memory('personal_long', 'personal_long-0', "
+                    "'## Updated\\n\\nUpdated personal memory.'); "
                     "print(json.dumps({"
                     "'current': str(memory_project.current_project() or ''), "
                     "'project_root': str(review.PROJECT_ROOT or ''), "
                     "'payload_current': project_payload['current_project'], "
                     "'payload_project': project_payload['project'], "
+                    "'active_sources': [source['id'] for source in active['sources']], "
+                    "'project_error': project_error, "
+                    "'project_delete_error': project_delete_error, "
                     "'scopes': [item['scope'] for item in queue['items']]"
                     "}))",
                 ],
@@ -135,6 +223,20 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(result["payload_current"], "")
             self.assertIsNone(result["payload_project"])
             self.assertEqual(result["scopes"], ["personal"])
+            self.assertEqual(
+                result["active_sources"], ["personal_long", "personal_short"]
+            )
+            self.assertIn("Unknown active memory source", result["project_error"])
+            self.assertIn(
+                "Unknown active memory source", result["project_delete_error"]
+            )
+            self.assertIn(
+                "Updated personal memory.",
+                (personal / "long.md").read_text(encoding="utf-8"),
+            )
+            self.assertIn(
+                "Do not mutate this file.", project_alias.read_text(encoding="utf-8")
+            )
             self.assertFalse((runtime / "codex").exists())
             self.assertTrue((personal / "memory_review_queue.json").is_file())
             self.assertTrue((personal / "memory_review_state.json").is_file())
