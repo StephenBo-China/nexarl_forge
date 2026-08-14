@@ -2400,6 +2400,56 @@ def _restore_regular_file(
         temporary.unlink(missing_ok=True)
 
 
+def _repair_lifecycle_hook(
+    path: pathlib.Path,
+    agent: str,
+    launcher: pathlib.Path,
+    written: dict[pathlib.Path, FileSnapshot | None],
+) -> dict[str, Any]:
+    import vibe_memory_hooks
+
+    try:
+        result = vibe_memory_hooks.repair(
+            path,
+            agent,
+            launcher,
+            _include_commit_snapshot=True,
+        )
+    except BaseException as error:
+        committed = getattr(error, "_commit_snapshot", None)
+        if committed is not None:
+            written[path] = committed
+        raise
+    if result.get("changed") is True:
+        committed = result.pop("_commit_snapshot", None)
+        if committed is None:
+            raise InstallError("hook repair did not return a commit snapshot")
+        written[path] = committed
+    return result
+
+
+def _restore_lifecycle_files(
+    snapshots: dict[pathlib.Path, FileSnapshot | None],
+    written: dict[pathlib.Path, FileSnapshot | None],
+    *,
+    exact_paths: set[pathlib.Path],
+) -> list[str]:
+    rollback_errors = []
+    for path, snapshot in snapshots.items():
+        try:
+            _restore_regular_file(
+                path,
+                snapshot,
+                expected_current=written.get(
+                    path,
+                    snapshot if path in exact_paths else _NO_SNAPSHOT_CHECK,
+                ),
+            )
+        except InstallError:
+            rollback_errors.append(str(path))
+    return rollback_errors
+
+
 def _managed_release_version(path: pathlib.Path) -> str | None:
     """Return a release's validated version, or None for an unknown directory."""
     if path.is_symlink() or not path.is_dir() or not _VERSION_PATTERN.fullmatch(path.name):
@@ -2488,7 +2538,9 @@ def update(
     state_path = install_state_path(paths)
     clients = _installed_clients(paths) if installed_clients is None else list(installed_clients)
     managed_paths = [runtime_config, pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), state_path]
-    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    hook_targets = [_hook_target_for_client(paths, client) for client in clients]
+    hook_paths = {target for target, _agent, _label in hook_targets}
+    managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
     selected_port = _runtime_port(paths, port)
@@ -2517,11 +2569,8 @@ def update(
             paths,
             render_launch_agent(paths, port=selected_port, python_executable=selected_python, run_at_load=run_at_load),
         )
-        import vibe_memory_hooks
-        for hook_path, agent, _label in (
-            _hook_target_for_client(paths, client) for client in clients
-        ):
-            vibe_memory_hooks.repair(hook_path, agent, paths.launcher)
+        for hook_path, agent, _label in hook_targets:
+            _repair_lifecycle_hook(hook_path, agent, paths.launcher, written)
         write_install_state(
             paths,
             _install_state_document(
@@ -2532,7 +2581,11 @@ def update(
                 python_executable=selected_python,
             ),
         )
-        written = {path: _snapshot_regular_file(path) for path in managed_paths}
+        written.update({
+            path: _snapshot_regular_file(path)
+            for path in managed_paths
+            if path not in hook_paths
+        })
         service = activate_launch_agent(paths, expected_version=new_version)
         hook_smoke = smoke_managed_hooks(paths, clients)
         return {
@@ -2549,16 +2602,9 @@ def update(
             bootout_launch_agent(paths)
         except InstallError:
             pass
-        rollback_errors: list[str] = []
-        for path, snapshot in snapshots.items():
-            try:
-                _restore_regular_file(
-                    path,
-                    snapshot,
-                    expected_current=written.get(path, _NO_SNAPSHOT_CHECK),
-                )
-            except InstallError:
-                rollback_errors.append(str(path))
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
         if previous_version is not None:
             _activate_managed_version(paths, previous_version)
             try:
@@ -2578,6 +2624,31 @@ def update(
         if isinstance(error, InstallError):
             raise
         raise InstallError("update failed") from error
+    except BaseException as interruption:
+        try:
+            bootout_launch_agent(paths)
+        except InstallError:
+            pass
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
+        if previous_version is not None:
+            try:
+                _activate_managed_version(paths, previous_version)
+                activate_launch_agent(paths, expected_version=previous_version)
+            except Exception:
+                rollback_errors.append("service")
+        if new_release is not None:
+            try:
+                _remove_new_managed_release(
+                    new_release,
+                    preexisted=release_preexisted,
+                    expected_identity=new_release_identity,
+                )
+            except Exception:
+                rollback_errors.append(str(new_release))
+        interruption._rollback_conflicts = rollback_errors
+        raise
 
 
 def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
@@ -2592,7 +2663,9 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
         pathlib.Path(paths.launch_agent), pathlib.Path(paths.launcher), install_state_path(paths),
     ]
     clients = _installed_clients(paths)
-    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    hook_targets = [_hook_target_for_client(paths, client) for client in clients]
+    hook_paths = {target for target, _agent, _label in hook_targets}
+    managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
     _activate_managed_version(paths, previous_version)
@@ -2602,9 +2675,8 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
         install_runtime_config(paths, port=port, app_version=previous_version, python_executable=python)
         install_launcher(paths, python_executable=python)
         install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python, run_at_load=run_at_load))
-        import vibe_memory_hooks
-        for hook_path, agent, _label in (_hook_target_for_client(paths, client) for client in clients):
-            vibe_memory_hooks.repair(hook_path, agent, paths.launcher)
+        for hook_path, agent, _label in hook_targets:
+            _repair_lifecycle_hook(hook_path, agent, paths.launcher, written)
         write_install_state(paths, _install_state_document(
             current_version=previous_version,
             previous_version=current_version if isinstance(current_version, str) else None,
@@ -2612,7 +2684,11 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
             installed_clients=clients,
             python_executable=python,
         ))
-        written = {path: _snapshot_regular_file(path) for path in managed_paths}
+        written.update({
+            path: _snapshot_regular_file(path)
+            for path in managed_paths
+            if path not in hook_paths
+        })
         service = activate_launch_agent(paths, expected_version=previous_version)
         smoke_managed_hooks(paths, clients)
     except Exception as error:
@@ -2620,22 +2696,31 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
             bootout_launch_agent(paths)
         except InstallError:
             pass
-        rollback_errors: list[str] = []
-        for path, snapshot in snapshots.items():
-            try:
-                _restore_regular_file(
-                    path,
-                    snapshot,
-                    expected_current=written.get(path, _NO_SNAPSHOT_CHECK),
-                )
-            except InstallError:
-                rollback_errors.append(str(path))
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
         if rollback_errors:
             raise InstallError("rollback restore failed: " + ", ".join(rollback_errors)) from error
         if isinstance(current_version, str):
             _activate_managed_version(paths, current_version)
             activate_launch_agent(paths, expected_version=current_version)
         raise InstallError("rollback failed") from error
+    except BaseException as interruption:
+        try:
+            bootout_launch_agent(paths)
+        except InstallError:
+            pass
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
+        if isinstance(current_version, str):
+            try:
+                _activate_managed_version(paths, current_version)
+                activate_launch_agent(paths, expected_version=current_version)
+            except Exception:
+                rollback_errors.append("service")
+        interruption._rollback_conflicts = rollback_errors
+        raise
     return {
         "status": "rolled_back",
         "current_version": previous_version,
@@ -2697,8 +2782,6 @@ def _hook_target_for_client(paths: RuntimePaths, client: str) -> tuple[pathlib.P
 
 def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
     """Re-render managed LaunchAgent and hook entries for the current runtime."""
-    import vibe_memory_hooks
-
     runtime = pathlib.Path(paths.install_root) / "current"
     if not runtime.is_symlink():
         raise InstallError("current runtime is not installed")
@@ -2713,7 +2796,9 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
         pathlib.Path(paths.launcher), install_state_path(paths),
     ]
     port, python, clients, previous_version = _repair_metadata(paths, current_version)
-    managed_paths.extend(_hook_target_for_client(paths, client)[0] for client in clients)
+    hook_targets = [_hook_target_for_client(paths, client) for client in clients]
+    hook_paths = {target for target, _agent, _label in hook_targets}
+    managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
     try:
@@ -2721,8 +2806,10 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
         launcher = install_launcher(paths, python_executable=python)
         launch_agent = install_launch_agent(paths, render_launch_agent(paths, port=port, python_executable=python, run_at_load=run_at_load))
         hook_results = {}
-        for path, agent, label in (_hook_target_for_client(paths, client) for client in clients):
-            hook_results[label] = vibe_memory_hooks.repair(path, agent, paths.launcher)
+        for path, agent, label in hook_targets:
+            hook_results[label] = _repair_lifecycle_hook(
+                path, agent, paths.launcher, written
+            )
         write_install_state(paths, _install_state_document(
             current_version=current_version,
             previous_version=previous_version,
@@ -2730,7 +2817,11 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
             installed_clients=clients,
             python_executable=python,
         ))
-        written = {path: _snapshot_regular_file(path) for path in managed_paths}
+        written.update({
+            path: _snapshot_regular_file(path)
+            for path in managed_paths
+            if path not in hook_paths
+        })
         service = activate_launch_agent(paths, expected_version=current_version)
         smoke = smoke_managed_hooks(paths, clients)
     except Exception as error:
@@ -2738,16 +2829,9 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
             bootout_launch_agent(paths)
         except InstallError:
             pass
-        rollback_errors: list[str] = []
-        for path, snapshot in snapshots.items():
-            try:
-                _restore_regular_file(
-                    path,
-                    snapshot,
-                    expected_current=written.get(path, _NO_SNAPSHOT_CHECK),
-                )
-            except InstallError:
-                rollback_errors.append(str(path))
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
         if rollback_errors:
             raise InstallError(
                 "repair rollback failed: " + ", ".join(rollback_errors)
@@ -2757,6 +2841,20 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
         except InstallError as restart_error:
             raise InstallError("repair failed and previous service could not be restarted") from restart_error
         raise InstallError("repair failed") from error
+    except BaseException as interruption:
+        try:
+            bootout_launch_agent(paths)
+        except InstallError:
+            pass
+        rollback_errors = _restore_lifecycle_files(
+            snapshots, written, exact_paths=hook_paths
+        )
+        try:
+            activate_launch_agent(paths, expected_version=current_version)
+        except InstallError:
+            rollback_errors.append("service")
+        interruption._rollback_conflicts = rollback_errors
+        raise
     return {
         "status": "repaired",
         "launch_agent": launch_agent,

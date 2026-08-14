@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import concurrent.futures
+import contextlib
 import os
 import pathlib
 import plistlib
@@ -3003,6 +3004,171 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(os.readlink(current), "releases/1.1.0")
             self.assertEqual(before, {path: path.read_bytes() for path in managed})
             self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.1.0"))
+
+    def test_lifecycle_hook_rollback_uses_immediate_commit_snapshots(self) -> None:
+        operations = ("update", "rollback", "repair")
+        failure_modes = (
+            "failure",
+            "keyboard_interrupt",
+            "system_exit_conflict",
+            "system_exit_post_commit",
+            "system_exit_cleanup_failure",
+            "late_external_then_failure",
+        )
+
+        for operation in operations:
+            for failure_mode in failure_modes:
+                with self.subTest(operation=operation, failure=failure_mode), tempfile.TemporaryDirectory() as value:
+                    root = pathlib.Path(value)
+                    paths = self.make_paths(root)
+                    releases = paths.install_root / "releases"
+                    for version in ("0.9.0", "1.0.0", "1.1.0"):
+                        (releases / version).mkdir(parents=True, exist_ok=True)
+                    current = paths.install_root / "current"
+                    current.symlink_to("releases/1.0.0")
+                    clients = ["codex", "claude-code"]
+                    codex, _agent, _label = vibe_memory_install._hook_target_for_client(paths, "codex")
+                    claude, _agent, _label = vibe_memory_install._hook_target_for_client(paths, "claude-code")
+                    codex.parent.mkdir(parents=True)
+                    claude.parent.mkdir(parents=True)
+                    codex.write_text('{"before":"codex"}\n', encoding="utf-8")
+                    claude.write_text('{"before":"claude"}\n', encoding="utf-8")
+                    original = codex.read_bytes()
+                    external = b'{"third_party":true}\n'
+                    interruption: BaseException
+                    if failure_mode == "keyboard_interrupt":
+                        interruption = KeyboardInterrupt()
+                    elif failure_mode.startswith("system_exit"):
+                        interruption = SystemExit(47)
+                    else:
+                        interruption = RuntimeError("later hook failed")
+                    commit_snapshot_flags: list[object] = []
+
+                    def repair_hook(target: pathlib.Path, *_args: object, **kwargs: object) -> dict[str, object]:
+                        commit_snapshot_flags.append(kwargs.get("_include_commit_snapshot"))
+                        if pathlib.Path(target) == claude:
+                            if failure_mode == "late_external_then_failure":
+                                claude.write_text('{"managed":true}\n', encoding="utf-8")
+                                committed = vibe_memory_install._snapshot_regular_file(claude)
+                                return {
+                                    "status": "updated",
+                                    "changed": True,
+                                    "_commit_snapshot": committed,
+                                }
+                            if failure_mode == "system_exit_post_commit":
+                                claude.write_text('{"managed":true}\n', encoding="utf-8")
+                                interruption._commit_snapshot = (
+                                    vibe_memory_install._snapshot_regular_file(claude)
+                                )
+                            elif failure_mode not in {
+                                "keyboard_interrupt",
+                                "system_exit_cleanup_failure",
+                            }:
+                                codex.write_bytes(external)
+                            raise interruption
+                        codex.write_text('{"managed":true}\n', encoding="utf-8")
+                        committed = vibe_memory_install._snapshot_regular_file(codex)
+                        return {
+                            "status": "updated",
+                            "changed": True,
+                            "_commit_snapshot": committed,
+                        }
+
+                    state = {
+                        "current_version": "1.0.0",
+                        "previous_version": "0.9.0",
+                        "port": 9123,
+                        "python_executable": sys.executable,
+                        "installed_clients": clients,
+                    }
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(mock.patch("vibe_memory_install._current_version", return_value="1.0.0"))
+                        stack.enter_context(mock.patch("vibe_memory_install._installed_clients", return_value=clients))
+                        stack.enter_context(mock.patch("vibe_memory_install.read_install_state", return_value=state))
+                        stack.enter_context(mock.patch("vibe_memory_install._repair_metadata", return_value=(9123, sys.executable, clients, "0.9.0")))
+                        stack.enter_context(mock.patch("vibe_memory_install._managed_release_version", return_value="1.0.0"))
+                        stack.enter_context(mock.patch("vibe_memory_install.validate_runtime_source", return_value={"version": "1.1.0"}))
+                        stack.enter_context(mock.patch("vibe_memory_install.install_runtime", return_value={"version": "1.1.0"}))
+                        stack.enter_context(mock.patch("vibe_memory_install.install_runtime_config"))
+                        stack.enter_context(mock.patch("vibe_memory_install.install_launcher", return_value={"status": "current"}))
+                        stack.enter_context(mock.patch("vibe_memory_install.install_launch_agent", return_value={"status": "current"}))
+                        stack.enter_context(mock.patch("vibe_memory_install._validate_control_plane", return_value={"control": "ok"}))
+                        stack.enter_context(mock.patch("vibe_memory_install._activate_managed_version"))
+                        stack.enter_context(mock.patch(
+                            "vibe_memory_install.write_install_state",
+                            side_effect=(
+                                lambda *_args, **_kwargs: codex.write_bytes(external)
+                                if failure_mode == "late_external_then_failure"
+                                else None
+                            ),
+                        ))
+                        stack.enter_context(mock.patch(
+                            "vibe_memory_install.activate_launch_agent",
+                            return_value={"status": "healthy"},
+                            side_effect=(
+                                [
+                                    vibe_memory_install.InstallError("health failed"),
+                                    {"status": "healthy"},
+                                ]
+                                if failure_mode == "late_external_then_failure"
+                                else (
+                                    vibe_memory_install.InstallError("restart failed")
+                                    if failure_mode == "system_exit_cleanup_failure"
+                                    else None
+                                )
+                            ),
+                        ))
+                        stack.enter_context(mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "absent"}))
+                        stack.enter_context(mock.patch("vibe_memory_install._remove_new_managed_release"))
+                        stack.enter_context(mock.patch("vibe_memory_hooks.repair", side_effect=repair_hook))
+
+                        if operation == "update":
+                            invoke = lambda: vibe_memory_install.update(root / "source", paths, validation={"control": "ok"})
+                        elif operation == "rollback":
+                            invoke = lambda: vibe_memory_install.rollback(paths)
+                        else:
+                            invoke = lambda: vibe_memory_install.repair(paths)
+
+                        if failure_mode in {"failure", "late_external_then_failure"}:
+                            with self.assertRaisesRegex(
+                                vibe_memory_install.InstallError,
+                                "rollback|restore",
+                            ):
+                                invoke()
+                        else:
+                            with self.assertRaises(type(interruption)) as raised:
+                                invoke()
+                            self.assertIs(raised.exception, interruption)
+                            if isinstance(interruption, SystemExit):
+                                self.assertEqual(interruption.code, 47)
+
+                    self.assertEqual(commit_snapshot_flags, [True, True])
+                    if failure_mode in {
+                        "keyboard_interrupt",
+                        "system_exit_post_commit",
+                        "system_exit_cleanup_failure",
+                    }:
+                        self.assertEqual(codex.read_bytes(), original)
+                        self.assertEqual(
+                            claude.read_text(encoding="utf-8"),
+                            '{"before":"claude"}\n',
+                        )
+                        expected_conflicts = (
+                            ["service"]
+                            if failure_mode == "system_exit_cleanup_failure"
+                            else []
+                        )
+                        self.assertEqual(
+                            getattr(interruption, "_rollback_conflicts", []),
+                            expected_conflicts,
+                        )
+                    else:
+                        self.assertEqual(codex.read_bytes(), external)
+                        if failure_mode == "system_exit_conflict":
+                            self.assertIn(
+                                str(codex),
+                                getattr(interruption, "_rollback_conflicts", []),
+                            )
 
 
 if __name__ == "__main__":
