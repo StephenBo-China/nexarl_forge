@@ -3145,6 +3145,220 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 getattr(interruption, "_cleanup_failures", [""])[0],
             )
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin atomic exchange only")
+    def test_rollback_current_cas_preserves_latest_writer_across_exchange_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            releases = paths.install_root / "releases"
+            for version in ("0.9.0", "1.0.0", "2.0.0", "3.0.0"):
+                (releases / version).mkdir(parents=True)
+            current = paths.install_root / "current"
+            current.symlink_to("releases/1.0.0")
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0",
+                    previous_version="0.9.0",
+                    port=9123,
+                    installed_clients=[],
+                    python_executable=sys.executable,
+                ),
+            )
+            state_path = vibe_memory_install.install_state_path(paths)
+            original_state = state_path.read_bytes()
+            real_snapshot = vibe_memory_install._managed_current_snapshot_at
+            real_renameat = vibe_memory_install._darwin_renameat
+            snapshot_calls = 0
+            swap_calls = 0
+            first_writer_injected = False
+
+            def install_external(version: str) -> None:
+                replacement = paths.install_root / f".external-{version}"
+                replacement.symlink_to(f"releases/{version}")
+                os.replace(replacement, current)
+
+            def race_after_compare(install_fd: int):
+                nonlocal snapshot_calls, first_writer_injected
+                result = real_snapshot(install_fd)
+                snapshot_calls += 1
+                if snapshot_calls == 2 and not first_writer_injected:
+                    install_external("2.0.0")
+                    first_writer_injected = True
+                return result
+
+            def race_atomic_exchange(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+                flags: int,
+            ) -> None:
+                nonlocal first_writer_injected, swap_calls
+                if flags == vibe_memory_install.RENAME_SWAP:
+                    swap_calls += 1
+                    if swap_calls == 1 and not first_writer_injected:
+                        install_external("2.0.0")
+                        first_writer_injected = True
+                    elif swap_calls == 2:
+                        install_external("3.0.0")
+                real_renameat(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                    flags,
+                )
+
+            with mock.patch(
+                "vibe_memory_install._managed_current_snapshot_at",
+                side_effect=race_after_compare,
+            ), mock.patch(
+                "vibe_memory_install._darwin_renameat",
+                side_effect=race_atomic_exchange,
+            ), mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+                return_value={"status": "healthy"},
+            ):
+                with self.assertRaisesRegex(
+                    vibe_memory_install.InstallError,
+                    "changed concurrently",
+                ):
+                    vibe_memory_install.rollback(paths)
+
+            self.assertTrue(first_writer_injected)
+            self.assertEqual(os.readlink(current), "releases/3.0.0")
+            self.assertEqual(state_path.read_bytes(), original_state)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin exclusive rename only")
+    def test_rollback_absent_current_cleanup_does_not_unlink_concurrent_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            releases = paths.install_root / "releases"
+            for version in ("0.9.0", "1.0.0", "2.0.0"):
+                (releases / version).mkdir(parents=True)
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0",
+                    previous_version="0.9.0",
+                    port=9123,
+                    installed_clients=[],
+                    python_executable=sys.executable,
+                ),
+            )
+            current = paths.install_root / "current"
+            state_path = vibe_memory_install.install_state_path(paths)
+            original_state = state_path.read_bytes()
+            real_snapshot = vibe_memory_install._managed_current_snapshot_at
+            real_renameat = vibe_memory_install._darwin_renameat
+            snapshot_calls = 0
+            injected = False
+
+            def install_external() -> None:
+                replacement = paths.install_root / ".external-current"
+                replacement.symlink_to("releases/2.0.0")
+                os.replace(replacement, current)
+
+            def race_after_cleanup_compare(install_fd: int):
+                nonlocal snapshot_calls, injected
+                result = real_snapshot(install_fd)
+                snapshot_calls += 1
+                if snapshot_calls == 5 and not injected:
+                    install_external()
+                    injected = True
+                return result
+
+            def race_atomic_remove(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+                flags: int,
+            ) -> None:
+                nonlocal injected
+                if source_name == "current" and not injected:
+                    install_external()
+                    injected = True
+                real_renameat(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                    flags,
+                )
+
+            with mock.patch(
+                "vibe_memory_install._managed_current_snapshot_at",
+                side_effect=race_after_cleanup_compare,
+            ), mock.patch(
+                "vibe_memory_install._darwin_renameat",
+                side_effect=race_atomic_remove,
+            ), mock.patch(
+                "vibe_memory_install.install_runtime_config",
+                side_effect=RuntimeError("later failure"),
+            ), mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+                return_value={"status": "healthy"},
+            ):
+                with self.assertRaisesRegex(
+                    vibe_memory_install.InstallError,
+                    "later failure",
+                ):
+                    vibe_memory_install.rollback(paths)
+
+            self.assertTrue(injected)
+            self.assertEqual(os.readlink(current), "releases/2.0.0")
+            self.assertEqual(state_path.read_bytes(), original_state)
+
+    def test_rollback_restores_current_when_displaced_entry_cleanup_is_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            releases = paths.install_root / "releases"
+            for version in ("0.9.0", "1.0.0"):
+                (releases / version).mkdir(parents=True)
+            current = paths.install_root / "current"
+            current.symlink_to("releases/1.0.0")
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0",
+                    previous_version="0.9.0",
+                    port=9123,
+                    installed_clients=[],
+                    python_executable=sys.executable,
+                ),
+            )
+            interruption = KeyboardInterrupt()
+            real_remove = vibe_memory_install._remove_current_entry_exact_at
+            remove_calls = 0
+
+            def interrupt_first_remove(*args: object, **kwargs: object) -> None:
+                nonlocal remove_calls
+                remove_calls += 1
+                real_remove(*args, **kwargs)
+                if remove_calls == 1:
+                    raise interruption
+
+            with mock.patch(
+                "vibe_memory_install._remove_current_entry_exact_at",
+                side_effect=interrupt_first_remove,
+            ), mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+                return_value={"status": "healthy"},
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    vibe_memory_install.rollback(paths)
+
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(os.readlink(current), "releases/1.0.0")
+            self.assertEqual(getattr(interruption, "_rollback_conflicts", []), [])
+
     def test_lifecycle_hook_rollback_uses_immediate_commit_snapshots(self) -> None:
         operations = ("update", "rollback", "repair")
         failure_modes = (

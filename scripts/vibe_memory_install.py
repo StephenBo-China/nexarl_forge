@@ -42,6 +42,7 @@ _NO_SNAPSHOT_CHECK = object()
 HOOK_SMOKE_OUTPUT_LIMIT = 16 * 1024
 RENAME_EXCL = 0x00000004
 RENAME_SWAP = 0x00000002
+CURRENT_RECOVERY_SWAP_LIMIT = 8
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _TRUSTED_SYSTEM_ALIASES = {
     pathlib.Path("/etc"): pathlib.Path("/private/etc"),
@@ -2263,20 +2264,113 @@ def write_install_state(paths: RuntimePaths, value: dict[str, Any]) -> None:
 
 
 ManagedCurrentSnapshot = tuple[tuple[int, int], str]
+CurrentEntrySnapshot = tuple[tuple[int, int, int], str | None]
+
+
+def _current_entry_snapshot_at(
+    install_fd: int,
+    name: str,
+) -> CurrentEntrySnapshot | None:
+    try:
+        metadata = os.stat(name, dir_fd=install_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    link = os.readlink(name, dir_fd=install_fd) if stat.S_ISLNK(metadata.st_mode) else None
+    return _temporary_identity(metadata), link
 
 
 def _managed_current_snapshot_at(install_fd: int) -> ManagedCurrentSnapshot | None:
-    try:
-        metadata = os.stat("current", dir_fd=install_fd, follow_symlinks=False)
-    except FileNotFoundError:
+    entry = _current_entry_snapshot_at(install_fd, "current")
+    if entry is None:
         return None
-    if not stat.S_ISLNK(metadata.st_mode):
+    identity, link = entry
+    if not stat.S_ISLNK(identity[2]) or link is None:
         raise InstallError("current runtime must be a managed symlink")
-    link = os.readlink("current", dir_fd=install_fd)
     prefix = "releases/"
     if not link.startswith(prefix) or pathlib.PurePosixPath(link).name != link[len(prefix):]:
         raise InstallError("current runtime symlink is not managed")
-    return _identity(metadata), link
+    return identity[:2], link
+
+
+def _entry_matches_managed_current(
+    entry: CurrentEntrySnapshot | None,
+    expected: ManagedCurrentSnapshot,
+) -> bool:
+    return (
+        entry is not None
+        and entry[0][:2] == expected[0]
+        and stat.S_ISLNK(entry[0][2])
+        and entry[1] == expected[1]
+    )
+
+
+def _quarantine_current_entry_at(install_fd: int, name: str) -> str:
+    while True:
+        quarantine_name = f".current.conflict-{uuid.uuid4().hex}"
+        try:
+            _darwin_renameat(
+                install_fd,
+                name,
+                install_fd,
+                quarantine_name,
+                RENAME_EXCL,
+            )
+            return quarantine_name
+        except FileExistsError:
+            continue
+
+
+def _remove_current_entry_exact_at(
+    install_fd: int,
+    name: str,
+    expected: CurrentEntrySnapshot,
+) -> None:
+    quarantine_name = _quarantine_current_entry_at(install_fd, name)
+    claimed = _current_entry_snapshot_at(install_fd, quarantine_name)
+    if claimed != expected:
+        try:
+            _darwin_renameat(
+                install_fd,
+                quarantine_name,
+                install_fd,
+                name,
+                RENAME_EXCL,
+            )
+        except OSError:
+            pass
+        raise InstallError("current runtime changed concurrently during rollback")
+    os.unlink(quarantine_name, dir_fd=install_fd)
+
+
+def _recover_current_exchange_mismatch(
+    install_fd: int,
+    temporary_name: str,
+    manager_entry: CurrentEntrySnapshot,
+) -> NoReturn:
+    seen: set[CurrentEntrySnapshot] = set()
+    for _ in range(CURRENT_RECOVERY_SWAP_LIMIT):
+        observed = _current_entry_snapshot_at(install_fd, temporary_name)
+        if observed is None:
+            raise InstallError("current runtime changed concurrently during rollback")
+        if observed == manager_entry:
+            _remove_current_entry_exact_at(install_fd, temporary_name, manager_entry)
+            raise InstallError("current runtime changed concurrently during rollback")
+        if observed in seen:
+            _quarantine_current_entry_at(install_fd, temporary_name)
+            raise InstallError("current runtime changed concurrently during rollback")
+        seen.add(observed)
+        _darwin_renameat(
+            install_fd,
+            temporary_name,
+            install_fd,
+            "current",
+            RENAME_SWAP,
+        )
+    _quarantine_current_entry_at(install_fd, temporary_name)
+    raise InstallError(
+        "current runtime changed concurrently during rollback; "
+        "continuous concurrent writes prevented recovery convergence"
+    )
 
 
 def _snapshot_managed_current(paths: RuntimePaths) -> ManagedCurrentSnapshot | None:
@@ -2312,21 +2406,65 @@ def _activate_managed_version(
     _validate_install_ancestor_chain(install_root)
     install_fd = _open_or_create_directory_chain(_canonical_install_path(install_root))
     temporary_name = f".current.tmp-{uuid.uuid4().hex}"
+    manager_entry: CurrentEntrySnapshot | None = None
+    displaced_to_remove: CurrentEntrySnapshot | None = None
     try:
         os.symlink(f"releases/{version}", temporary_name, dir_fd=install_fd)
-        current = _managed_current_snapshot_at(install_fd)
-        if expected_current is not _NO_SNAPSHOT_CHECK and current != expected_current:
-            raise InstallError("current runtime changed concurrently during rollback")
-        os.replace(
-            temporary_name,
-            "current",
-            src_dir_fd=install_fd,
-            dst_dir_fd=install_fd,
-        )
+        manager_entry = _current_entry_snapshot_at(install_fd, temporary_name)
+        if manager_entry is None:
+            raise InstallError("current runtime temporary disappeared before activation")
+        if expected_current is _NO_SNAPSHOT_CHECK:
+            os.replace(
+                temporary_name,
+                "current",
+                src_dir_fd=install_fd,
+                dst_dir_fd=install_fd,
+            )
+        elif expected_current is None:
+            try:
+                _darwin_renameat(
+                    install_fd,
+                    temporary_name,
+                    install_fd,
+                    "current",
+                    RENAME_EXCL,
+                )
+            except FileExistsError as error:
+                raise InstallError(
+                    "current runtime changed concurrently during rollback"
+                ) from error
+        else:
+            _darwin_renameat(
+                install_fd,
+                temporary_name,
+                install_fd,
+                "current",
+                RENAME_SWAP,
+            )
+            displaced = _current_entry_snapshot_at(install_fd, temporary_name)
+            active = _current_entry_snapshot_at(install_fd, "current")
+            if (
+                not _entry_matches_managed_current(displaced, expected_current)
+                or active != manager_entry
+            ):
+                _recover_current_exchange_mismatch(
+                    install_fd,
+                    temporary_name,
+                    manager_entry,
+                )
+            if displaced is None:
+                raise InstallError("current runtime disappeared during activation")
+            displaced_to_remove = displaced
         committed = _managed_current_snapshot_at(install_fd)
         if committed is None:
             raise InstallError("current runtime disappeared after activation")
         try:
+            if displaced_to_remove is not None:
+                _remove_current_entry_exact_at(
+                    install_fd,
+                    temporary_name,
+                    displaced_to_remove,
+                )
             os.fsync(install_fd)
         except BaseException as error:
             try:
@@ -2336,10 +2474,9 @@ def _activate_managed_version(
             raise
         return committed
     finally:
-        try:
-            os.unlink(temporary_name, dir_fd=install_fd)
-        except FileNotFoundError:
-            pass
+        remaining = _current_entry_snapshot_at(install_fd, temporary_name)
+        if manager_entry is not None and remaining == manager_entry:
+            _remove_current_entry_exact_at(install_fd, temporary_name, manager_entry)
         os.close(install_fd)
 
 
@@ -2366,10 +2503,23 @@ def _restore_managed_current(
     _validate_install_ancestor_chain(install_root)
     install_fd = os.open(_canonical_install_path(install_root), _DIRECTORY_OPEN_FLAGS)
     try:
-        if _managed_current_snapshot_at(install_fd) != committed:
-            raise InstallError("current runtime changed concurrently during rollback")
-        os.unlink("current", dir_fd=install_fd)
-        os.fsync(install_fd)
+        held_name = _quarantine_current_entry_at(install_fd, "current")
+        held = _current_entry_snapshot_at(install_fd, held_name)
+        if held is not None and _entry_matches_managed_current(held, committed):
+            _remove_current_entry_exact_at(install_fd, held_name, held)
+            os.fsync(install_fd)
+            return
+        try:
+            _darwin_renameat(
+                install_fd,
+                held_name,
+                install_fd,
+                "current",
+                RENAME_EXCL,
+            )
+        except FileExistsError:
+            pass
+        raise InstallError("current runtime changed concurrently during rollback")
     finally:
         os.close(install_fd)
 
