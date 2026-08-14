@@ -6,7 +6,9 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,6 +27,118 @@ import ui_design_preferences as preferences
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_start_script_without_project_does_not_promote_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            runtime = temp / "releases" / "1.0.0"
+            runtime.mkdir(parents=True)
+            capture = temp / "project-root.txt"
+            fake_bin = temp / "bin"
+            fake_bin.mkdir()
+            python = fake_bin / "python3"
+            python.write_text(
+                "#!/bin/sh\nprintf '%s' \"${MEMORY_REVIEW_PROJECT_ROOT-}\" > \"$CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CAPTURE": str(capture),
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                }
+            )
+            environment.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
+
+            completed = subprocess.run(
+                [str(ROOT / "scripts" / "start_memory_review.sh")],
+                cwd=runtime,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(capture.read_text(encoding="utf-8"), "")
+
+    def test_empty_registry_builds_personal_only_queue_without_touching_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            runtime = temp / "releases" / "1.0.0"
+            shutil.copytree(
+                ROOT / "scripts",
+                runtime / "scripts",
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            (runtime / "release.json").write_text(
+                (ROOT / "release.json").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            home = temp / "home"
+            personal = home / ".codex" / "personal_memory"
+            personal.mkdir(parents=True)
+            (personal / "proposals.md").write_text(
+                "# Proposals\n\n"
+                "### M-personal\n\n"
+                "memory_id: M-personal\nstatus: pending\ntarget: long\n"
+                "created: 2026-08-14T00:00:00+08:00\n"
+                "source_event: agent_summary\ncategory: work_style\n\n"
+                "candidate:\n\n```text\n"
+                "**标题：跨项目评审习惯**\n\n**分类：工作方式**\n\n"
+                "用户希望跨项目候选始终经过明确审核。\n```\n",
+                encoding="utf-8",
+            )
+            registry = temp / "projects.json"
+            registry.write_text(
+                json.dumps({"current_project": "", "projects": []}),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "MEMORY_REVIEW_PROJECT_REGISTRY": str(registry),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                    "PYTHONPATH": str(runtime / "scripts"),
+                }
+            )
+            environment.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import json, memory_project, memory_review_queue as review, "
+                    "memory_review_server as server; "
+                    "queue = review.build_queue(); "
+                    "project_payload = server.project_payload(); "
+                    "print(json.dumps({"
+                    "'current': str(memory_project.current_project() or ''), "
+                    "'project_root': str(review.PROJECT_ROOT or ''), "
+                    "'payload_current': project_payload['current_project'], "
+                    "'payload_project': project_payload['project'], "
+                    "'scopes': [item['scope'] for item in queue['items']]"
+                    "}))",
+                ],
+                cwd=runtime,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["current"], "")
+            self.assertEqual(result["project_root"], "")
+            self.assertEqual(result["payload_current"], "")
+            self.assertIsNone(result["payload_project"])
+            self.assertEqual(result["scopes"], ["personal"])
+            self.assertFalse((runtime / "codex").exists())
+            self.assertTrue((personal / "memory_review_queue.json").is_file())
+            self.assertTrue((personal / "memory_review_state.json").is_file())
+
     def test_init_project_creates_memory_and_instructions_without_project_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value) / "project"

@@ -479,14 +479,12 @@ def list_projects() -> dict[str, Any]:
     return {**data, "projects": refreshed}
 
 
-def current_project(default: pathlib.Path | None = None) -> pathlib.Path:
+def current_project() -> pathlib.Path | None:
     data = registry()
     current = data.get("current_project") or ""
     if current:
         return normalize_project_root(current)
-    if default is not None:
-        return default.resolve()
-    return APP_ROOT
+    return None
 
 
 def ensure_file(path: pathlib.Path, content: str, changes: list[dict[str, str]]) -> None:
@@ -1575,7 +1573,7 @@ def main() -> int:
         print(json.dumps(list_projects(), ensure_ascii=False, indent=2))
         return 0
     if args.command == "current":
-        print(current_project())
+        print(current_project() or "")
         return 0
     if args.command == "recommend-port":
         print(recommend_port())

@@ -549,14 +549,16 @@ def switch_project(project_root: str) -> dict:
 
 def project_payload() -> dict:
     data = memory_project.list_projects()
-    current = str(review.PROJECT_ROOT)
+    current = str(review.PROJECT_ROOT or "")
     if current and all(item.get("root") != current for item in data.get("projects", [])):
         data = memory_project.register_project(current, make_current=True)
     return {
-        "current_project": str(review.PROJECT_ROOT),
+        "current_project": current,
         "registry": data,
         "recommend_port": memory_project.recommend_port(),
-        "project": memory_project.project_entry(review.PROJECT_ROOT),
+        "project": memory_project.project_entry(review.PROJECT_ROOT)
+        if review.PROJECT_ROOT
+        else None,
     }
 
 

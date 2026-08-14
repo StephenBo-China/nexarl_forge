@@ -32,11 +32,15 @@ from loop_superpowers import atomic_write_text
 from ui_design_store import atomic_write_json, exclusive_lock
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROJECT_ROOT = pathlib.Path(
-    os.environ.get("MEMORY_REVIEW_PROJECT_ROOT", str(memory_project.current_project(APP_ROOT)))
-).expanduser().resolve()
-ROOT = PROJECT_ROOT
-CODEX_DIR = PROJECT_ROOT / "codex"
+PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
+_PROJECT_ROOT_VALUE = os.environ.get("MEMORY_REVIEW_PROJECT_ROOT")
+PROJECT_ROOT = (
+    pathlib.Path(_PROJECT_ROOT_VALUE).expanduser().resolve()
+    if _PROJECT_ROOT_VALUE
+    else memory_project.current_project()
+)
+ROOT = PROJECT_ROOT or APP_ROOT
+CODEX_DIR = PROJECT_ROOT / "codex" if PROJECT_ROOT else PERSONAL_DIR
 PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"
 PROJECT_LONG = CODEX_DIR / "codex_long_memory.md"
 PROJECT_QUEUE = CODEX_DIR / "memory_review_queue.json"
@@ -75,7 +79,6 @@ RESERVED_CANDIDATE_METADATA_LINE = re.compile(
 )
 CANDIDATE_HEADING_LINE = re.compile(r"^\s*###(?:\s|$)", flags=re.MULTILINE)
 
-PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
 PERSONAL_PROPOSALS = PERSONAL_DIR / "proposals.md"
 PERSONAL_LONG = PERSONAL_DIR / "long.md"
 PERSONAL_SHORT = PERSONAL_DIR / "short.md"
@@ -691,7 +694,8 @@ def build_queue() -> dict[str, Any]:
     queue_lock_path = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
     with queue_lock(path=queue_lock_path):
         queue = _build_queue_from_items(
-            parse_project_candidates() + parse_personal_candidates(),
+            (parse_project_candidates() if PROJECT_ROOT else [])
+            + parse_personal_candidates(),
             state_map(),
         )
         write_json(PROJECT_QUEUE, queue)
@@ -715,6 +719,8 @@ def create_agent_candidate(
     summary = summary.strip()
     if scope not in {"personal", "project"}:
         raise ValueError("scope must be personal or project")
+    if scope == "project" and PROJECT_ROOT is None:
+        raise ValueError("project candidates require a registered current project")
     if target not in {"long", "short"}:
         raise ValueError("target must be long or short")
     if scope == "project" and target != "long":
@@ -910,6 +916,8 @@ def official_contains_content_digest(
 
 def decision_target_path(target: str) -> pathlib.Path:
     if target == "project_long":
+        if PROJECT_ROOT is None:
+            raise ValueError("project approval requires a registered current project")
         return PROJECT_LONG
     if target == "personal_long":
         return PERSONAL_LONG
@@ -1071,11 +1079,14 @@ def start_review_service_if_needed() -> bool:
     log_path = CODEX_DIR / "memory_review_server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    env["MEMORY_REVIEW_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    if PROJECT_ROOT is not None:
+        env["MEMORY_REVIEW_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    else:
+        env.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
     with log_path.open("ab") as log_handle:
         subprocess.Popen(
             [sys.executable, str(server_script)],
-            cwd=str(PROJECT_ROOT),
+            cwd=str(PROJECT_ROOT or APP_ROOT),
             stdout=log_handle,
             stderr=log_handle,
             stdin=subprocess.DEVNULL,
@@ -1120,7 +1131,7 @@ def review_summary(queue: dict[str, Any]) -> str:
         f"pending={counts.get('pending', 0)}, "
         f"project={counts.get('project_pending', 0)}, "
         f"personal={counts.get('personal_pending', 0)}, "
-        f"project_root={PROJECT_ROOT}, "
+        f"project_root={PROJECT_ROOT or ''}, "
         f"url={REVIEW_URL}"
     )
 
