@@ -42,6 +42,7 @@ class UIDesignServerTest(unittest.TestCase):
         self.environment.start()
         self.original_project_registry = memory_project.REGISTRY_PATH
         memory_project.REGISTRY_PATH = self.temp / "projects.json"
+        memory_project.register_project(self.project, make_current=False)
 
     def tearDown(self) -> None:
         memory_project.REGISTRY_PATH = self.original_project_registry
@@ -281,6 +282,25 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertIn("effective_preferences", context)
         self.assertEqual(imported["status"], "validated")
         self.assertEqual(listed["items"][0]["id"], imported["id"])
+
+    def test_project_domain_get_rejects_missing_blank_and_unregistered_project(self) -> None:
+        unregistered = self.temp / "unregistered"
+        unregistered.mkdir()
+        with mock.patch.object(server.review, "PROJECT_ROOT", None), mock.patch.object(
+            server.ui_design_preferences, "load_project_overrides", return_value={}
+        ) as load_project:
+            for query in ({}, {"project": [""]}, {"project": str(unregistered)}):
+                with self.subTest(query=query), self.assertRaisesRegex(
+                    ValueError, "registered project"
+                ):
+                    server.ui_design_get("/api/ui-design/context", query)
+            status, payload = self.settings_request(
+                "GET", "/api/ui-design/context?project="
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("registered project", payload["error"])
+        load_project.assert_not_called()
 
     def test_ui_skill_import_maps_all_source_payloads(self) -> None:
         cases = (

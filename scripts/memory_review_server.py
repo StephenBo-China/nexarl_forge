@@ -256,9 +256,31 @@ def _skill_namespace(command: str, **values: object) -> argparse.Namespace:
 
 
 def _project_from(value: object) -> pathlib.Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("project is required")
-    return pathlib.Path(value).expanduser()
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, str) and value.strip():
+        project = pathlib.Path(value).expanduser()
+    elif review.PROJECT_ROOT is not None:
+        project = pathlib.Path(review.PROJECT_ROOT).expanduser()
+    else:
+        raise ValueError("a registered project is required")
+    canonical_project = memory_project.normalize_project_root(project)
+    registered = {
+        memory_project.normalize_project_root(root)
+        for item in memory_project.registry().get("projects", [])
+        if isinstance(item, dict)
+        for root in [item.get("root")]
+        if isinstance(root, str) and root
+    }
+    if canonical_project not in registered:
+        raise ValueError(f"a registered project is required: {canonical_project}")
+    return project
+
+
+def _optional_project_from(value: object) -> pathlib.Path | None:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return _project_from(value) if isinstance(value, str) and value.strip() else None
 
 
 def _design_namespace(command: str, **values: object) -> argparse.Namespace:
@@ -284,10 +306,7 @@ def _design_namespace(command: str, **values: object) -> argparse.Namespace:
 
 def ui_design_get(path: str, query: dict[str, object]) -> dict:
     if path == "/api/ui-design/context":
-        raw_project = query.get("project") or str(review.PROJECT_ROOT)
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else ""
-        project = pathlib.Path(str(raw_project)).expanduser()
+        project = _project_from(query.get("project"))
         return {
             "project": str(project),
             "global_preferences": ui_design_preferences.load_global_preferences(),
@@ -295,10 +314,7 @@ def ui_design_get(path: str, query: dict[str, object]) -> dict:
             "effective_preferences": ui_design_preferences.effective_preferences(project),
         }
     if path in {"/api/ui-design/project-config", "/api/ui-design/packages"}:
-        raw_project = query.get("project") or str(review.PROJECT_ROOT)
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else ""
-        project = _project_from(raw_project)
+        project = _project_from(query.get("project"))
         if path == "/api/ui-design/packages":
             return ui_design_cli.dispatch(
                 _design_namespace(
@@ -317,11 +333,9 @@ def ui_design_get(path: str, query: dict[str, object]) -> dict:
             "audit": ui_design_gate.audit_history(project),
         }
     if path == "/api/ui-skills":
-        raw_project = query.get("project")
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else None
+        project = _optional_project_from(query.get("project"))
         scan = ui_design_cli.dispatch(
-            _skill_namespace("scan", project=str(raw_project) if raw_project else None)
+            _skill_namespace("scan", project=str(project) if project else None)
         )
         items = []
         for draft in ui_skill_registry.list_drafts():
@@ -357,16 +371,15 @@ def ui_design_post(path: str, body: dict) -> dict:
             json.dump(value, handle, ensure_ascii=False)
             handle.flush()
             command = "set-global" if path.endswith("/global") else "set-project"
+            project = _project_from(body.get("project")) if command == "set-project" else None
             args = argparse.Namespace(
                 command="ui-design",
                 ui_design_command="preferences",
                 preference_command=command,
                 json_file=handle.name,
-                project=body.get("project"),
+                project=str(project) if project else None,
                 idempotency_key=key,
             )
-            if command == "set-project" and not body.get("project"):
-                raise ValueError("project is required")
             return ui_design_cli.dispatch(args)
 
     if path.startswith("/api/ui-design/project-config/"):
@@ -451,9 +464,10 @@ def ui_design_post(path: str, body: dict) -> dict:
         )
 
     command = path.rsplit("/", 1)[-1].replace("request-revision", "request-revision")
+    project = _optional_project_from(body.get("project"))
     values = {
         "idempotency_key": key,
-        "project": body.get("project"),
+        "project": str(project) if project else None,
         "draft_id": body.get("draft_id"),
         "name": body.get("name"),
         "digest": body.get("digest"),

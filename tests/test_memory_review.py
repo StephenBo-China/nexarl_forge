@@ -47,29 +47,53 @@ class MemoryReviewQualityTest(unittest.TestCase):
             shim = temp / "shim"
             shim.mkdir()
             (shim / "sitecustomize.py").write_text(
-                "import json, os, pathlib, subprocess, urllib.error, urllib.request\n"
+                "import atexit, http.server, json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request\n"
                 "_popen = subprocess.Popen\n"
-                "_health_calls = 0\n"
+                "_child = None\n"
+                "_evidence = {}\n"
+                "if any(str(arg).endswith('memory_review_server.py') for arg in sys.argv):\n"
+                "    class _ControlledServer:\n"
+                "        def __init__(self, *_args, **_kwargs): pass\n"
+                "        def serve_forever(self): time.sleep(60)\n"
+                "        def server_close(self): pass\n"
+                "    http.server.ThreadingHTTPServer = _ControlledServer\n"
+                "def _write_evidence():\n"
+                "    pathlib.Path(os.environ['CAPTURE']).write_text(json.dumps(_evidence), encoding='utf-8')\n"
                 "class _Response:\n"
                 "    status = 200\n"
                 "    def __enter__(self): return self\n"
                 "    def __exit__(self, *_args): return False\n"
                 "def _urlopen(*_args, **_kwargs):\n"
-                "    global _health_calls\n"
-                "    _health_calls += 1\n"
-                "    if _health_calls == 1: raise urllib.error.URLError('not running')\n"
+                "    if _child is None: raise urllib.error.URLError('not running')\n"
+                "    time.sleep(0.1)\n"
+                "    if _child.poll() is not None: raise urllib.error.URLError('child exited')\n"
+                "    _evidence['alive_at_health'] = True\n"
                 "    return _Response()\n"
                 "def _capture_popen(*args, **kwargs):\n"
-                "    child = _popen(*args, **kwargs)\n"
-                "    pathlib.Path(os.environ['CAPTURE']).write_text(json.dumps({\n"
+                "    global _child, _evidence\n"
+                "    _child = _popen(*args, **kwargs)\n"
+                "    _evidence = {\n"
                 "        'command': [str(value) for value in args[0]],\n"
                 "        'cwd': kwargs.get('cwd'),\n"
                 "        'project_root': kwargs.get('env', {}).get('MEMORY_REVIEW_PROJECT_ROOT'),\n"
-                "        'pid': child.pid,\n"
-                "    }), encoding='utf-8')\n"
-                "    return child\n"
+                "        'pid': _child.pid,\n"
+                "    }\n"
+                "    _write_evidence()\n"
+                "    return _child\n"
+                "def _cleanup():\n"
+                "    if _child is None: return\n"
+                "    try:\n"
+                "        if _child.poll() is None: _child.terminate()\n"
+                "        try: _evidence['returncode'] = _child.wait(timeout=5)\n"
+                "        except subprocess.TimeoutExpired:\n"
+                "            _child.kill()\n"
+                "            _evidence['returncode'] = _child.wait(timeout=5)\n"
+                "        _evidence['cleaned'] = True\n"
+                "    finally:\n"
+                "        _write_evidence()\n"
                 "urllib.request.urlopen = _urlopen\n"
-                "subprocess.Popen = _capture_popen\n",
+                "subprocess.Popen = _capture_popen\n"
+                "atexit.register(_cleanup)\n",
                 encoding="utf-8",
             )
             before = {
@@ -92,27 +116,38 @@ class MemoryReviewQualityTest(unittest.TestCase):
             )
             environment.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
 
-            completed = subprocess.run(
-                ["/bin/bash", str(runtime / "scripts" / "start_memory_review.sh")],
-                cwd=runtime,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            started = json.loads(capture.read_text(encoding="utf-8"))
-            self.assertIsNone(started["project_root"])
-            self.assertEqual(pathlib.Path(started["cwd"]).resolve(), runtime.resolve())
-            self.assertEqual(
-                pathlib.Path(started["command"][1]).resolve(),
-                (runtime / "scripts" / "memory_review_server.py").resolve(),
-            )
+            started: dict[str, object] = {}
             try:
-                os.kill(started["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+                completed = subprocess.run(
+                    ["/bin/bash", str(runtime / "scripts" / "start_memory_review.sh")],
+                    cwd=runtime,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                started = json.loads(capture.read_text(encoding="utf-8"))
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertIn("started=True", completed.stdout, started)
+                self.assertIsNone(started["project_root"])
+                self.assertEqual(pathlib.Path(str(started["cwd"])).resolve(), runtime.resolve())
+                self.assertEqual(
+                    pathlib.Path(str(started["command"][1])).resolve(),
+                    (runtime / "scripts" / "memory_review_server.py").resolve(),
+                )
+                self.assertIs(started["alive_at_health"], True)
+                self.assertIs(started["cleaned"], True)
+                self.assertIsNotNone(started["returncode"])
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(started["pid"]), 0)
+            finally:
+                if not started and capture.exists():
+                    started = json.loads(capture.read_text(encoding="utf-8"))
+                if started.get("pid") is not None:
+                    try:
+                        os.kill(int(started["pid"]), signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
             after = {
                 path.relative_to(runtime).as_posix(): (
                     stat.S_IMODE(path.stat(follow_symlinks=False).st_mode),
