@@ -3009,20 +3009,28 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
         operations = ("update", "rollback", "repair")
         failure_modes = (
             "failure",
+            "failure_conflict_restart_failure",
             "keyboard_interrupt",
             "system_exit_conflict",
             "system_exit_post_commit",
-            "system_exit_cleanup_failure",
+            "system_exit_restore_io_failure",
+            "keyboard_interrupt_bootout_failure",
+            "system_exit_restart_failure",
             "late_external_then_failure",
         )
 
         for operation in operations:
-            for failure_mode in failure_modes:
+            operation_failure_modes = failure_modes + (
+                ("system_exit_release_cleanup_failure",)
+                if operation == "update"
+                else ()
+            )
+            for failure_mode in operation_failure_modes:
                 with self.subTest(operation=operation, failure=failure_mode), tempfile.TemporaryDirectory() as value:
                     root = pathlib.Path(value)
                     paths = self.make_paths(root)
                     releases = paths.install_root / "releases"
-                    for version in ("0.9.0", "1.0.0", "1.1.0"):
+                    for version in ("0.9.0", "1.0.0"):
                         (releases / version).mkdir(parents=True, exist_ok=True)
                     current = paths.install_root / "current"
                     current.symlink_to("releases/1.0.0")
@@ -3036,7 +3044,7 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     original = codex.read_bytes()
                     external = b'{"third_party":true}\n'
                     interruption: BaseException
-                    if failure_mode == "keyboard_interrupt":
+                    if failure_mode.startswith("keyboard_interrupt"):
                         interruption = KeyboardInterrupt()
                     elif failure_mode.startswith("system_exit"):
                         interruption = SystemExit(47)
@@ -3060,9 +3068,17 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                                 interruption._commit_snapshot = (
                                     vibe_memory_install._snapshot_regular_file(claude)
                                 )
+                            elif failure_mode == "system_exit_restore_io_failure":
+                                codex.unlink()
+                                codex.parent.rmdir()
+                                codex.parent.write_bytes(b"blocks hook restore")
+                            elif failure_mode == "system_exit_release_cleanup_failure":
+                                shutil.rmtree(releases / "1.1.0")
+                                (releases / "1.1.0").write_bytes(b"foreign release")
                             elif failure_mode not in {
                                 "keyboard_interrupt",
-                                "system_exit_cleanup_failure",
+                                "keyboard_interrupt_bootout_failure",
+                                "system_exit_restart_failure",
                             }:
                                 codex.write_bytes(external)
                             raise interruption
@@ -3081,19 +3097,45 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                         "python_executable": sys.executable,
                         "installed_clients": clients,
                     }
+                    service_state: dict[str, str | None] = {"version": None}
+                    activation_attempts = 0
+
+                    def install_runtime(*_args: object, **_kwargs: object) -> dict[str, str]:
+                        (releases / "1.1.0").mkdir(parents=True, exist_ok=True)
+                        return {"version": "1.1.0"}
+
+                    def activate_service(
+                        _paths: vibe_memory_paths.RuntimePaths,
+                        *,
+                        expected_version: str,
+                    ) -> dict[str, str]:
+                        nonlocal activation_attempts
+                        activation_attempts += 1
+                        if failure_mode == "late_external_then_failure" and activation_attempts == 1:
+                            raise vibe_memory_install.InstallError("health failed")
+                        if failure_mode in {
+                            "failure_conflict_restart_failure",
+                            "system_exit_restart_failure",
+                        }:
+                            raise PermissionError("restart denied")
+                        service_state["version"] = expected_version
+                        return {"status": "healthy"}
+
                     with contextlib.ExitStack() as stack:
                         stack.enter_context(mock.patch("vibe_memory_install._current_version", return_value="1.0.0"))
                         stack.enter_context(mock.patch("vibe_memory_install._installed_clients", return_value=clients))
                         stack.enter_context(mock.patch("vibe_memory_install.read_install_state", return_value=state))
                         stack.enter_context(mock.patch("vibe_memory_install._repair_metadata", return_value=(9123, sys.executable, clients, "0.9.0")))
-                        stack.enter_context(mock.patch("vibe_memory_install._managed_release_version", return_value="1.0.0"))
+                        stack.enter_context(mock.patch(
+                            "vibe_memory_install._managed_release_version",
+                            side_effect=lambda path: pathlib.Path(path).name,
+                        ))
                         stack.enter_context(mock.patch("vibe_memory_install.validate_runtime_source", return_value={"version": "1.1.0"}))
-                        stack.enter_context(mock.patch("vibe_memory_install.install_runtime", return_value={"version": "1.1.0"}))
+                        stack.enter_context(mock.patch("vibe_memory_install.install_runtime", side_effect=install_runtime))
                         stack.enter_context(mock.patch("vibe_memory_install.install_runtime_config"))
                         stack.enter_context(mock.patch("vibe_memory_install.install_launcher", return_value={"status": "current"}))
                         stack.enter_context(mock.patch("vibe_memory_install.install_launch_agent", return_value={"status": "current"}))
                         stack.enter_context(mock.patch("vibe_memory_install._validate_control_plane", return_value={"control": "ok"}))
-                        stack.enter_context(mock.patch("vibe_memory_install._activate_managed_version"))
                         stack.enter_context(mock.patch(
                             "vibe_memory_install.write_install_state",
                             side_effect=(
@@ -3104,22 +3146,16 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                         ))
                         stack.enter_context(mock.patch(
                             "vibe_memory_install.activate_launch_agent",
-                            return_value={"status": "healthy"},
+                            side_effect=activate_service,
+                        ))
+                        stack.enter_context(mock.patch(
+                            "vibe_memory_install.bootout_launch_agent",
                             side_effect=(
-                                [
-                                    vibe_memory_install.InstallError("health failed"),
-                                    {"status": "healthy"},
-                                ]
-                                if failure_mode == "late_external_then_failure"
-                                else (
-                                    vibe_memory_install.InstallError("restart failed")
-                                    if failure_mode == "system_exit_cleanup_failure"
-                                    else None
-                                )
+                                PermissionError("bootout denied")
+                                if failure_mode == "keyboard_interrupt_bootout_failure"
+                                else None
                             ),
                         ))
-                        stack.enter_context(mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "absent"}))
-                        stack.enter_context(mock.patch("vibe_memory_install._remove_new_managed_release"))
                         stack.enter_context(mock.patch("vibe_memory_hooks.repair", side_effect=repair_hook))
 
                         if operation == "update":
@@ -3129,12 +3165,22 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                         else:
                             invoke = lambda: vibe_memory_install.repair(paths)
 
-                        if failure_mode in {"failure", "late_external_then_failure"}:
-                            with self.assertRaisesRegex(
-                                vibe_memory_install.InstallError,
-                                "rollback|restore",
-                            ):
+                        if failure_mode in {
+                            "failure",
+                            "failure_conflict_restart_failure",
+                            "late_external_then_failure",
+                        }:
+                            with self.assertRaises(vibe_memory_install.InstallError) as raised:
                                 invoke()
+                            self.assertIn(str(codex), str(raised.exception))
+                            expected_original = (
+                                "health failed"
+                                if failure_mode == "late_external_then_failure"
+                                else "later hook failed"
+                            )
+                            self.assertIn(expected_original, str(raised.exception))
+                            if failure_mode == "failure_conflict_restart_failure":
+                                self.assertIn("restart denied", str(raised.exception))
                         else:
                             with self.assertRaises(type(interruption)) as raised:
                                 invoke()
@@ -3143,24 +3189,57 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                                 self.assertEqual(interruption.code, 47)
 
                     self.assertEqual(commit_snapshot_flags, [True, True])
+                    self.assertEqual(os.readlink(current), "releases/1.0.0")
+                    if operation == "update":
+                        if failure_mode == "system_exit_release_cleanup_failure":
+                            self.assertEqual(
+                                (releases / "1.1.0").read_bytes(),
+                                b"foreign release",
+                            )
+                        else:
+                            self.assertFalse((releases / "1.1.0").exists())
+                    if failure_mode not in {
+                        "failure_conflict_restart_failure",
+                        "system_exit_restart_failure",
+                    }:
+                        self.assertEqual(service_state["version"], "1.0.0")
+
                     if failure_mode in {
                         "keyboard_interrupt",
                         "system_exit_post_commit",
-                        "system_exit_cleanup_failure",
+                        "keyboard_interrupt_bootout_failure",
+                        "system_exit_restart_failure",
+                        "system_exit_release_cleanup_failure",
                     }:
                         self.assertEqual(codex.read_bytes(), original)
                         self.assertEqual(
                             claude.read_text(encoding="utf-8"),
                             '{"before":"claude"}\n',
                         )
-                        expected_conflicts = (
-                            ["service"]
-                            if failure_mode == "system_exit_cleanup_failure"
-                            else []
-                        )
+                        expected_conflicts = {
+                            "keyboard_interrupt_bootout_failure": ["bootout"],
+                            "system_exit_restart_failure": ["service"],
+                            "system_exit_release_cleanup_failure": [
+                                str(releases / "1.1.0")
+                            ],
+                        }.get(failure_mode, [])
                         self.assertEqual(
                             getattr(interruption, "_rollback_conflicts", []),
                             expected_conflicts,
+                        )
+                        self.assertEqual(
+                            len(getattr(interruption, "_cleanup_failures", [])),
+                            len(expected_conflicts),
+                        )
+                    elif failure_mode == "system_exit_restore_io_failure":
+                        self.assertTrue(codex.parent.is_file())
+                        self.assertEqual(
+                            getattr(interruption, "_rollback_conflicts", []),
+                            [str(codex)],
+                        )
+                        self.assertIn(
+                            "NotADirectoryError",
+                            getattr(interruption, "_cleanup_failures", [""])[0],
                         )
                     else:
                         self.assertEqual(codex.read_bytes(), external)

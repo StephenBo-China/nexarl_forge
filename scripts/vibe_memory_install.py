@@ -15,7 +15,7 @@ from string import Template
 import sys
 import tempfile
 import time
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 import urllib.error
 import urllib.request
 import uuid
@@ -2428,13 +2428,27 @@ def _repair_lifecycle_hook(
     return result
 
 
+LifecycleCleanupFailure = tuple[str, BaseException]
+
+
+def _record_lifecycle_cleanup(
+    failures: list[LifecycleCleanupFailure],
+    label: str,
+    action: Callable[[], object],
+) -> None:
+    try:
+        action()
+    except BaseException as error:
+        failures.append((label, error))
+
+
 def _restore_lifecycle_files(
     snapshots: dict[pathlib.Path, FileSnapshot | None],
     written: dict[pathlib.Path, FileSnapshot | None],
     *,
     exact_paths: set[pathlib.Path],
-) -> list[str]:
-    rollback_errors = []
+) -> list[LifecycleCleanupFailure]:
+    rollback_errors: list[LifecycleCleanupFailure] = []
     for path, snapshot in snapshots.items():
         try:
             _restore_regular_file(
@@ -2445,9 +2459,54 @@ def _restore_lifecycle_files(
                     snapshot if path in exact_paths else _NO_SNAPSHOT_CHECK,
                 ),
             )
-        except InstallError:
-            rollback_errors.append(str(path))
+        except BaseException as error:
+            rollback_errors.append((str(path), error))
     return rollback_errors
+
+
+def _cleanup_failure_labels(failures: list[LifecycleCleanupFailure]) -> list[str]:
+    return [label for label, _error in failures]
+
+
+def _cleanup_failure_details(failures: list[LifecycleCleanupFailure]) -> list[str]:
+    details = []
+    for label, error in failures:
+        try:
+            message = str(error)
+        except BaseException:
+            message = "<unprintable cleanup error>"
+        details.append(f"{label}: {type(error).__name__}: {message}")
+    return details
+
+
+def _attach_lifecycle_cleanup_failures(
+    interruption: BaseException,
+    failures: list[LifecycleCleanupFailure],
+) -> None:
+    for name, value in (
+        ("_rollback_conflicts", _cleanup_failure_labels(failures)),
+        ("_cleanup_failures", _cleanup_failure_details(failures)),
+    ):
+        try:
+            setattr(interruption, name, value)
+        except BaseException:
+            pass
+
+
+def _raise_lifecycle_failure(
+    operation: str,
+    error: Exception,
+    failures: list[LifecycleCleanupFailure],
+) -> NoReturn:
+    if failures:
+        details = "; ".join(_cleanup_failure_details(failures))
+        raise InstallError(
+            f"{operation} failed: {type(error).__name__}: {error}; "
+            f"rollback failed during cleanup: {details}"
+        ) from error
+    raise InstallError(
+        f"{operation} failed: {type(error).__name__}: {error}"
+    ) from error
 
 
 def _managed_release_version(path: pathlib.Path) -> str | None:
@@ -2548,6 +2607,42 @@ def update(
     new_release: pathlib.Path | None = None
     new_release_identity: tuple[int, int] | None = None
     release_preexisted = True
+
+    def cleanup_update() -> list[LifecycleCleanupFailure]:
+        failures: list[LifecycleCleanupFailure] = []
+        _record_lifecycle_cleanup(
+            failures, "bootout", lambda: bootout_launch_agent(paths)
+        )
+        failures.extend(
+            _restore_lifecycle_files(
+                snapshots, written, exact_paths=hook_paths
+            )
+        )
+        if previous_version is not None:
+            _record_lifecycle_cleanup(
+                failures,
+                "version",
+                lambda: _activate_managed_version(paths, previous_version),
+            )
+            _record_lifecycle_cleanup(
+                failures,
+                "service",
+                lambda: activate_launch_agent(
+                    paths, expected_version=previous_version
+                ),
+            )
+        if new_release is not None:
+            _record_lifecycle_cleanup(
+                failures,
+                str(new_release),
+                lambda: _remove_new_managed_release(
+                    new_release,
+                    preexisted=release_preexisted,
+                    expected_identity=new_release_identity,
+                ),
+            )
+        return failures
+
     try:
         source_version = validate_runtime_source(source_root)["version"]
         new_release = pathlib.Path(paths.install_root) / "releases" / source_version
@@ -2597,57 +2692,9 @@ def update(
             "hook_smoke": hook_smoke,
         }
     except Exception as error:
-        restart_error: InstallError | None = None
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        if previous_version is not None:
-            _activate_managed_version(paths, previous_version)
-            try:
-                activate_launch_agent(paths, expected_version=previous_version)
-            except InstallError as caught_restart_error:
-                restart_error = caught_restart_error
-        if new_release is not None:
-            _remove_new_managed_release(
-                new_release,
-                preexisted=release_preexisted,
-                expected_identity=new_release_identity,
-            )
-        if restart_error is not None:
-            raise InstallError("update failed and previous service could not be restarted") from restart_error
-        if rollback_errors:
-            raise InstallError("update rollback failed: " + ", ".join(rollback_errors)) from error
-        if isinstance(error, InstallError):
-            raise
-        raise InstallError("update failed") from error
+        _raise_lifecycle_failure("update", error, cleanup_update())
     except BaseException as interruption:
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        if previous_version is not None:
-            try:
-                _activate_managed_version(paths, previous_version)
-                activate_launch_agent(paths, expected_version=previous_version)
-            except Exception:
-                rollback_errors.append("service")
-        if new_release is not None:
-            try:
-                _remove_new_managed_release(
-                    new_release,
-                    preexisted=release_preexisted,
-                    expected_identity=new_release_identity,
-                )
-            except Exception:
-                rollback_errors.append(str(new_release))
-        interruption._rollback_conflicts = rollback_errors
+        _attach_lifecycle_cleanup_failures(interruption, cleanup_update())
         raise
 
 
@@ -2668,6 +2715,32 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
     managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
+
+    def cleanup_rollback() -> list[LifecycleCleanupFailure]:
+        failures: list[LifecycleCleanupFailure] = []
+        _record_lifecycle_cleanup(
+            failures, "bootout", lambda: bootout_launch_agent(paths)
+        )
+        failures.extend(
+            _restore_lifecycle_files(
+                snapshots, written, exact_paths=hook_paths
+            )
+        )
+        if isinstance(current_version, str):
+            _record_lifecycle_cleanup(
+                failures,
+                "version",
+                lambda: _activate_managed_version(paths, current_version),
+            )
+            _record_lifecycle_cleanup(
+                failures,
+                "service",
+                lambda: activate_launch_agent(
+                    paths, expected_version=current_version
+                ),
+            )
+        return failures
+
     _activate_managed_version(paths, previous_version)
     port = int(state.get("port", 8897))
     try:
@@ -2692,34 +2765,9 @@ def rollback(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]
         service = activate_launch_agent(paths, expected_version=previous_version)
         smoke_managed_hooks(paths, clients)
     except Exception as error:
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        if rollback_errors:
-            raise InstallError("rollback restore failed: " + ", ".join(rollback_errors)) from error
-        if isinstance(current_version, str):
-            _activate_managed_version(paths, current_version)
-            activate_launch_agent(paths, expected_version=current_version)
-        raise InstallError("rollback failed") from error
+        _raise_lifecycle_failure("rollback", error, cleanup_rollback())
     except BaseException as interruption:
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        if isinstance(current_version, str):
-            try:
-                _activate_managed_version(paths, current_version)
-                activate_launch_agent(paths, expected_version=current_version)
-            except Exception:
-                rollback_errors.append("service")
-        interruption._rollback_conflicts = rollback_errors
+        _attach_lifecycle_cleanup_failures(interruption, cleanup_rollback())
         raise
     return {
         "status": "rolled_back",
@@ -2801,6 +2849,26 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
     managed_paths.extend(hook_paths)
     snapshots = {path: _snapshot_regular_file(path) for path in managed_paths}
     written: dict[pathlib.Path, FileSnapshot | None] = {}
+
+    def cleanup_repair() -> list[LifecycleCleanupFailure]:
+        failures: list[LifecycleCleanupFailure] = []
+        _record_lifecycle_cleanup(
+            failures, "bootout", lambda: bootout_launch_agent(paths)
+        )
+        failures.extend(
+            _restore_lifecycle_files(
+                snapshots, written, exact_paths=hook_paths
+            )
+        )
+        _record_lifecycle_cleanup(
+            failures,
+            "service",
+            lambda: activate_launch_agent(
+                paths, expected_version=current_version
+            ),
+        )
+        return failures
+
     try:
         install_runtime_config(paths, port=port, app_version=current_version, python_executable=python)
         launcher = install_launcher(paths, python_executable=python)
@@ -2825,35 +2893,9 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
         service = activate_launch_agent(paths, expected_version=current_version)
         smoke = smoke_managed_hooks(paths, clients)
     except Exception as error:
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        if rollback_errors:
-            raise InstallError(
-                "repair rollback failed: " + ", ".join(rollback_errors)
-            ) from error
-        try:
-            activate_launch_agent(paths, expected_version=current_version)
-        except InstallError as restart_error:
-            raise InstallError("repair failed and previous service could not be restarted") from restart_error
-        raise InstallError("repair failed") from error
+        _raise_lifecycle_failure("repair", error, cleanup_repair())
     except BaseException as interruption:
-        try:
-            bootout_launch_agent(paths)
-        except InstallError:
-            pass
-        rollback_errors = _restore_lifecycle_files(
-            snapshots, written, exact_paths=hook_paths
-        )
-        try:
-            activate_launch_agent(paths, expected_version=current_version)
-        except InstallError:
-            rollback_errors.append("service")
-        interruption._rollback_conflicts = rollback_errors
+        _attach_lifecycle_cleanup_failures(interruption, cleanup_repair())
         raise
     return {
         "status": "repaired",
