@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import pathlib
@@ -49,12 +50,105 @@ class UIDesignServerTest(unittest.TestCase):
         self.environment.stop()
         self.temporary.cleanup()
 
+    def http_request(
+        self,
+        method: str,
+        path: str,
+        host: str | None,
+        *,
+        body: bytes | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[int, bytes]:
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        worker = threading.Thread(target=httpd.serve_forever)
+        worker.start()
+        try:
+            connection = http.client.HTTPConnection(*httpd.server_address, timeout=2)
+            connection.putrequest(method, path, skip_host=True)
+            if host is not None:
+                connection.putheader("Host", host)
+            for name, value in (headers or {}).items():
+                connection.putheader(name, value)
+            if body is not None:
+                connection.putheader("Content-Length", str(len(body)))
+            connection.endheaders(body)
+            response = connection.getresponse()
+            return response.status, response.read()
+        finally:
+            connection.close()
+            httpd.shutdown()
+            worker.join(timeout=2)
+            httpd.server_close()
+
     def test_health_payload_has_stable_service_identity_and_version(self) -> None:
         payload = server.health_payload()
         self.assertEqual(payload["service"], "vibe-memory")
         self.assertEqual(payload["app_version"], "1.0.0")
         self.assertEqual(payload["data_schema_version"], 1)
         self.assertIs(payload["ok"], True)
+
+    def test_http_boundary_rejects_rebinding_hosts_before_active_memory_read(self) -> None:
+        malicious_hosts = (
+            "rebind.attacker:8897",
+            "localhost.attacker:8897",
+            "127.0.0.1@rebind.attacker:8897",
+            "rebind.attacker@127.0.0.1:8897",
+            "localhost.:8897",
+            "127.0.0.1:0",
+            "[::1]evil:8897",
+            "::1:8897",
+            None,
+        )
+        for host in malicious_hosts:
+            with self.subTest(host=host), mock.patch.object(
+                server,
+                "active_memory_payload",
+                return_value={"secret": "personal-memory"},
+            ) as active_memory:
+                status, payload = self.http_request("GET", "/api/active-memory", host)
+
+            self.assertEqual(status, 400)
+            self.assertNotIn(b"personal-memory", payload)
+            active_memory.assert_not_called()
+
+    def test_http_boundary_rejects_rebinding_host_for_every_dispatched_method(self) -> None:
+        cases = (
+            ("GET", "/health", None, None),
+            ("POST", "/api/refresh", None, None),
+            ("HEAD", "/health", None, None),
+            ("OPTIONS", "/health", None, None),
+        )
+        for method, path, body, headers in cases:
+            with self.subTest(method=method):
+                status, _payload = self.http_request(
+                    method,
+                    path,
+                    "rebind.attacker:8897",
+                    body=body,
+                    headers=headers,
+                )
+
+            self.assertEqual(status, 400)
+
+    def test_http_boundary_preserves_loopback_hosts_and_unsupported_methods(self) -> None:
+        for host in ("127.0.0.1:8897", "localhost:8897", "[::1]:8897"):
+            with self.subTest(host=host), mock.patch.object(
+                server,
+                "active_memory_payload",
+                return_value={"ok": True},
+            ) as active_memory:
+                status, payload = self.http_request("GET", "/api/active-memory", host)
+
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(payload), {"ok": True})
+            active_memory.assert_called_once_with()
+
+        for method in ("HEAD", "OPTIONS"):
+            with self.subTest(method=method):
+                status, _payload = self.http_request(
+                    method, "/health", "127.0.0.1:8897"
+                )
+            self.assertEqual(status, 501)
 
     def settings_request(
         self, method: str, path: str, body: dict[str, object] | None = None

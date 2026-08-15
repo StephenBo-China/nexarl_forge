@@ -2535,6 +2535,45 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
+    def _validate_request_metadata(self) -> tuple[str, int]:
+        if hasattr(self.headers, "get_all"):
+            host_values = self.headers.get_all("Host", [])
+        else:
+            host = self.headers.get("Host")
+            host_values = [] if host is None else [host]
+        if len(host_values) != 1:
+            raise ValueError("Host is invalid")
+        host = host_values[0]
+        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        try:
+            parsed_host = urlparse(f"//{host}")
+            host_name = parsed_host.hostname
+            parsed_port = parsed_host.port
+        except ValueError as error:
+            raise ValueError("Host is invalid") from error
+        if (
+            parsed_host.username is not None
+            or parsed_host.password is not None
+            or parsed_host.path
+            or parsed_host.query
+            or parsed_host.fragment
+        ):
+            raise ValueError("Host is invalid")
+        host_port = PORT if parsed_port is None else parsed_port
+        if host_name not in allowed_hosts or host_port != PORT:
+            raise ValueError("Host must be loopback")
+        return host_name, host_port
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        try:
+            self._validate_request_metadata()
+        except ValueError:
+            self.send_error(400, "Invalid Host header")
+            return False
+        return True
+
     def send_json(self, value: object, status: int = 200) -> None:
         payload = json_bytes(value)
         self.send_response(status)
@@ -2544,16 +2583,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def read_json(self) -> dict:
-        host = self.headers.get("Host", "")
-        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
-        try:
-            parsed_host = urlparse(f"//{host}")
-            host_name = parsed_host.hostname
-            host_port = parsed_host.port or PORT
-        except ValueError as error:
-            raise ValueError("Host is invalid") from error
-        if host_name not in allowed_hosts or host_port != PORT:
-            raise ValueError("Host must be loopback")
+        host_name, host_port = self._validate_request_metadata()
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
         if content_type != "application/json":
             raise ValueError("Content-Type must be application/json")
