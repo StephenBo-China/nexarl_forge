@@ -2474,10 +2474,37 @@ def _activate_managed_version(
             raise
         return committed
     finally:
-        remaining = _current_entry_snapshot_at(install_fd, temporary_name)
-        if manager_entry is not None and remaining == manager_entry:
-            _remove_current_entry_exact_at(install_fd, temporary_name, manager_entry)
-        os.close(install_fd)
+        primary_error = sys.exc_info()[1]
+        cleanup_failures: list[LifecycleCleanupFailure] = []
+        try:
+            try:
+                remaining = _current_entry_snapshot_at(install_fd, temporary_name)
+                if manager_entry is not None and remaining == manager_entry:
+                    _remove_current_entry_exact_at(
+                        install_fd,
+                        temporary_name,
+                        manager_entry,
+                    )
+            except BaseException as cleanup_error:
+                cleanup_failures.append(("current temporary", cleanup_error))
+        finally:
+            try:
+                os.close(install_fd)
+            except BaseException as close_error:
+                cleanup_failures.append(("current fd", close_error))
+        if cleanup_failures:
+            if primary_error is not None:
+                _attach_lifecycle_cleanup_failures(
+                    primary_error,
+                    cleanup_failures,
+                )
+            else:
+                _label, cleanup_error = cleanup_failures[0]
+                _attach_lifecycle_cleanup_failures(
+                    cleanup_error,
+                    cleanup_failures[1:],
+                )
+                raise cleanup_error
 
 
 def _restore_managed_current(

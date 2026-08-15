@@ -3359,6 +3359,86 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(os.readlink(current), "releases/1.0.0")
             self.assertEqual(getattr(interruption, "_rollback_conflicts", []), [])
 
+    def test_current_activation_preserves_primary_exception_and_closes_fd_when_finally_cleanup_fails(self) -> None:
+        cleanup_modes = ("remove", "snapshot")
+
+        for cleanup_mode in cleanup_modes:
+            with self.subTest(cleanup=cleanup_mode), tempfile.TemporaryDirectory() as value:
+                paths = self.make_paths(pathlib.Path(value))
+                releases = paths.install_root / "releases"
+                for version in ("0.9.0", "1.0.0"):
+                    (releases / version).mkdir(parents=True)
+                current = paths.install_root / "current"
+                current.symlink_to("releases/1.0.0")
+                expected = vibe_memory_install._snapshot_managed_current(paths)
+                self.assertIsNotNone(expected)
+                primary: BaseException = (
+                    KeyboardInterrupt()
+                    if cleanup_mode == "remove"
+                    else SystemExit(47)
+                )
+                cleanup = RuntimeError(f"{cleanup_mode} cleanup failed")
+                real_open_chain = vibe_memory_install._open_or_create_directory_chain
+                real_entry_snapshot = vibe_memory_install._current_entry_snapshot_at
+                captured_fd: int | None = None
+                snapshot_calls = 0
+
+                def capture_fd(path: pathlib.Path) -> int:
+                    nonlocal captured_fd
+                    captured_fd = real_open_chain(path)
+                    return captured_fd
+
+                def fail_finally_snapshot(install_fd: int, name: str):
+                    nonlocal snapshot_calls
+                    snapshot_calls += 1
+                    if cleanup_mode == "snapshot" and snapshot_calls == 2:
+                        raise cleanup
+                    return real_entry_snapshot(install_fd, name)
+
+                remove_effect: object = (
+                    cleanup
+                    if cleanup_mode == "remove"
+                    else mock.DEFAULT
+                )
+                caught: BaseException | None = None
+                with mock.patch(
+                    "vibe_memory_install._open_or_create_directory_chain",
+                    side_effect=capture_fd,
+                ), mock.patch(
+                    "vibe_memory_install._darwin_renameat",
+                    side_effect=primary,
+                ), mock.patch(
+                    "vibe_memory_install._current_entry_snapshot_at",
+                    side_effect=fail_finally_snapshot,
+                ), mock.patch(
+                    "vibe_memory_install._remove_current_entry_exact_at",
+                    side_effect=remove_effect,
+                    wraps=vibe_memory_install._remove_current_entry_exact_at,
+                ):
+                    try:
+                        vibe_memory_install._activate_managed_version(
+                            paths,
+                            "0.9.0",
+                            expected_current=expected,
+                        )
+                    except BaseException as error:
+                        caught = error
+                    else:
+                        self.fail("activation unexpectedly succeeded")
+
+                self.assertIs(caught, primary)
+                self.assertEqual(
+                    getattr(primary, "_rollback_conflicts", []),
+                    ["current temporary"],
+                )
+                self.assertIn(
+                    str(cleanup),
+                    getattr(primary, "_cleanup_failures", [""])[0],
+                )
+                self.assertIsNotNone(captured_fd)
+                with self.assertRaises(OSError):
+                    os.fstat(captured_fd)
+
     def test_lifecycle_hook_rollback_uses_immediate_commit_snapshots(self) -> None:
         operations = ("update", "rollback", "repair")
         failure_modes = (
