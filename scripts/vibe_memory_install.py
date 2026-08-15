@@ -3225,6 +3225,131 @@ def _validate_explicit_data_paths(
     return validated
 
 
+def _uninstall_lifecycle_hook(
+    path: pathlib.Path,
+    launcher: pathlib.Path,
+    written: dict[pathlib.Path, FileSnapshot | None],
+) -> dict[str, Any]:
+    import vibe_memory_hooks
+
+    try:
+        result = vibe_memory_hooks.uninstall(
+            path,
+            launcher,
+            _include_commit_snapshot=True,
+        )
+    except BaseException as error:
+        committed = getattr(error, "_commit_snapshot", None)
+        if committed is not None:
+            written[path] = committed
+        raise
+    if result.get("changed") is True:
+        committed = result.pop("_commit_snapshot", None)
+        if committed is None:
+            raise InstallError("hook uninstall did not return a commit snapshot")
+        written[path] = committed
+    return result
+
+
+ReleaseSnapshot = tuple[tuple[int, int], dict[str, tuple[str, bytes | None]]]
+
+
+def _snapshot_owned_release(path: pathlib.Path) -> ReleaseSnapshot:
+    before = path.stat(follow_symlinks=False)
+    entries = _snapshot_source_release(path)
+    after = path.stat(follow_symlinks=False)
+    if _identity(before) != _identity(after):
+        raise InstallError(f"managed release changed while snapshotting: {path}")
+    return _identity(after), entries
+
+
+def _materialize_release_snapshot(
+    path: pathlib.Path,
+    entries: dict[str, tuple[str, bytes | None]],
+) -> None:
+    path.mkdir(mode=0o700)
+    try:
+        for relative, (entry_type, content) in sorted(
+            entries.items(), key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0])
+        ):
+            destination = path / relative
+            if entry_type == "directory":
+                destination.mkdir(mode=0o700)
+            elif entry_type == "file" and content is not None:
+                destination.write_bytes(content)
+                destination.chmod(0o600)
+            else:
+                raise InstallError(f"invalid release snapshot entry: {relative}")
+        path.chmod(0o700)
+    except BaseException:
+        shutil.rmtree(path, ignore_errors=True)
+        raise
+
+
+def _quarantine_owned_release(
+    path: pathlib.Path,
+    snapshot: ReleaseSnapshot,
+) -> pathlib.Path:
+    identity, entries = snapshot
+    quarantine = path.with_name(f".{path.name}.uninstall-{uuid.uuid4().hex}")
+    _darwin_rename(path, quarantine, RENAME_EXCL)
+    try:
+        metadata = quarantine.stat(follow_symlinks=False)
+        if _identity(metadata) != identity or _snapshot_source_release(quarantine) != entries:
+            raise InstallError(f"managed release changed during uninstall: {path}")
+    except BaseException:
+        try:
+            _darwin_rename(quarantine, path, RENAME_EXCL)
+        except BaseException:
+            pass
+        raise
+    return quarantine
+
+
+def _restore_quarantined_release(
+    path: pathlib.Path,
+    quarantine: pathlib.Path,
+    snapshot: ReleaseSnapshot,
+) -> None:
+    identity, entries = snapshot
+    if os.path.lexists(path):
+        raise InstallError(f"managed release changed concurrently during rollback: {path}")
+    try:
+        metadata = quarantine.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        _materialize_release_snapshot(path, entries)
+        return
+    if _identity(metadata) != identity:
+        raise InstallError(f"managed release changed concurrently during rollback: {path}")
+    try:
+        current_entries = _snapshot_source_release(quarantine)
+    except BaseException:
+        current_entries = None
+    if current_entries == entries:
+        _darwin_rename(quarantine, path, RENAME_EXCL)
+        return
+    _materialize_release_snapshot(path, entries)
+    shutil.rmtree(quarantine)
+
+
+def _remove_managed_current_exact(
+    paths: RuntimePaths,
+    expected: ManagedCurrentSnapshot,
+) -> None:
+    install_root = pathlib.Path(paths.install_root)
+    _validate_install_ancestor_chain(install_root)
+    install_fd = os.open(_canonical_install_path(install_root), _DIRECTORY_OPEN_FLAGS)
+    try:
+        entry = _current_entry_snapshot_at(install_fd, "current")
+        if not _entry_matches_managed_current(entry, expected):
+            raise InstallError("current runtime changed concurrently during uninstall")
+        assert entry is not None
+        _remove_current_entry_exact_at(install_fd, "current", entry)
+        os.fsync(install_fd)
+    finally:
+        os.close(install_fd)
+
+
 def uninstall(
     paths: RuntimePaths,
     *,
@@ -3247,7 +3372,6 @@ def uninstall(
     import vibe_memory_hooks
 
     removed: list[str] = []
-    service = bootout_launch_agent(paths, runner=runner)
     releases_root = pathlib.Path(paths.install_root) / "releases"
     owned_releases: list[pathlib.Path] = []
     preserved_releases: list[pathlib.Path] = []
@@ -3259,42 +3383,127 @@ def uninstall(
                 owned_releases.append(release)
             else:
                 preserved_releases.append(release)
-    hook_results = {}
-    for client in ("codex", "claude-code"):
-        path, _agent, label = _hook_target_for_client(paths, client)
-        hook_results[label] = vibe_memory_hooks.uninstall(path, paths.launcher)
-    home = pathlib.Path(paths.personal_memory).parents[1]
+    release_snapshots = {
+        release: _snapshot_owned_release(release) for release in owned_releases
+    }
+    original_current = _snapshot_managed_current(paths)
+    current_version = (
+        original_current[1][len("releases/"):]
+        if original_current is not None
+        else None
+    )
+    hook_targets = [
+        _hook_target_for_client(paths, client)
+        for client in ("codex", "claude-code")
+    ]
+    for path, agent, _label in hook_targets:
+        if path.exists():
+            current_document = vibe_memory_hooks.load_document(path)
+            vibe_memory_hooks.remove_managed_entries(
+                current_document,
+                paths.launcher,
+            )
     launch_agent = pathlib.Path(paths.launch_agent)
-    if _is_managed_launch_agent(launch_agent):
-        launch_agent.unlink()
-        removed.append(str(launch_agent))
     launcher = pathlib.Path(paths.launcher)
-    if _is_managed_launcher(launcher):
-        launcher.unlink()
-        removed.append(str(launcher))
     current = pathlib.Path(paths.install_root) / "current"
-    if os.path.lexists(current):
-        if not current.is_symlink():
-            raise InstallError("current runtime target is not a managed symlink")
-        current.unlink()
-        removed.append(str(current))
-    for path in (
+    if launch_agent.exists() and not _is_managed_launch_agent(launch_agent):
+        raise InstallError("LaunchAgent asset is not manager-owned")
+    if launcher.exists() and not _is_managed_launcher(launcher):
+        raise InstallError("launcher asset is not manager-owned")
+    managed_files = [
+        launch_agent,
+        launcher,
         pathlib.Path(paths.install_root) / "config.json",
         install_state_path(paths),
         pathlib.Path(paths.install_root) / "state" / "service-action.json",
-    ):
-        if _unlink_regular_file(path):
-            removed.append(str(path))
-    for release in owned_releases:
-        if _managed_release_version(release) != release.name:
-            raise InstallError(f"managed release changed during uninstall: {release}")
-        shutil.rmtree(release)
-        removed.append(str(release))
+    ]
+    hook_paths = {path for path, _agent, _label in hook_targets}
+    snapshots = {
+        path: _snapshot_regular_file(path)
+        for path in [*hook_paths, *managed_files, *validated_data_paths]
+    }
+    written: dict[pathlib.Path, FileSnapshot | None] = {}
+    quarantined_releases: dict[pathlib.Path, pathlib.Path] = {}
+    current_removed = False
+    service_stopped = False
+
+    def cleanup_uninstall() -> list[LifecycleCleanupFailure]:
+        failures: list[LifecycleCleanupFailure] = []
+        for release, quarantine in reversed(list(quarantined_releases.items())):
+            _record_lifecycle_cleanup(
+                failures,
+                str(release),
+                lambda release=release, quarantine=quarantine: _restore_quarantined_release(
+                    release,
+                    quarantine,
+                    release_snapshots[release],
+                ),
+            )
+        failures.extend(
+            _restore_lifecycle_files(
+                snapshots,
+                written,
+                exact_paths=set(snapshots),
+            )
+        )
+        if current_removed and original_current is not None:
+            _record_lifecycle_cleanup(
+                failures,
+                "version",
+                lambda: _activate_managed_version(
+                    paths,
+                    current_version or "",
+                    expected_current=None,
+                ),
+            )
+        if service_stopped and current_version is not None:
+            _record_lifecycle_cleanup(
+                failures,
+                "service",
+                lambda: activate_launch_agent(
+                    paths,
+                    expected_version=current_version,
+                ),
+            )
+        return failures
+
+    hook_results: dict[str, Any] = {}
     deleted_data: list[str] = []
-    if remove_data:
+    try:
+        service = bootout_launch_agent(paths, runner=runner)
+        service_stopped = not isinstance(service, dict) or service.get("status") == "booted_out"
+        for path, _agent, label in hook_targets:
+            hook_results[label] = _uninstall_lifecycle_hook(
+                path,
+                paths.launcher,
+                written,
+            )
+        for path in managed_files:
+            if _unlink_regular_file(path):
+                written[path] = None
+                removed.append(str(path))
+        if original_current is not None:
+            _remove_managed_current_exact(paths, original_current)
+            current_removed = True
+            removed.append(str(current))
+        for release in owned_releases:
+            quarantine = _quarantine_owned_release(
+                release,
+                release_snapshots[release],
+            )
+            quarantined_releases[release] = quarantine
+            removed.append(str(release))
         for data_path in validated_data_paths:
-            data_path.unlink(missing_ok=True)
+            if _unlink_regular_file(data_path):
+                written[data_path] = None
             deleted_data.append(str(data_path))
+        for quarantine in quarantined_releases.values():
+            shutil.rmtree(quarantine)
+    except Exception as error:
+        _raise_lifecycle_failure("uninstall", error, cleanup_uninstall())
+    except BaseException as interruption:
+        _attach_lifecycle_cleanup_failures(interruption, cleanup_uninstall())
+        raise
     return {
         "status": "uninstalled",
         "removed": removed,

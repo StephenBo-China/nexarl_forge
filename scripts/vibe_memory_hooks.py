@@ -1117,6 +1117,8 @@ def repair(
 def uninstall(
     path: str | pathlib.Path,
     runtime: str | pathlib.Path | None = None,
+    *,
+    _include_commit_snapshot: bool = False,
 ) -> dict[str, Any]:
     """Remove Vibe Memory managed hook entries while preserving custom handlers."""
     target = pathlib.Path(path)
@@ -1155,6 +1157,7 @@ def uninstall(
                 updated,
                 expected_source=source,
                 _source_descriptor=source_descriptor,
+                _include_commit_snapshot=_include_commit_snapshot,
             )
             result["status"] = "updated" if result["changed"] else "current"
             return result
