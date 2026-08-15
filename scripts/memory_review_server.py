@@ -2554,6 +2554,7 @@ class Handler(BaseHTTPRequestHandler):
         if (
             parsed_host.username is not None
             or parsed_host.password is not None
+            or parsed_host.netloc.endswith(":")
             or parsed_host.path
             or parsed_host.query
             or parsed_host.fragment

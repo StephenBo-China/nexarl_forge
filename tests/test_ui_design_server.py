@@ -95,6 +95,9 @@ class UIDesignServerTest(unittest.TestCase):
             "rebind.attacker@127.0.0.1:8897",
             "localhost.:8897",
             "127.0.0.1:0",
+            "localhost:",
+            "127.0.0.1:",
+            "[::1]:",
             "[::1]evil:8897",
             "::1:8897",
             None,
@@ -106,10 +109,9 @@ class UIDesignServerTest(unittest.TestCase):
                 return_value={"secret": "personal-memory"},
             ) as active_memory:
                 status, payload = self.http_request("GET", "/api/active-memory", host)
-
-            self.assertEqual(status, 400)
-            self.assertNotIn(b"personal-memory", payload)
-            active_memory.assert_not_called()
+                self.assertEqual(status, 400)
+                self.assertNotIn(b"personal-memory", payload)
+                active_memory.assert_not_called()
 
     def test_http_boundary_rejects_rebinding_host_for_every_dispatched_method(self) -> None:
         cases = (
@@ -131,17 +133,23 @@ class UIDesignServerTest(unittest.TestCase):
             self.assertEqual(status, 400)
 
     def test_http_boundary_preserves_loopback_hosts_and_unsupported_methods(self) -> None:
-        for host in ("127.0.0.1:8897", "localhost:8897", "[::1]:8897"):
+        for host in (
+            "127.0.0.1",
+            "localhost",
+            "[::1]",
+            "127.0.0.1:8897",
+            "localhost:8897",
+            "[::1]:8897",
+        ):
             with self.subTest(host=host), mock.patch.object(
                 server,
                 "active_memory_payload",
                 return_value={"ok": True},
             ) as active_memory:
                 status, payload = self.http_request("GET", "/api/active-memory", host)
-
-            self.assertEqual(status, 200)
-            self.assertEqual(json.loads(payload), {"ok": True})
-            active_memory.assert_called_once_with()
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(payload), {"ok": True})
+                active_memory.assert_called_once_with()
 
         for method in ("HEAD", "OPTIONS"):
             with self.subTest(method=method):
