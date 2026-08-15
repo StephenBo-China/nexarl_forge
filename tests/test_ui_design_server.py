@@ -132,6 +132,41 @@ class UIDesignServerTest(unittest.TestCase):
 
             self.assertEqual(status, 400)
 
+    def test_http_boundary_validates_absolute_form_authority_before_dispatch(self) -> None:
+        mismatches = (
+            ("http://rebind.attacker:8897/api/active-memory", "localhost:8897"),
+            ("http://localhost/api/active-memory", "localhost:8897"),
+            ("http://[::1]:8897/api/active-memory", "localhost:8897"),
+            ("http://[::1]:8898/api/active-memory", "[::1]:8897"),
+        )
+        for target, host in mismatches:
+            with self.subTest(target=target, host=host), mock.patch.object(
+                server,
+                "active_memory_payload",
+                return_value={"secret": "personal-memory"},
+            ) as active_memory:
+                status, payload = self.http_request("GET", target, host)
+                self.assertEqual(status, 400)
+                self.assertNotIn(b"personal-memory", payload)
+                active_memory.assert_not_called()
+
+        matches = (
+            ("http://localhost:8897/api/active-memory", "localhost:8897"),
+            ("http://LOCALHOST:08897/api/active-memory", "localhost:8897"),
+            ("http://127.0.0.1:8897/api/active-memory", "127.0.0.1"),
+            ("http://[::1]:8897/api/active-memory", "[::1]:8897"),
+        )
+        for target, host in matches:
+            with self.subTest(target=target, host=host), mock.patch.object(
+                server,
+                "active_memory_payload",
+                return_value={"ok": True},
+            ) as active_memory:
+                status, payload = self.http_request("GET", target, host)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(payload), {"ok": True})
+                active_memory.assert_called_once_with()
+
     def test_http_boundary_preserves_loopback_hosts_and_unsupported_methods(self) -> None:
         for host in (
             "127.0.0.1",

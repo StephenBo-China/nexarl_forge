@@ -2563,6 +2563,24 @@ class Handler(BaseHTTPRequestHandler):
         host_port = PORT if parsed_port is None else parsed_port
         if host_name not in allowed_hosts or host_port != PORT:
             raise ValueError("Host must be loopback")
+        parsed_target = urlparse(self.path)
+        if parsed_target.scheme or parsed_target.netloc:
+            try:
+                target_port = parsed_target.port
+            except ValueError as error:
+                raise ValueError("Request target authority is invalid") from error
+            if (
+                parsed_target.scheme != "http"
+                or not parsed_target.netloc
+                or parsed_target.username is not None
+                or parsed_target.password is not None
+                or parsed_target.netloc.endswith(":")
+                or parsed_target.fragment
+            ):
+                raise ValueError("Request target authority is invalid")
+            target_port = 80 if target_port is None else target_port
+            if parsed_target.hostname != host_name or target_port != host_port:
+                raise ValueError("Request target authority must exactly match Host")
         return host_name, host_port
 
     def parse_request(self) -> bool:
