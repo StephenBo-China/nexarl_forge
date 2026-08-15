@@ -2544,6 +2544,8 @@ class Handler(BaseHTTPRequestHandler):
         if len(host_values) != 1:
             raise ValueError("Host is invalid")
         host = host_values[0]
+        if "#" in host or "?" in host:
+            raise ValueError("Host is invalid")
         allowed_hosts = {"127.0.0.1", "localhost", "::1"}
         try:
             parsed_host = urlparse(f"//{host}")
@@ -2563,6 +2565,8 @@ class Handler(BaseHTTPRequestHandler):
         host_port = PORT if parsed_port is None else parsed_port
         if host_name not in allowed_hosts or host_port != PORT:
             raise ValueError("Host must be loopback")
+        if "#" in self.path:
+            raise ValueError("Request target is invalid")
         parsed_target = urlparse(self.path)
         if parsed_target.scheme or parsed_target.netloc:
             try:
@@ -2577,6 +2581,11 @@ class Handler(BaseHTTPRequestHandler):
                 or parsed_target.netloc.endswith(":")
                 or parsed_target.fragment
             ):
+                raise ValueError("Request target authority is invalid")
+            authority_start = self.path.find("://") + 3
+            path_start = self.path.find("/", authority_start)
+            query_start = self.path.find("?", authority_start)
+            if query_start != -1 and (path_start == -1 or query_start < path_start):
                 raise ValueError("Request target authority is invalid")
             target_port = 80 if target_port is None else target_port
             if parsed_target.hostname != host_name or target_port != host_port:
