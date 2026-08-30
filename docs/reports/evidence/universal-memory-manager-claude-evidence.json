@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "tested_implementation_commit": "cada208d90bcb00d168dd3af0155eff756139231",
+  "prior_installed_runtime_commit": "a94f356ddeb07cfb2478790f8a9d0bc090469113",
+  "verdict": "pass",
+  "open_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 2},
+  "acceptance_failures": 0,
+  "provenance": {
+    "operational_model_label": "claude-sonnet-4-6",
+    "basis": "two successful Claude CLI session init metadata records reported claude-sonnet-4-6",
+    "public_bundle_independent_verification": false,
+    "verification_limit": "The public bundle does not include raw CLI init metadata records and cannot independently adjudicate model identity; the workflow uses the reported init metadata as its operational label.",
+    "self_label_mismatches": [
+      {
+        "artifact": "loop/reports/claude_gate.json",
+        "self_label": "claude-sonnet-4-5",
+        "cli_init_metadata_reported_model": "claude-sonnet-4-6"
+      },
+      {
+        "artifact": "loop/reports/universal_memory_manager_claude_static.json",
+        "self_label": "claude-sonnet-4-5",
+        "cli_init_metadata_reported_model": "claude-sonnet-4-6"
+      }
+    ],
+    "static_representation": {
+      "raw_json_primitive_operations": 11,
+      "raw_markdown_grouped_steps": 8,
+      "canonical_representation": "8 ordered grouped static inspection records",
+      "normalization": "Repository/subsystem enumeration and related file reads are folded into their documented groups; no inspection result is omitted."
+    },
+    "runtime_method": "installed CLI plus curl/HTTP in isolated HOME; no Playwright",
+    "postfix_method": "clean disposable clone at final commit; fresh full suite, install module, release gate, Darwin E2E, and lifecycle delta; prior manual CLI/curl runtime inherited only for unchanged surfaces"
+  },
+  "sanitized_environment": {
+    "gate": {"timestamp": "2026-08-14T10:09:50Z", "environment": "isolated evaluator tree"},
+    "static": {"timestamp": "2026-08-14T10:14:33Z", "repository": "<DISPOSABLE_STATIC_REPO>"},
+    "runtime": {
+      "timestamp": "2026-08-14T18:40:00+08:00",
+      "claude_code_version": "2.1.85",
+      "python_version": "3.14.6",
+      "platform": "Darwin 24.6.0 arm64",
+      "home": "<DISPOSABLE_EVAL_HOME>",
+      "url": "http://127.0.0.1:<DISPOSABLE_PORT>"
+    },
+    "final": {"timestamp": "2026-08-14T18:41:00+08:00", "environment": "read-only staged synthesis"},
+    "postfix": {"timestamp": "2026-08-14T12:13:31Z", "repository": "<DISPOSABLE_POSTFIX_REPO>", "claude_code_version": "2.1.85", "model": "claude-sonnet-4-6", "python_version": "3.14.6", "platform": "Darwin 24.6.0 arm64", "git_status": "clean"}
+  },
+  "canonical_ordered_records": [
+    {"id":"G-01","stage":"gate","command":"git rev-parse HEAD && git status --short","exit":"0","outcome":"HEAD matched the tested commit; isolated evaluator tree clean."},
+    {"id":"G-02","stage":"gate","command":"python3 scripts/verify_release.py --tree .","exit":"0","outcome":"All 13 release checks returned ok."},
+    {"id":"S-01","stage":"static","command":"Enumerate <DISPOSABLE_STATIC_REPO>, scripts/, and evaluator-report inventory.","exit":"N/A (read-only inspection)","outcome":"Repository and relevant subsystem/evidence files identified."},
+    {"id":"S-02","stage":"static","command":"Inspect line counts for vibe_memory_install.py, vibe_memory_hooks.py, vibe_memory_router.py, vibe_memory_paths.py, vibe_memory_settings.py, and vibe_memory_migration.py.","exit":"N/A (read-only inspection)","outcome":"File sizes established for bounded review."},
+    {"id":"S-03","stage":"static","command":"Inspect git log --oneline -8.","exit":"N/A (read-only inspection)","outcome":"Tested commit and recent lifecycle-hardening history confirmed."},
+    {"id":"S-04","stage":"static","command":"Enumerate templates/loop/ and templates/macos/.","exit":"N/A (read-only inspection)","outcome":"Loop and LaunchAgent template assets identified."},
+    {"id":"S-05","stage":"static","command":"Read scripts/vibe_memory_install.py in chunks 1-1000, 1001-2000, and 2001-2901.","exit":"N/A (read-only inspection)","outcome":"Python discovery, launcher, lifecycle, migration validation, and uninstall controls inspected."},
+    {"id":"S-06","stage":"static","command":"Read vibe_memory_hooks.py, vibe_memory_router.py, vibe_memory_paths.py, targeted vibe_memory_migration.py, and com.noema.vibe-memory.plist.","exit":"N/A (read-only inspection)","outcome":"Shared hooks, routing, canonical paths, 17-area control plane, and LaunchAgent behavior inspected."},
+    {"id":"S-07","stage":"static","command":"Search scripts/ for anthropic and openai model-API imports.","exit":"N/A (read-only inspection)","outcome":"No model-API import was found in hook/router implementation."},
+    {"id":"S-08","stage":"static","command":"Read targeted vibe_memory_settings.py and vibe_memory_cli.py ranges.","exit":"N/A (read-only inspection)","outcome":"First-run, retention, approval, and installed CLI behavior inspected."},
+    {"id":"RT-01","stage":"runtime","command":"<DISPOSABLE_EVAL_HOME>/.local/bin/vibe-memory doctor --json","exit":"not separately recorded","outcome":"Runtime, service, hooks, data, and control plane all ok."},
+    {"id":"RT-02","stage":"runtime","command":"curl http://127.0.0.1:<DISPOSABLE_PORT>/health","exit":"not separately recorded","outcome":"Healthy Vibe Memory 1.0.0 response with data schema 1."},
+    {"id":"RT-03","stage":"runtime","command":"curl http://127.0.0.1:<DISPOSABLE_PORT>/","exit":"not separately recorded","outcome":"Expected first-run wizard HTML returned in isolated HOME."},
+    {"id":"RT-04","stage":"runtime","command":"vibe-memory project register <DISPOSABLE_PROJECT>","exit":"not separately recorded","outcome":"Project registered with memory_status: not_initialized."},
+    {"id":"RT-05","stage":"runtime","command":"vibe-memory project init <DISPOSABLE_PROJECT>","exit":"not separately recorded","outcome":"Project initialized; 18 managed files created."},
+    {"id":"RT-06","stage":"runtime","command":"vibe-memory project list","exit":"not separately recorded","outcome":"Initialized project listed."},
+    {"id":"RT-07","stage":"runtime","command":"vibe-memory hook --agent claude-code --event SessionStart from <DISPOSABLE_UNREGISTERED_CWD>","exit":"not separately recorded","outcome":"Personal-only context returned; no project files created."},
+    {"id":"RT-08","stage":"runtime","command":"vibe-memory hook --agent claude-code --event SessionStart from <DISPOSABLE_PROJECT>","exit":"not separately recorded","outcome":"Project and personal context returned; context packet written."},
+    {"id":"RT-09","stage":"runtime","command":"vibe-memory migrate preview --project-root <DISPOSABLE_PROJECT>","exit":"not separately recorded","outcome":"Clean preview; no legacy targets or errors."},
+    {"id":"RT-10","stage":"runtime","command":"vibe-memory migrate apply --project-root <DISPOSABLE_PROJECT> --approved","exit":"not separately recorded","outcome":"Applied with unchanged result; audit written."},
+    {"id":"RT-11","stage":"runtime","command":"vibe-memory hooks status","exit":"not separately recorded","outcome":"Codex and Claude hooks current."},
+    {"id":"RT-12","stage":"runtime","command":"vibe-memory hooks repair","exit":"not separately recorded","outcome":"No repair needed."},
+    {"id":"RT-13","stage":"runtime","command":"vibe-memory doctor --json after flows","exit":"not separately recorded","outcome":"All areas remained ok."},
+    {"id":"RT-14","stage":"runtime","command":"curl -X PATCH http://127.0.0.1:<DISPOSABLE_PORT>/api/settings with formal_memory_requires_approval=false","exit":"not separately recorded","outcome":"Request rejected; approval must remain true."},
+    {"id":"RT-15","stage":"runtime","command":"curl -X POST http://127.0.0.1:<DISPOSABLE_PORT>/api/settings/first-run with formal_memory_requires_approval=false","exit":"not separately recorded","outcome":"Request rejected; approval must remain true."},
+    {"id":"F-01","stage":"final","command":"Read gate, static, and runtime evidence and synthesize prior adjudication.","exit":"N/A (read-only inspection)","outcome":"Prior a94f356 overall pass; P0=0, P1=0, P2=1, P3=2; no acceptance failure."},
+    {"id":"D-01","stage":"remediation","command":"Review lifecycle cleanup across update, rollback, and repair.","exit":"N/A (read-only inspection)","outcome":"Blocking P1 LC-01 identified: dropped BaseException, non-exact hook rollback, concurrent-change overwrite risk, and lost cleanup sub-failures."},
+    {"id":"D-02","stage":"remediation","command":"python3 -m unittest tests.test_vibe_memory_install.LaunchAgentLifecycleTest.test_lifecycle_hook_rollback_uses_immediate_commit_snapshots -v against the old implementation.","exit":"nonzero (exact code not separately recorded)","outcome":"Genuine RED: 6 failures and 7 errors."},
+    {"id":"D-03","stage":"remediation","command":"Inspect TDD commit 2d5b256 (fix: preserve concurrent lifecycle hook changes).","exit":"N/A (read-only inspection)","outcome":"Immediate commit snapshots and concurrent hook-change preservation implemented with focused tests."},
+    {"id":"D-04","stage":"remediation","command":"Inspect TDD follow-up commit 3be3bc0 (fix: preserve lifecycle failures during cleanup).","exit":"N/A (read-only inspection)","outcome":"Original interruption identity and aggregated lifecycle cleanup failures preserved."},
+    {"id":"D-05","stage":"remediation","command":"Final specification review.","exit":"N/A (read-only inspection)","outcome":"APPROVED."},
+    {"id":"D-06","stage":"remediation","command":"Final code-quality review.","exit":"N/A (read-only inspection)","outcome":"APPROVED."},
+    {"id":"P-01","stage":"postfix","command":"git rev-parse HEAD && git status --short in <DISPOSABLE_POSTFIX_REPO>.","exit":"not separately recorded","outcome":"HEAD matched the final tested commit; disposable clone clean."},
+    {"id":"P-02","stage":"postfix","command":"python3 scripts/verify_release.py --tree .","exit":"0","outcome":"All 13 release gates returned ok."},
+    {"id":"P-03","stage":"postfix","command":"python3 -m unittest discover -s tests -v","exit":"0","outcome":"Full suite: 518 tests in 69.961 seconds, 0 failures/errors/skips, OK."},
+    {"id":"P-04","stage":"postfix","command":"python3 -m unittest discover -s tests -p test_vibe_memory_install.py","exit":"0","outcome":"Install module only: 102 tests in 5.874 seconds, 0 skips, OK; not the full-suite count."},
+    {"id":"P-05","stage":"postfix","command":"python3 -m unittest tests.test_macos_install_e2e -v","exit":"0","outcome":"Darwin E2E: 3 tests in 34.272 seconds, 0 failures/skips, OK."},
+    {"id":"P-06","stage":"postfix","command":"python3 -m unittest tests.test_vibe_memory_install.LaunchAgentLifecycleTest.test_lifecycle_hook_rollback_uses_immediate_commit_snapshots -v","exit":"0","outcome":"GREEN: one selector in 1.466 seconds; all 28 lifecycle subcases passed."},
+    {"id":"P-07","stage":"postfix","command":"git diff a94f356ddeb07cfb2478790f8a9d0bc090469113..3be3bc070666d20325dc94c5521822a638aed30c --stat","exit":"0","outcome":"Delta limited to lifecycle install logic and its tests: 2 files, +481/-96."},
+    {"id":"P-08","stage":"postfix","command":"Read prior runtime evidence, final delta, fresh results, and review decisions; synthesize postfix adjudication.","exit":"N/A (read-only inspection)","outcome":"Final verdict pass; LC-01 closed; P0=0, P1=0, P2=1, P3=2; no acceptance failure."}
+  ],
+  "stage_results": [
+    {"stage":"gate","verdict":"pass","P0":0,"P1":0,"P2":0,"P3":0,"acceptance_failures":0},
+    {"stage":"static","verdict":"pass","P0":0,"P1":0,"P2":0,"P3":0,"acceptance_failures":0},
+    {"stage":"runtime","verdict":"pass","P0":0,"P1":0,"P2":1,"P3":2,"acceptance_failures":0},
+    {"stage":"final","verdict":"pass","P0":0,"P1":0,"P2":1,"P3":2,"acceptance_failures":0},
+    {"stage":"remediation","verdict":"approved","P0":0,"P1":0,"P2":0,"P3":0,"acceptance_failures":0},
+    {"stage":"postfix","verdict":"pass","P0":0,"P1":0,"P2":1,"P3":2,"acceptance_failures":0}
+  ],
+  "open_findings": [
+    {"id":"R-01","severity":"P2","summary":"Wrong-cwd test harness resolves personal-only context and does not populate the project context packet."},
+    {"id":"R-02","severity":"P3","summary":"Freshly initialized project may show cosmetic managed_hooks_status: upgrade_available."},
+    {"id":"R-03","severity":"P3","summary":"Isolated evaluation HOME displayed the expected first-run wizard because first_run_complete=false."}
+  ],
+  "closed_findings": [
+    {"id":"LC-01","severity":"P1","status":"closed","summary":"Lifecycle cleanup preserves original BaseException identity, uses exact expected-current hook rollback, preserves concurrent changes, and aggregates cleanup failures.","tdd_commits":["2d5b256","3be3bc0"],"red":"6 failures and 7 errors","green":"28 subcases passed","specification_review":"APPROVED","quality_review":"APPROVED"}
+  ],
+  "residual_risks": [
+    "Physical Intel hardware was not tested.",
+    "Signed/notarized app or pkg packaging and Linux/Windows support remain deferred.",
+    "launchctl print ownership parsing and subsequent non-CAS bootout remain a lifecycle maintenance risk.",
+    "Hook smoke output can grow temporary-disk usage until process completion or the 10-second timeout."
+  ],
+  "ignored_local_sources": [
+    "loop/reports/claude_gate.{md,json}",
+    "loop/reports/universal_memory_manager_claude_static.{md,json}",
+    "loop/reports/universal_memory_manager_claude_runtime.{md,json}",
+    "loop/reports/universal_memory_manager_claude_eval.{md,json}",
+    "loop/reports/universal_memory_manager_claude_postfix.{md,json}"
+  ],
+  "report_package_scan": {
+    "scope": ["docs/RELEASE_CHECKLIST.md", "docs/reports/"],
+    "implementation_tree_scan_covers_nested_report_package": false,
+    "absolute_user_path_scan": {"tool":"rg", "target":"standard macOS absolute home-path prefix", "exit":1, "matches":0},
+    "sensitive_value_scan": {"tool":"rg", "target":"credential-label/value assignments and common provider-token shapes", "exit":1, "matches":0},
+    "limitations": ["Not a Git-history scan.", "Does not prove files are tracked."],
+    "tracked_status_confirmation": "Required after the report-only commit."
+  }
+}
