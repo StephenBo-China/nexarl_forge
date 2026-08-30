@@ -34,8 +34,41 @@ from ui_design_store import atomic_write_json, exclusive_lock
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
 PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
 _PROJECT_ROOT_VALUE = os.environ.get("MEMORY_REVIEW_PROJECT_ROOT")
+
+
+def _registered_project_root(value: str | None) -> pathlib.Path | None:
+    """Return an explicitly requested root only when it is registered.
+
+    Hooks may pass ``MEMORY_REVIEW_PROJECT_ROOT`` for a workspace.  Treating
+    that value as authoritative would let an unregistered directory create a
+    project proposal/state tree.  Resolve the registry independently and fail
+    closed on malformed or inaccessible registry data.
+    """
+    if not value:
+        return None
+    try:
+        candidate = pathlib.Path(value).expanduser().resolve()
+        if not candidate.is_dir():
+            return None
+        projects = memory_project.registry().get("projects", [])
+        if not isinstance(projects, list):
+            return None
+        for entry in projects:
+            raw_root = entry.get("root") if isinstance(entry, dict) else None
+            if not isinstance(raw_root, str) or not raw_root:
+                continue
+            try:
+                if pathlib.Path(raw_root).expanduser().resolve() == candidate:
+                    return candidate
+            except (OSError, RuntimeError, ValueError):
+                continue
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    return None
+
+
 PROJECT_ROOT = (
-    pathlib.Path(_PROJECT_ROOT_VALUE).expanduser().resolve()
+    _registered_project_root(_PROJECT_ROOT_VALUE)
     if _PROJECT_ROOT_VALUE
     else memory_project.current_project()
 )
