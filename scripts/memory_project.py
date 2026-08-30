@@ -1134,7 +1134,6 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
         agent_candidate_protocol(project_root),
         changes,
     )
-    register_project(project_root, make_current=True)
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 

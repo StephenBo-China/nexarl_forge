@@ -32,6 +32,30 @@ import vibe_memory_paths
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_init_project_does_not_register_an_unregistered_project(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "project"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            registered_root = temp / "already-registered"
+            registry_before = {
+                "current_project": str(registered_root),
+                "projects": [{"root": str(registered_root), "name": "already-registered"}],
+            }
+            registry_path.write_text(json.dumps(registry_before), encoding="utf-8")
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                memory_project.init_project(root)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            self.assertEqual(
+                json.loads(registry_path.read_text(encoding="utf-8")),
+                registry_before,
+            )
+
     def test_agent_candidate_protocol_prefers_stable_launcher(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             launcher = pathlib.Path(value) / "bin" / "vibe-memory"
