@@ -2865,8 +2865,8 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertFalse(release.exists())
             self.assertTrue(result["data_retained"])
 
-    def test_uninstall_without_valid_state_removes_all_owned_releases_and_exact_home_hook(self) -> None:
-        for state_mode in ("missing", "malformed"):
+    def test_uninstall_without_state_removes_all_owned_releases_and_exact_home_hook(self) -> None:
+        for state_mode in ("missing",):
             with self.subTest(state=state_mode), tempfile.TemporaryDirectory() as value:
                 root = pathlib.Path(value)
                 paths = self.make_paths(root)
@@ -2879,9 +2879,6 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     manifest["app_version"] = version
                     (release / "release.json").write_text(json.dumps(manifest), encoding="utf-8")
                 state = vibe_memory_install.install_state_path(paths)
-                if state_mode == "malformed":
-                    state.parent.mkdir(parents=True, exist_ok=True)
-                    state.write_text("{bad", encoding="utf-8")
                 hook = paths.personal_memory.parents[1] / ".codex/hooks.json"
                 hook.parent.mkdir(parents=True)
                 hook.write_text(json.dumps(vibe_memory_hooks.merge_document({"hooks": {}}, "codex", paths.launcher)), encoding="utf-8")
@@ -3076,6 +3073,32 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 bootout.assert_not_called()
                 self.assertEqual(target.read_text(encoding="utf-8"), '{"foreign": true}\n')
                 self.assertTrue((paths.install_root / "current").is_symlink())
+
+    def test_uninstall_accepts_current_session_active_service_action(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            action = paths.install_root / "state" / "service-action.json"
+            action.parent.mkdir(parents=True, exist_ok=True)
+            action.write_text(json.dumps({"generation": "a" * 32, "desired_start_at_login": False, "status": "current_session_active"}), encoding="utf-8")
+            with mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "booted_out"}):
+                vibe_memory_install.uninstall(paths)
+            self.assertFalse(action.exists())
+
+    def test_uninstall_rejects_malformed_install_state_before_bootout(self) -> None:
+        for payload in (b"{bad", b"\xff\xfe not json"):
+            with self.subTest(payload=payload), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                paths = self.make_paths(root)
+                vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+                state = vibe_memory_install.install_state_path(paths)
+                state.parent.mkdir(parents=True, exist_ok=True)
+                state.write_bytes(payload)
+                with mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.uninstall(paths)
+                bootout.assert_not_called()
+                self.assertEqual(state.read_bytes(), payload)
 
     def test_uninstall_preserves_fixed_asset_replaced_after_hook_commit(self) -> None:
         with tempfile.TemporaryDirectory() as value:

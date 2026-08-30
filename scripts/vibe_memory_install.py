@@ -3227,16 +3227,14 @@ def _validate_owned_fixed_asset(path: pathlib.Path, kind: str, paths: RuntimePat
         elif kind == "install-state":
             try:
                 value = json.loads(path.read_text(encoding="utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                # Historical uninstall semantics intentionally clean up an
-                # unreadable manager state file when release ownership is known.
-                return
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("malformed install state") from error
             _validate_install_state(value)
         else:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict) or not isinstance(value.get("generation"), str) or not re.fullmatch(r"[0-9a-f]{32}", value["generation"]):
                 raise ValueError("invalid service action")
-            if not isinstance(value.get("desired_start_at_login"), bool) or value.get("status") not in {"active", "bootout_pending"}:
+            if not isinstance(value.get("desired_start_at_login"), bool) or value.get("status") not in {"active", "bootout_pending", "current_session_active", "install_pending", "start_pending"}:
                 raise ValueError("invalid service action")
     except Exception as error:
         raise InstallError(f"{kind} asset is not manager-owned") from error
