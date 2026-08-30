@@ -3515,6 +3515,11 @@ def uninstall(
         path: _snapshot_regular_file(path)
         for path in [*hook_paths, *managed_files, *validated_data_paths]
     }
+    # Bind fixed-asset ownership to the exact bytes captured for deletion.
+    for path, kind in zip(managed_files[2:], ("config", "install-state", "service-action")):
+        _validate_owned_fixed_asset(path, kind, paths)
+        if _snapshot_regular_file(path) != snapshots[path]:
+            raise InstallError(f"{kind} asset changed during uninstall preflight")
     written: dict[pathlib.Path, FileSnapshot | None] = {}
     quarantined_releases: dict[pathlib.Path, pathlib.Path] = {}
     current_removed = False

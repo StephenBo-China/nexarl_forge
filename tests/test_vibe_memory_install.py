@@ -3100,6 +3100,38 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 bootout.assert_not_called()
                 self.assertEqual(state.read_bytes(), payload)
 
+    def test_uninstall_rejects_fixed_asset_replaced_between_validation_and_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            vibe_memory_install.write_install_state(paths, vibe_memory_install._install_state_document(
+                current_version="1.0.0", previous_version=None, port=8897,
+                installed_clients=[], python_executable=sys.executable,
+            ))
+            state = vibe_memory_install.install_state_path(paths)
+            foreign = b'{"foreign": true}\n'
+            real_snapshot = vibe_memory_install._snapshot_regular_file
+            replaced = False
+
+            def replace_before_snapshot(path: pathlib.Path) -> object:
+                nonlocal replaced
+                if path == state and not replaced:
+                    replaced = True
+                    replacement = state.with_name("foreign-state.json")
+                    replacement.write_bytes(foreign)
+                    os.replace(replacement, state)
+                return real_snapshot(path)
+
+            with mock.patch("vibe_memory_install._snapshot_regular_file", side_effect=replace_before_snapshot), mock.patch(
+                "vibe_memory_install.bootout_launch_agent"
+            ) as bootout, self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.uninstall(paths)
+
+            bootout.assert_not_called()
+            self.assertEqual(state.read_bytes(), foreign)
+            self.assertTrue((paths.install_root / "current").is_symlink())
+
     def test_uninstall_preserves_fixed_asset_replaced_after_hook_commit(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
