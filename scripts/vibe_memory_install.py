@@ -3194,7 +3194,15 @@ def _is_managed_launcher(path: pathlib.Path) -> bool:
     )
 
 
-def _unlink_regular_file(path: pathlib.Path) -> bool:
+def _unlink_regular_file(
+    path: pathlib.Path,
+    *,
+    expected: FileSnapshot | None | object = _NO_SNAPSHOT_CHECK,
+) -> bool:
+    if expected is not _NO_SNAPSHOT_CHECK:
+        current = _snapshot_regular_file(path)
+        if current != expected:
+            raise InstallError(f"managed file changed concurrently during uninstall: {path}")
     if not path.exists():
         return False
     if path.is_symlink():
@@ -3203,6 +3211,35 @@ def _unlink_regular_file(path: pathlib.Path) -> bool:
         raise InstallError(f"managed path must be a regular file: {path}")
     path.unlink()
     return True
+
+
+def _validate_owned_fixed_asset(path: pathlib.Path, kind: str, paths: RuntimePaths) -> None:
+    """Fail closed when a fixed control-plane asset exists but is foreign."""
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink():
+        raise InstallError(f"{kind} asset must not be a symlink")
+    if not path.is_file():
+        raise InstallError(f"{kind} asset must be a regular file")
+    try:
+        if kind == "config":
+            read_runtime_config(paths)
+        elif kind == "install-state":
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                # Historical uninstall semantics intentionally clean up an
+                # unreadable manager state file when release ownership is known.
+                return
+            _validate_install_state(value)
+        else:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(value, dict) or not isinstance(value.get("generation"), str) or not re.fullmatch(r"[0-9a-f]{32}", value["generation"]):
+                raise ValueError("invalid service action")
+            if not isinstance(value.get("desired_start_at_login"), bool) or value.get("status") not in {"active", "bootout_pending"}:
+                raise ValueError("invalid service action")
+    except Exception as error:
+        raise InstallError(f"{kind} asset is not manager-owned") from error
 
 
 def _validate_explicit_data_paths(
@@ -3252,6 +3289,14 @@ def _uninstall_lifecycle_hook(
 
 
 ReleaseSnapshot = tuple[tuple[int, int], dict[str, tuple[str, bytes | None]]]
+
+
+def _snapshot_complete_release_tree(path: pathlib.Path) -> dict[str, tuple[str, bytes | None]]:
+    fd = os.open(path, _DIRECTORY_OPEN_FLAGS)
+    try:
+        return _snapshot_directory_fd(fd, path, pathlib.Path())
+    finally:
+        os.close(fd)
 
 
 def _snapshot_owned_release(path: pathlib.Path) -> ReleaseSnapshot:
@@ -3322,13 +3367,35 @@ def _restore_quarantined_release(
     if _identity(metadata) != identity:
         raise InstallError(f"managed release changed concurrently during rollback: {path}")
     try:
-        current_entries = _snapshot_source_release(quarantine)
+        current_entries = _snapshot_complete_release_tree(quarantine)
     except BaseException:
         current_entries = None
     if current_entries == entries:
         _darwin_rename(quarantine, path, RENAME_EXCL)
         return
     _materialize_release_snapshot(path, entries)
+    # The quarantine was modified concurrently; leave it intact for recovery.
+
+
+def _remove_quarantined_release(
+    quarantine: pathlib.Path,
+    snapshot: ReleaseSnapshot,
+) -> None:
+    """Delete a quarantined release only when identity and full content still match."""
+    identity, entries = snapshot
+    try:
+        metadata = quarantine.stat(follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise InstallError(f"release quarantine disappeared during cleanup: {quarantine}") from error
+    if _identity(metadata) != identity:
+        raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+    try:
+        current_entries = _snapshot_complete_release_tree(quarantine)
+        expected_entries = dict(entries)
+    except BaseException as error:
+        raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+    if current_entries != expected_entries:
+        raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
     shutil.rmtree(quarantine)
 
 
@@ -3417,6 +3484,8 @@ def uninstall(
         install_state_path(paths),
         pathlib.Path(paths.install_root) / "state" / "service-action.json",
     ]
+    for path, kind in zip(managed_files[2:], ("config", "install-state", "service-action")):
+        _validate_owned_fixed_asset(path, kind, paths)
     hook_paths = {path for path, _agent, _label in hook_targets}
     snapshots = {
         path: _snapshot_regular_file(path)
@@ -3479,7 +3548,7 @@ def uninstall(
                 written,
             )
         for path in managed_files:
-            if _unlink_regular_file(path):
+            if _unlink_regular_file(path, expected=snapshots[path]):
                 written[path] = None
                 removed.append(str(path))
         if original_current is not None:
@@ -3494,11 +3563,11 @@ def uninstall(
             quarantined_releases[release] = quarantine
             removed.append(str(release))
         for data_path in validated_data_paths:
-            if _unlink_regular_file(data_path):
+            if _unlink_regular_file(data_path, expected=snapshots[data_path]):
                 written[data_path] = None
             deleted_data.append(str(data_path))
-        for quarantine in quarantined_releases.values():
-            shutil.rmtree(quarantine)
+        for release, quarantine in quarantined_releases.items():
+            _remove_quarantined_release(quarantine, release_snapshots[release])
     except Exception as error:
         _raise_lifecycle_failure("uninstall", error, cleanup_uninstall())
     except BaseException as interruption:
