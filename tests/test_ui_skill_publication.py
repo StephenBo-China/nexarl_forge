@@ -120,6 +120,58 @@ class UISkillPublicationTest(unittest.TestCase):
             )
         self.assertTrue(self.codex_dir.exists())
 
+    def test_project_scope_rejects_targets_for_a_different_project_before_writes(self) -> None:
+        project_a = self.temp / "project-a"
+        project_b = self.temp / "project-b"
+        self.approved["scope"] = {"type": "project", "root": str(project_a)}
+        targets = {
+            "codex": project_b / ".agents/skills/sample-ui",
+            "claude": project_b / ".claude/skills/sample-ui",
+        }
+
+        with self.assertRaises(publisher.ScopeConflict):
+            publisher.publish(
+                self.approved,
+                targets=targets,
+                project_root=project_b,
+                idempotency_key="scope-conflict",
+            )
+
+        self.assertFalse(project_b.exists())
+        self.assertFalse((self.temp / "ui-design-home/registry.json").exists())
+
+    def test_global_scope_rejects_explicit_project_publication_before_writes(self) -> None:
+        project = self.temp / "project"
+        targets = {
+            "codex": project / ".agents/skills/sample-ui",
+            "claude": project / ".claude/skills/sample-ui",
+        }
+
+        with self.assertRaises(publisher.ScopeConflict):
+            publisher.publish(
+                {**self.approved, "scope": {"type": "global"}},
+                targets=targets,
+                project_root=project,
+                idempotency_key="global-project-conflict",
+            )
+
+        self.assertFalse(project.exists())
+        self.assertFalse((self.temp / "ui-design-home/registry.json").exists())
+
+    def test_personal_scope_rejects_publication_before_writes(self) -> None:
+        project = self.temp / "project"
+        targets = {"codex": project / ".agents/skills/sample-ui"}
+
+        with self.assertRaises(publisher.ScopeConflict):
+            publisher.publish(
+                {**self.approved, "scope": {"type": "personal"}},
+                targets=targets,
+                idempotency_key="personal-scope-conflict",
+            )
+
+        self.assertFalse(project.exists())
+        self.assertFalse((self.temp / "ui-design-home/registry.json").exists())
+
     def test_disable_and_rollback_use_the_same_two_target_transaction(self) -> None:
         current_codex = self.seed_target(self.codex_dir, "current")
         current_claude = self.seed_target(self.claude_dir, "current")

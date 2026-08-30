@@ -547,6 +547,41 @@ description: Broken duplicate skill.
         )
         self.assertEqual(active["skills"], [])
 
+    def test_cli_publish_rejects_project_scope_override_without_writing_state(self) -> None:
+        project_a = self.temp / "project-a"
+        project_b = self.temp / "project-b"
+        draft = registry.create_draft(
+            name="sample-ui",
+            source={"type": "local"},
+            package_root=self.fixture,
+            scope={"type": "project", "root": str(project_a)},
+            targets=["codex", "claude"],
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+        registry_before = (self.temp / "ui-design-home/registry.json").read_bytes()
+
+        args = memory_review.build_parser().parse_args(
+            [
+                "ui-skill",
+                "publish",
+                draft["id"],
+                "--digest",
+                approved["digest"],
+                "--project",
+                str(project_b),
+                "--idempotency-key",
+                "cli-scope-conflict-001",
+            ]
+        )
+        with self.assertRaises(publisher.ScopeConflict):
+            memory_review.ui_design_cli.dispatch(args)
+
+        self.assertEqual(
+            (self.temp / "ui-design-home/registry.json").read_bytes(), registry_before
+        )
+        self.assertFalse(project_b.exists())
+        self.assertEqual(registry.get_draft(draft["id"])["status"], "approved")
+
 
 if __name__ == "__main__":
     unittest.main()

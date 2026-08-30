@@ -96,6 +96,7 @@ def ui_design_error_status(error: Exception) -> int:
         error,
         (
             ValueError,
+            ui_skill_publisher.ScopeConflict,
             ui_design_preferences.PreferenceValidationError,
             ui_design_gate.GateValidationError,
         ),
