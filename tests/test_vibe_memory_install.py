@@ -2944,7 +2944,7 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             real_snapshot = vibe_memory_install._snapshot_owned_release
             injected = False
 
-            def snapshot_with_external_release(path: pathlib.Path) -> object:
+            def snapshot_with_external_release(path: pathlib.Path, *_args: object) -> object:
                 nonlocal injected
                 if not injected:
                     injected = True
@@ -2963,6 +2963,43 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
 
             self.assertTrue(injected)
             self.assertEqual((external / "EXTERNAL_SENTINEL").read_text(encoding="utf-8"), "keep\n")
+
+    def test_uninstall_rejects_owned_release_replaced_between_inventory_and_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(root)
+            vibe_memory_install.install_runtime(source, paths)
+            release = paths.install_root / "releases/1.0.0"
+            displaced = paths.install_root / "releases/1.0.0.foreign"
+            real_snapshot = vibe_memory_install._snapshot_owned_release
+            replaced = False
+
+            def replace_before_snapshot(path: pathlib.Path, expected: object = None) -> object:
+                nonlocal replaced
+                if not replaced:
+                    replaced = True
+                    os.replace(release, displaced)
+                    shutil.copytree(source, release)
+                    for entry in release.rglob("*"):
+                        if entry.is_file():
+                            entry.chmod(0o600)
+                        elif entry.is_dir():
+                            entry.chmod(0o700)
+                return real_snapshot(path, expected)
+
+            with mock.patch(
+                "vibe_memory_install._snapshot_owned_release",
+                side_effect=replace_before_snapshot,
+            ), mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(paths)
+
+            self.assertTrue(replaced)
+            bootout.assert_not_called()
+            self.assertTrue(release.is_dir())
+            self.assertTrue(displaced.is_dir())
 
     def test_uninstall_never_deletes_semver_release_with_valid_manifest_and_user_extra(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -3229,6 +3266,42 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 bootout.assert_not_called()
                 self.assertEqual(target.read_bytes(), foreign)
 
+    def test_uninstall_rejects_crafted_launch_agent_with_manager_markers_only(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
+            crafted = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.noema.vibe-memory</string>
+<key>ProgramArguments</key><array><string>/bin/echo</string><string>memory_review_server.py</string></array>
+</dict></plist>
+"""
+            paths.launch_agent.write_text(crafted, encoding="utf-8")
+            with mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(paths)
+            bootout.assert_not_called()
+            self.assertEqual(paths.launch_agent.read_text(encoding="utf-8"), crafted)
+
+    def test_uninstall_rejects_launcher_with_marker_only(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            paths.launcher.parent.mkdir(parents=True, exist_ok=True)
+            crafted = f"{vibe_memory_install.LAUNCHER_MARKER}\n"
+            paths.launcher.write_text(crafted, encoding="utf-8")
+            with mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(paths)
+            bootout.assert_not_called()
+            self.assertEqual(paths.launcher.read_text(encoding="utf-8"), crafted)
+
     def test_uninstall_rejects_empty_install_state_as_foreign(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)
@@ -3243,6 +3316,74 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 vibe_memory_install.uninstall(paths)
             bootout.assert_not_called()
             self.assertEqual(state.read_text(encoding="utf-8"), "{}\n")
+
+    def test_uninstall_rejects_fixed_asset_added_after_initial_presence_check(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            target = paths.install_root / "config.json"
+            original_validate = vibe_memory_install._validate_owned_fixed_asset
+            injected = False
+
+            def validate_then_add(path: pathlib.Path, kind: str, runtime_paths: object) -> None:
+                nonlocal injected
+                original_validate(path, kind, runtime_paths)
+                if kind == "config" and not injected:
+                    injected = True
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(
+                        vibe_memory_install.render_runtime_config(
+                            8897, "1.0.0", python_executable=sys.executable
+                        ),
+                        encoding="utf-8",
+                    )
+
+            with mock.patch(
+                "vibe_memory_install._validate_owned_fixed_asset",
+                side_effect=validate_then_add,
+            ), mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(paths)
+
+            self.assertTrue(injected)
+            bootout.assert_not_called()
+            self.assertTrue(target.exists())
+
+    def test_uninstall_rejects_approved_data_added_after_initial_presence_check(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            target = paths.project_registry
+            original_validate = vibe_memory_install._validate_owned_fixed_asset
+            injected = False
+
+            def validate_then_add(path: pathlib.Path, kind: str, runtime_paths: object) -> None:
+                nonlocal injected
+                original_validate(path, kind, runtime_paths)
+                if kind == "config" and not injected:
+                    injected = True
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("{\"external\":true}\n", encoding="utf-8")
+
+            with mock.patch(
+                "vibe_memory_install._validate_owned_fixed_asset",
+                side_effect=validate_then_add,
+            ), mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(
+                    paths,
+                    remove_data=True,
+                    approved_data_deletion=True,
+                    data_paths=[target],
+                )
+
+            self.assertTrue(injected)
+            bootout.assert_not_called()
+            self.assertEqual(target.read_text(encoding="utf-8"), "{\"external\":true}\n")
 
     def test_uninstall_preserves_fixed_asset_replaced_after_hook_commit(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -3913,6 +4054,269 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertTrue(injected)
             self.assertTrue(quarantine.is_dir())
             self.assertEqual((quarantine / "FOREIGN").read_bytes(), b"keep")
+
+    def test_remove_quarantined_release_rejects_in_place_file_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            quarantine = root / "quarantine"
+            quarantine.mkdir(mode=0o700)
+            for directory in ("scripts", "templates", "docs"):
+                (quarantine / directory).mkdir(mode=0o700)
+            (quarantine / "README.md").write_bytes(b"# Runtime\n")
+            (quarantine / "release.json").write_bytes(json.dumps(MANIFEST).encode())
+            (quarantine / "scripts" / "server.py").write_bytes(b"print('server')\n")
+            (quarantine / "templates" / "template.txt").write_bytes(b"template\n")
+            (quarantine / "docs" / "guide.md").write_bytes(b"# Guide\n")
+            for file in quarantine.rglob("*"):
+                if file.is_file():
+                    file.chmod(0o600)
+            snapshot = vibe_memory_install._snapshot_owned_release(quarantine)
+            real_inventory = vibe_memory_install._temporary_tree_inventory_fd
+            inventory_calls = 0
+
+            def mutate_after_inventory(fd: int, prefix: pathlib.Path = pathlib.Path()) -> object:
+                nonlocal inventory_calls
+                result = real_inventory(fd, prefix)
+                inventory_calls += 1
+                if inventory_calls == 2:
+                    target = quarantine / "README.md"
+                    target.write_bytes(b"foreign\n")
+                    target.chmod(0o600)
+                return result
+
+            with mock.patch(
+                "vibe_memory_install._temporary_tree_inventory_fd",
+                side_effect=mutate_after_inventory,
+            ), self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install._remove_quarantined_release(quarantine, snapshot)
+
+            self.assertEqual((quarantine / "README.md").read_bytes(), b"foreign\n")
+
+    def test_unlink_regular_file_rejects_in_place_mutation_before_final_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            target = pathlib.Path(value) / "managed"
+            target.write_bytes(b"manager\n")
+            target.chmod(0o600)
+            expected = vibe_memory_install._snapshot_regular_file(target)
+            real_snapshot = vibe_memory_install._snapshot_regular_file_at
+            snapshot_calls = 0
+
+            def mutate_after_first_snapshot(fd: int, name: str, display: pathlib.Path) -> object:
+                nonlocal snapshot_calls
+                result = real_snapshot(fd, name, display)
+                snapshot_calls += 1
+                if snapshot_calls == 3:
+                    private_target = target.parent / name
+                    private_target.write_bytes(b"foreign\n")
+                    private_target.chmod(0o600)
+                return result
+
+            with mock.patch(
+                "vibe_memory_install._snapshot_regular_file_at",
+                side_effect=mutate_after_first_snapshot,
+            ), self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install._unlink_regular_file(target, expected=expected)
+
+            self.assertEqual(target.read_bytes(), b"foreign\n")
+
+    def test_unlink_regular_file_preserves_keyboard_interrupt_when_cleanup_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            target = pathlib.Path(value) / "managed"
+            target.write_bytes(b"manager\n")
+            target.chmod(0o600)
+            expected = vibe_memory_install._snapshot_regular_file(target)
+            interruption = KeyboardInterrupt()
+            with mock.patch(
+                "vibe_memory_install._unlink_claimed_entry_exact",
+                side_effect=interruption,
+            ), mock.patch(
+                "vibe_memory_install._entry_exists",
+                side_effect=OSError("cleanup check failed"),
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    vibe_memory_install._unlink_regular_file(target, expected=expected)
+            self.assertIs(raised.exception, interruption)
+            self.assertEqual(type(raised.exception), KeyboardInterrupt)
+
+    def test_portable_claim_restore_does_not_replace_occupied_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            claimed = root / "claimed"
+            original = root / "original"
+            claimed.write_bytes(b"manager\n")
+            original.write_bytes(b"foreign\n")
+            parent_fd = os.open(root, vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+            try:
+                with mock.patch.object(vibe_memory_install.sys, "platform", "linux"), self.assertRaises(
+                    vibe_memory_install.InstallError
+                ):
+                    vibe_memory_install._restore_claimed_entry(parent_fd, "claimed", "original")
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(original.read_bytes(), b"foreign\n")
+            self.assertEqual(claimed.read_bytes(), b"manager\n")
+
+    def test_portable_directory_restore_does_not_replace_occupied_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            claimed = root / "claimed"
+            original = root / "original"
+            claimed.mkdir(mode=0o700)
+            (claimed / "manager").write_bytes(b"manager\n")
+            parent_fd = os.open(root, vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+
+            real_rename = os.rename
+            real_noreplace = vibe_memory_install._rename_noreplace_at
+
+            def race_rename(source: object, destination: object, **kwargs: object) -> object:
+                destination_path = root / os.fspath(destination)
+                if not destination_path.exists():
+                    destination_path.mkdir(mode=0o700)
+                return real_rename(source, destination, **kwargs)
+
+            def race_noreplace(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                destination_path = root / destination_name
+                if not destination_path.exists():
+                    destination_path.mkdir(mode=0o700)
+                return real_noreplace(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
+            try:
+                with mock.patch.object(vibe_memory_install.sys, "platform", "linux"), mock.patch(
+                    "vibe_memory_install.os.rename", side_effect=race_rename
+                ), mock.patch(
+                    "vibe_memory_install._rename_noreplace_at", side_effect=race_noreplace
+                ), self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install._restore_claimed_entry(parent_fd, "claimed", "original")
+            finally:
+                os.close(parent_fd)
+            self.assertTrue(original.is_dir())
+            self.assertEqual(list(original.iterdir()), [])
+            self.assertEqual((claimed / "manager").read_bytes(), b"manager\n")
+
+    def test_portable_claim_does_not_replace_occupied_private_name(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = root / "source"
+            source.write_bytes(b"manager\n")
+            parent_fd = os.open(root, vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+            fixed_uuid = mock.Mock(hex="fixed")
+            next_uuid = mock.Mock(hex="next")
+            try:
+                (root / ".source.remove-fixed").write_bytes(b"foreign\n")
+                with mock.patch.object(vibe_memory_install.sys, "platform", "linux"), mock.patch(
+                    "vibe_memory_install.uuid.uuid4", side_effect=[fixed_uuid, next_uuid]
+                ):
+                    claimed_name = vibe_memory_install._claim_entry_for_removal(parent_fd, "source", "source")
+            finally:
+                os.close(parent_fd)
+            self.assertEqual(claimed_name, ".source.remove-next")
+            self.assertFalse(source.exists())
+            self.assertEqual((root / ".source.remove-fixed").read_bytes(), b"foreign\n")
+
+    def test_portable_directory_claim_does_not_replace_occupied_private_name(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = root / "source"
+            source.mkdir(mode=0o700)
+            (source / "manager").write_bytes(b"manager\n")
+            parent_fd = os.open(root, vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+            fixed_uuid = mock.Mock(hex="fixed")
+            next_uuid = mock.Mock(hex="next")
+
+            real_rename = os.rename
+            real_noreplace = vibe_memory_install._rename_noreplace_at
+            raced = False
+
+            def race_rename(source: object, destination: object, **kwargs: object) -> object:
+                destination_path = root / os.fspath(destination)
+                if not destination_path.exists():
+                    destination_path.mkdir(mode=0o700)
+                return real_rename(source, destination, **kwargs)
+
+            def race_noreplace(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                nonlocal raced
+                destination_path = root / destination_name
+                if not raced:
+                    raced = True
+                    destination_path.mkdir(mode=0o700)
+                return real_noreplace(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                )
+
+            try:
+                with mock.patch.object(vibe_memory_install.sys, "platform", "linux"), mock.patch(
+                    "vibe_memory_install.uuid.uuid4", side_effect=[fixed_uuid, next_uuid]
+                ), mock.patch(
+                    "vibe_memory_install.os.rename", side_effect=race_rename
+                ), mock.patch(
+                    "vibe_memory_install._rename_noreplace_at", side_effect=race_noreplace
+                ):
+                    claimed_name = vibe_memory_install._claim_entry_for_removal(parent_fd, "source", "source")
+            finally:
+                os.close(parent_fd)
+            occupied = root / ".source.remove-fixed"
+            claimed = root / claimed_name
+            self.assertFalse(source.exists())
+            self.assertTrue(occupied.is_dir())
+            self.assertEqual(list(occupied.iterdir()), [])
+            self.assertEqual(claimed_name, ".source.remove-next")
+            self.assertEqual((claimed / "manager").read_bytes(), b"manager\n")
+
+    def test_remove_quarantined_release_preserves_keyboard_interrupt_when_cleanup_check_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            quarantine = root / "quarantine"
+            quarantine.mkdir(mode=0o700)
+            for directory in ("scripts", "templates", "docs"):
+                (quarantine / directory).mkdir(mode=0o700)
+            (quarantine / "README.md").write_bytes(b"# Runtime\n")
+            (quarantine / "release.json").write_bytes(json.dumps(MANIFEST).encode())
+            (quarantine / "scripts" / "server.py").write_bytes(b"print('server')\n")
+            (quarantine / "templates" / "template.txt").write_bytes(b"template\n")
+            (quarantine / "docs" / "guide.md").write_bytes(b"# Guide\n")
+            for file in quarantine.rglob("*"):
+                if file.is_file():
+                    file.chmod(0o600)
+            snapshot = vibe_memory_install._snapshot_owned_release(quarantine)
+            real_inventory = vibe_memory_install._temporary_tree_inventory_fd
+            calls = 0
+            interruption = KeyboardInterrupt()
+
+            def interrupt_on_claimed_inventory(fd: int, prefix: pathlib.Path = pathlib.Path()) -> object:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise interruption
+                return real_inventory(fd, prefix)
+
+            with mock.patch(
+                "vibe_memory_install._temporary_tree_inventory_fd",
+                side_effect=interrupt_on_claimed_inventory,
+            ), mock.patch(
+                "vibe_memory_install._entry_exists",
+                side_effect=OSError("cleanup check failed"),
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    vibe_memory_install._remove_quarantined_release(quarantine, snapshot)
+            self.assertIs(raised.exception, interruption)
 
     def test_verify_private_release_closes_directory_fd(self) -> None:
         with tempfile.TemporaryDirectory() as value:

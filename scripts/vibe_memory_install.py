@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ctypes
+import errno
 import json
 import os
 import pathlib
 import plistlib
+import platform
 import re
 import shutil
 import stat
@@ -714,6 +716,77 @@ def _darwin_renameat(
         raise OSError(error_number, os.strerror(error_number), source_name, destination_name)
 
 
+def _rename_noreplace_at(
+    source_parent_fd: int,
+    source_name: str,
+    destination_parent_fd: int,
+    destination_name: str,
+) -> None:
+    """Atomically rename without replacement on the host filesystem."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameatx_np = getattr(libc, "renameatx_np", None)
+    if renameatx_np is not None:
+        renameatx_np.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            source_parent_fd,
+            os.fsencode(source_name),
+            destination_parent_fd,
+            os.fsencode(destination_name),
+            RENAME_EXCL,
+        )
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            source_name,
+            destination_name,
+        )
+    if platform.system() == "Linux":
+        syscall_number = {
+            "x86_64": 316,
+            "aarch64": 276,
+            "arm64": 276,
+        }.get(platform.machine())
+        if syscall_number is not None:
+            syscall = libc.syscall
+            syscall.argtypes = (
+                ctypes.c_long,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            syscall.restype = ctypes.c_long
+            result = syscall(
+                syscall_number,
+                source_parent_fd,
+                os.fsencode(source_name),
+                destination_parent_fd,
+                os.fsencode(destination_name),
+                1,  # RENAME_NOREPLACE
+            )
+            if result == 0:
+                return
+            error_number = ctypes.get_errno()
+            raise OSError(
+                error_number,
+                os.strerror(error_number),
+                source_name,
+                destination_name,
+            )
+    raise OSError(errno.EOPNOTSUPP, "atomic no-replace rename is unavailable")
+
+
 def _atomic_rename_exclusive(
     source: pathlib.Path | _AnchoredPath,
     destination: pathlib.Path | _AnchoredPath,
@@ -1003,6 +1076,14 @@ def _entry_exists(parent_fd: int, name: str) -> bool:
 
 def _temporary_identity(metadata: os.stat_result) -> tuple[int, int, int]:
     return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _entry_identity(path: pathlib.Path) -> tuple[int, int, int] | None:
+    """Return an entry's no-follow identity, preserving absence as ``None``."""
+    try:
+        return _temporary_identity(os.lstat(path))
+    except FileNotFoundError:
+        return None
 
 
 def _delete_tree_contents_fd(
@@ -2342,22 +2423,30 @@ def _remove_current_entry_exact_at(
         except OSError:
             pass
         raise InstallError("current runtime changed concurrently during rollback")
-    delete_name = _claim_entry_for_removal(install_fd, quarantine_name, "current")
     try:
-        deleting = _current_entry_snapshot_at(install_fd, delete_name)
-        if deleting != expected:
-            try:
-                _restore_claimed_entry(install_fd, delete_name, quarantine_name)
-            except InstallError:
-                pass
-            raise InstallError("current runtime changed concurrently during rollback")
-        os.unlink(delete_name, dir_fd=install_fd)
+        _unlink_claimed_entry_exact(
+            install_fd,
+            quarantine_name,
+            expected,
+            _current_entry_snapshot_at,
+            "current",
+            pathlib.Path(name),
+        )
     except BaseException:
-        if _entry_exists(install_fd, delete_name):
+        primary = sys.exc_info()[1]
+        cleanup_failures: list[LifecycleCleanupFailure] = []
+        try:
+            exists = _entry_exists(install_fd, quarantine_name)
+        except BaseException as cleanup_error:
+            exists = False
+            cleanup_failures.append(("current quarantine check", cleanup_error))
+        if exists:
             try:
-                _restore_claimed_entry(install_fd, delete_name, quarantine_name)
-            except InstallError:
-                pass
+                _restore_claimed_entry(install_fd, quarantine_name, name)
+            except BaseException as cleanup_error:
+                cleanup_failures.append(("current quarantine restore", cleanup_error))
+        if primary is not None and cleanup_failures:
+            _attach_lifecycle_cleanup_failures(primary, cleanup_failures)
         raise
 
 
@@ -2678,12 +2767,23 @@ def _claim_entry_for_removal(parent_fd: int, name: str, stem: str) -> str:
                     RENAME_EXCL,
                 )
             else:
-                os.rename(
-                    name,
-                    claimed_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                )
+                source_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if stat.S_ISDIR(source_metadata.st_mode):
+                    _rename_noreplace_at(
+                        parent_fd,
+                        name,
+                        parent_fd,
+                        claimed_name,
+                    )
+                else:
+                    os.link(
+                        name,
+                        claimed_name,
+                        src_dir_fd=parent_fd,
+                        dst_dir_fd=parent_fd,
+                        follow_symlinks=False,
+                    )
+                    os.unlink(name, dir_fd=parent_fd)
             return claimed_name
         except FileExistsError:
             continue
@@ -2707,13 +2807,11 @@ def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str
             # destination, and unlinking the claimed name completes the move.
             metadata = os.stat(claimed_name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
-                if _entry_exists(parent_fd, original_name):
-                    raise FileExistsError(original_name)
-                os.rename(
+                _rename_noreplace_at(
+                    parent_fd,
                     claimed_name,
+                    parent_fd,
                     original_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
                 )
             else:
                 os.link(
@@ -2728,6 +2826,44 @@ def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str
         raise InstallError(
             f"managed file changed concurrently during uninstall: {original_name}"
         ) from error
+
+
+def _unlink_claimed_entry_exact(
+    parent_fd: int,
+    claimed_name: str,
+    expected: object,
+    snapshot: Callable[[int, str], object],
+    stem: str,
+    display_path: pathlib.Path,
+) -> None:
+    """Claim a private name once more, compare identity/content, then unlink."""
+    final_name = _claim_entry_for_removal(parent_fd, claimed_name, stem)
+    try:
+        observed = snapshot(parent_fd, final_name)
+        confirmed = snapshot(parent_fd, final_name)
+        if observed != expected or confirmed != expected:
+            try:
+                _restore_claimed_entry(parent_fd, final_name, claimed_name)
+            except BaseException:
+                pass
+            raise InstallError(f"managed file changed concurrently during uninstall: {display_path}")
+        os.unlink(final_name, dir_fd=parent_fd)
+    except BaseException:
+        primary = sys.exc_info()[1]
+        cleanup_failures: list[LifecycleCleanupFailure] = []
+        try:
+            exists = _entry_exists(parent_fd, final_name)
+        except BaseException as cleanup_error:
+            exists = False
+            cleanup_failures.append((f"cleanup check {display_path}", cleanup_error))
+        if exists:
+            try:
+                _restore_claimed_entry(parent_fd, final_name, claimed_name)
+            except BaseException as cleanup_error:
+                cleanup_failures.append((f"cleanup restore {display_path}", cleanup_error))
+        if primary is not None and cleanup_failures:
+            _attach_lifecycle_cleanup_failures(primary, cleanup_failures)
+        raise
 
 
 def _restore_regular_file(
@@ -3292,13 +3428,40 @@ def repair(paths: RuntimePaths, *, run_at_load: bool = True) -> dict[str, Any]:
     }
 
 
-def _is_managed_launch_agent(path: pathlib.Path) -> bool:
+def _is_managed_launch_agent_content(content: bytes, paths: RuntimePaths) -> bool:
+    try:
+        plist = plistlib.loads(content)
+        if not isinstance(plist, dict):
+            return False
+        environment = plist.get("EnvironmentVariables")
+        if not isinstance(environment, dict):
+            return False
+        raw_port = environment.get("MEMORY_REVIEW_PORT")
+        if not isinstance(raw_port, str) or not raw_port.isdigit():
+            return False
+        port = int(raw_port)
+        run_at_load = plist.get("RunAtLoad")
+        if not isinstance(run_at_load, bool):
+            return False
+        _validate_launch_agent(
+            plist,
+            str(pathlib.Path(paths.install_root) / "current"),
+            port,
+            run_at_load=run_at_load,
+        )
+    except (OSError, ValueError, TypeError, plistlib.InvalidFileException, InstallError):
+        return False
+    return True
+
+
+def _is_managed_launch_agent(path: pathlib.Path, paths: RuntimePaths) -> bool:
     if not path.exists():
         return False
     if path.is_symlink():
         raise InstallError(f"managed LaunchAgent must not be a symlink: {path}")
-    text = path.read_text(encoding="utf-8")
-    return "com.noema.vibe-memory" in text and "memory_review_server.py" in text
+    if not path.is_file():
+        raise InstallError(f"managed LaunchAgent must be a regular file: {path}")
+    return _is_managed_launch_agent_content(path.read_bytes(), paths)
 
 
 def _is_managed_launcher(path: pathlib.Path) -> bool:
@@ -3308,27 +3471,22 @@ def _is_managed_launcher(path: pathlib.Path) -> bool:
         raise InstallError(f"managed launcher must not be a symlink: {path}")
     if not path.is_file():
         raise InstallError(f"managed launcher must be a regular file: {path}")
-    return "Vibe Memory stable launcher; generated by the installer." in path.read_text(
-        encoding="utf-8"
-    )
+    return _is_manager_launcher(path.read_bytes())
 
 
 def _validate_managed_asset_snapshot(
     path: pathlib.Path,
     kind: str,
     snapshot: FileSnapshot | None,
+    paths: RuntimePaths,
 ) -> None:
     """Validate ownership against the exact bytes captured for deletion."""
     if snapshot is None:
         return
-    try:
-        text = snapshot[1].decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise InstallError(f"{kind} asset is not manager-owned") from error
     if kind == "launch-agent":
-        owned = "com.noema.vibe-memory" in text and "memory_review_server.py" in text
+        owned = _is_managed_launch_agent_content(snapshot[1], paths)
     elif kind == "launcher":
-        owned = LAUNCHER_MARKER in text
+        owned = _is_manager_launcher(snapshot[1])
     else:
         raise InstallError(f"unknown managed asset kind: {kind}")
     if not owned:
@@ -3347,12 +3505,7 @@ def _unlink_regular_file(
         return False
     parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
     try:
-        try:
-            current = _snapshot_regular_file_at(parent_fd, path.name, path)
-        except InstallError:
-            if expected is _NO_SNAPSHOT_CHECK:
-                raise
-            raise
+        current = _snapshot_regular_file_at(parent_fd, path.name, path)
         if expected is not _NO_SNAPSHOT_CHECK and current != expected:
             raise InstallError(f"managed file changed concurrently during uninstall: {path}")
         claimed_name = _claim_entry_for_removal(parent_fd, path.name, path.name)
@@ -3361,30 +3514,43 @@ def _unlink_regular_file(
             if expected is not _NO_SNAPSHOT_CHECK and claimed != expected:
                 _restore_claimed_entry(parent_fd, claimed_name, path.name)
                 raise InstallError(f"managed file changed concurrently during uninstall: {path}")
-            delete_name = _claim_entry_for_removal(parent_fd, claimed_name, path.name)
-            try:
-                deleted = _snapshot_regular_file_at(parent_fd, delete_name, path)
-                if expected is not _NO_SNAPSHOT_CHECK and deleted != expected:
-                    _restore_claimed_entry(parent_fd, delete_name, claimed_name)
-                    _restore_claimed_entry(parent_fd, claimed_name, path.name)
-                    raise InstallError(f"managed file changed concurrently during uninstall: {path}")
-                os.unlink(delete_name, dir_fd=parent_fd)
-            except BaseException:
-                if _entry_exists(parent_fd, delete_name):
-                    try:
-                        _restore_claimed_entry(parent_fd, delete_name, claimed_name)
-                    except InstallError:
-                        pass
-                raise
+            _unlink_claimed_entry_exact(
+                parent_fd,
+                claimed_name,
+                expected,
+                lambda descriptor, entry: _snapshot_regular_file_at(
+                    descriptor, entry, path
+                ),
+                path.name,
+                path,
+            )
         except BaseException:
-            if _entry_exists(parent_fd, claimed_name):
+            primary = sys.exc_info()[1]
+            cleanup_failures: list[LifecycleCleanupFailure] = []
+            try:
+                exists = _entry_exists(parent_fd, claimed_name)
+            except BaseException as cleanup_error:
+                exists = False
+                cleanup_failures.append((f"cleanup check {path}", cleanup_error))
+            if exists:
                 try:
                     _restore_claimed_entry(parent_fd, claimed_name, path.name)
-                except InstallError:
-                    pass
+                except BaseException as cleanup_error:
+                    cleanup_failures.append((f"cleanup restore {path}", cleanup_error))
+            if primary is not None and cleanup_failures:
+                _attach_lifecycle_cleanup_failures(primary, cleanup_failures)
             raise
     finally:
-        os.close(parent_fd)
+        primary = sys.exc_info()[1]
+        try:
+            os.close(parent_fd)
+        except BaseException as close_error:
+            if primary is None:
+                raise
+            _attach_lifecycle_cleanup_failures(
+                primary,
+                [(f"close {path.parent}", close_error)],
+            )
     return True
 
 
@@ -3478,8 +3644,13 @@ def _snapshot_complete_release_tree(path: pathlib.Path) -> dict[str, tuple[str, 
         os.close(fd)
 
 
-def _snapshot_owned_release(path: pathlib.Path) -> ReleaseSnapshot:
+def _snapshot_owned_release(
+    path: pathlib.Path,
+    expected_identity: tuple[int, int] | None = None,
+) -> ReleaseSnapshot:
     before = path.stat(follow_symlinks=False)
+    if expected_identity is not None and _identity(before) != expected_identity:
+        raise InstallError(f"managed release changed while snapshotting: {path}")
     entries = _snapshot_source_release(path)
     fd = os.open(path, _DIRECTORY_OPEN_FLAGS)
     try:
@@ -3601,6 +3772,18 @@ def _remove_quarantined_release(
                 raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
             if _temporary_tree_inventory_fd(claimed_fd) != ledger:
                 raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+            try:
+                anchored_entries = _snapshot_directory_fd(
+                    claimed_fd,
+                    quarantine,
+                    pathlib.Path(),
+                )
+            except (OSError, ValueError) as error:
+                raise InstallError(
+                    f"release quarantine contents changed during cleanup: {quarantine}"
+                ) from error
+            if anchored_entries != expected_entries:
+                raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
             _delete_tree_contents_fd(claimed_fd, ledger)
             if _identity(os.fstat(claimed_fd)) != identity:
                 raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
@@ -3608,14 +3791,38 @@ def _remove_quarantined_release(
         except TemporaryCleanupConflict as error:
             raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
         finally:
-            os.close(claimed_fd)
-            if not claimed_ok and _entry_exists(parent_fd, claimed_name):
+            primary = sys.exc_info()[1]
+            cleanup_failures: list[LifecycleCleanupFailure] = []
+            try:
+                os.close(claimed_fd)
+            except BaseException as close_error:
+                cleanup_failures.append((f"close {claimed_name}", close_error))
+            if not claimed_ok:
                 try:
-                    _restore_claimed_entry(parent_fd, claimed_name, quarantine.name)
-                except InstallError:
-                    pass
+                    exists = _entry_exists(parent_fd, claimed_name)
+                except BaseException as check_error:
+                    exists = False
+                    cleanup_failures.append((f"check {claimed_name}", check_error))
+                if exists:
+                    try:
+                        _restore_claimed_entry(parent_fd, claimed_name, quarantine.name)
+                    except BaseException as restore_error:
+                        cleanup_failures.append((f"restore {claimed_name}", restore_error))
+            if primary is not None and cleanup_failures:
+                _attach_lifecycle_cleanup_failures(primary, cleanup_failures)
+            elif primary is None and cleanup_failures:
+                raise cleanup_failures[0][1]
+        final_name = _claim_entry_for_removal(parent_fd, claimed_name, "quarantine-final")
+        final_fd = os.open(final_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
         try:
-            os.rmdir(claimed_name, dir_fd=parent_fd)
+            if _identity(os.fstat(final_fd)) != identity:
+                raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+            if _temporary_tree_inventory_fd(final_fd):
+                raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+        finally:
+            os.close(final_fd)
+        try:
+            os.rmdir(final_name, dir_fd=parent_fd)
         except OSError as error:
             raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
     except BaseException:
@@ -3623,7 +3830,16 @@ def _remove_quarantined_release(
         # preserving it allows recovery if a concurrent actor changed it.
         raise
     finally:
-        os.close(parent_fd)
+        primary = sys.exc_info()[1]
+        try:
+            os.close(parent_fd)
+        except BaseException as close_error:
+            if primary is None:
+                raise
+            _attach_lifecycle_cleanup_failures(
+                primary,
+                [(f"close {quarantine.parent}", close_error)],
+            )
 
 
 def _remove_managed_current_exact(
@@ -3668,17 +3884,30 @@ def uninstall(
     removed: list[str] = []
     releases_root = pathlib.Path(paths.install_root) / "releases"
     owned_releases: list[pathlib.Path] = []
+    owned_release_identities: dict[pathlib.Path, tuple[int, int]] = {}
     preserved_releases: list[pathlib.Path] = []
     if releases_root.exists():
         if releases_root.is_symlink() or not releases_root.is_dir():
             raise InstallError("releases root must be a real directory")
         for release in sorted(releases_root.iterdir(), key=lambda item: item.name):
+            try:
+                inventory_identity = _identity(release.stat(follow_symlinks=False))
+            except OSError as error:
+                raise InstallError(f"managed release changed during inventory: {release}") from error
             if _managed_release_version(release) == release.name:
                 owned_releases.append(release)
+                try:
+                    confirmed_identity = _identity(release.stat(follow_symlinks=False))
+                except OSError as error:
+                    raise InstallError(f"managed release changed during inventory: {release}") from error
+                if confirmed_identity != inventory_identity:
+                    raise InstallError(f"managed release changed during inventory: {release}")
+                owned_release_identities[release] = inventory_identity
             else:
                 preserved_releases.append(release)
     release_snapshots = {
-        release: _snapshot_owned_release(release) for release in owned_releases
+        release: _snapshot_owned_release(release, owned_release_identities[release])
+        for release in owned_releases
     }
     original_current = _snapshot_managed_current(paths)
     current_version = (
@@ -3690,20 +3919,9 @@ def uninstall(
         _hook_target_for_client(paths, client)
         for client in ("codex", "claude-code")
     ]
-    for path, agent, _label in hook_targets:
-        if path.exists():
-            current_document = vibe_memory_hooks.load_document(path)
-            vibe_memory_hooks.remove_managed_entries(
-                current_document,
-                paths.launcher,
-            )
     launch_agent = pathlib.Path(paths.launch_agent)
     launcher = pathlib.Path(paths.launcher)
     current = pathlib.Path(paths.install_root) / "current"
-    if launch_agent.exists() and not _is_managed_launch_agent(launch_agent):
-        raise InstallError("LaunchAgent asset is not manager-owned")
-    if launcher.exists() and not _is_managed_launcher(launcher):
-        raise InstallError("launcher asset is not manager-owned")
     managed_files = [
         launch_agent,
         launcher,
@@ -3711,6 +3929,19 @@ def uninstall(
         install_state_path(paths),
         pathlib.Path(paths.install_root) / "state" / "service-action.json",
     ]
+    tracked_paths = [*managed_files, *validated_data_paths]
+    initial_presence = {path: _entry_identity(path) for path in tracked_paths}
+    for path, agent, _label in hook_targets:
+        if path.exists():
+            current_document = vibe_memory_hooks.load_document(path)
+            vibe_memory_hooks.remove_managed_entries(
+                current_document,
+                paths.launcher,
+            )
+    if launch_agent.exists() and not _is_managed_launch_agent(launch_agent, paths):
+        raise InstallError("LaunchAgent asset is not manager-owned")
+    if launcher.exists() and not _is_managed_launcher(launcher):
+        raise InstallError("launcher asset is not manager-owned")
     for path, kind in zip(managed_files[2:], ("config", "install-state", "service-action")):
         _validate_owned_fixed_asset(path, kind, paths)
     hook_paths = {path for path, _agent, _label in hook_targets}
@@ -3718,8 +3949,13 @@ def uninstall(
         path: _snapshot_regular_file(path)
         for path in [*hook_paths, *managed_files, *validated_data_paths]
     }
-    _validate_managed_asset_snapshot(launch_agent, "launch-agent", snapshots[launch_agent])
-    _validate_managed_asset_snapshot(launcher, "launcher", snapshots[launcher])
+    _validate_managed_asset_snapshot(launch_agent, "launch-agent", snapshots[launch_agent], paths)
+    _validate_managed_asset_snapshot(launcher, "launcher", snapshots[launcher], paths)
+    for path in tracked_paths:
+        before = initial_presence[path]
+        after = _entry_identity(path)
+        if before != after:
+            raise InstallError(f"managed uninstall target changed during preflight: {path}")
     # Bind fixed-asset ownership to the exact bytes captured for deletion.
     for path, kind in zip(managed_files[2:], ("config", "install-state", "service-action")):
         _validate_owned_fixed_asset(path, kind, paths)
