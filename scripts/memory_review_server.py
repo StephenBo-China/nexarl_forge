@@ -562,17 +562,69 @@ def switch_project(project_root: str) -> dict:
     return project_payload()
 
 
+def _registered_project_root(project_root: str) -> pathlib.Path | None:
+    """Return the canonical registered root, or ``None`` when unregistered.
+
+    This check is intentionally read-only.  In particular, project switching
+    must never promote an arbitrary path into the global project registry.
+    """
+    if not isinstance(project_root, str) or not project_root.strip():
+        return None
+    canonical = memory_project.normalize_project_root(project_root)
+    for item in memory_project.registry().get("projects", []):
+        if not isinstance(item, dict):
+            continue
+        value = item.get("root")
+        if isinstance(value, str) and value:
+            try:
+                if memory_project.normalize_project_root(value) == canonical:
+                    return canonical
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return None
+
+
+def switch_registered_project(project_root: str) -> dict:
+    """Switch only to an existing registry entry; never register implicitly."""
+    canonical = _registered_project_root(project_root)
+    if canonical is None:
+        requested = pathlib.Path(project_root).expanduser().resolve() if isinstance(project_root, str) else project_root
+        raise ValueError(f"project is not registered: {requested}")
+    return switch_project(str(canonical))
+
+
+def init_project_payload(project_root: str) -> dict:
+    """Initialize project files while preserving explicit registration policy."""
+    canonical = memory_project.normalize_project_root(project_root)
+    was_registered = _registered_project_root(str(canonical)) is not None
+    result = memory_project.init_project(str(canonical))
+    # ``memory_project.init_project`` refreshes an existing registry entry and
+    # selects it as current.  For a new/unregistered path, leave the current
+    # review project untouched and return the existing registry payload.
+    payload = switch_project(str(canonical)) if was_registered else project_payload()
+    return {"ok": True, "changes": result.get("changes", []), "projects": payload}
+
+
 def project_payload() -> dict:
     data = memory_project.list_projects()
     current = str(review.PROJECT_ROOT or "")
-    if current and all(item.get("root") != current for item in data.get("projects", [])):
-        data = memory_project.register_project(current, make_current=True)
+    if current:
+        canonical_current = memory_project.normalize_project_root(current)
+        registered = {
+            item.get("root")
+            for item in data.get("projects", [])
+            if isinstance(item, dict) and isinstance(item.get("root"), str)
+        }
+        if str(canonical_current) in registered:
+            current = str(canonical_current)
+        else:
+            current = ""
     return {
         "current_project": current,
         "registry": data,
         "recommend_port": memory_project.recommend_port(),
-        "project": memory_project.project_entry(review.PROJECT_ROOT)
-        if review.PROJECT_ROOT
+        "project": memory_project.project_entry(pathlib.Path(current))
+        if current
         else None,
     }
 
@@ -2716,14 +2768,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/projects/use":
                 body = self.read_json()
-                payload = switch_project(body.get("project_root", ""))
+                payload = switch_registered_project(body.get("project_root", ""))
                 self.send_json(payload)
                 return
             if parsed.path == "/api/projects/init":
                 body = self.read_json()
-                result = memory_project.init_project(body.get("project_root", ""))
-                payload = switch_project(result["project"]["root"])
-                self.send_json({"ok": True, "changes": result.get("changes", []), "projects": payload})
+                self.send_json(init_project_payload(body.get("project_root", "")))
                 return
             if parsed.path == "/api/projects/init-loop":
                 body = self.read_json()
