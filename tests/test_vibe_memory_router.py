@@ -966,7 +966,16 @@ class VibeMemoryRouterTest(unittest.TestCase):
             self.assertEqual(shlex.split(command)[:2], [sys.executable, str(cli)])
 
     def test_build_context_rejects_invalid_persisted_python_fallback_values(self) -> None:
-        invalid_values = [None, "", 123, [], {}, "/missing/python"]
+        invalid_values = [
+            None,
+            "",
+            123,
+            [],
+            {},
+            "/missing/python",
+            "\x00",
+            "python\x00invalid",
+        ]
         for persisted in invalid_values:
             with self.subTest(persisted=persisted), tempfile.TemporaryDirectory() as value:
                 temp = pathlib.Path(value)
@@ -996,6 +1005,25 @@ class VibeMemoryRouterTest(unittest.TestCase):
             command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
             source = pathlib.Path(vibe_memory_router.__file__).with_name("vibe_memory_cli.py")
             self.assertEqual(shlex.split(command)[:2], [sys.executable, str(source)])
+
+    def test_build_context_does_not_swallow_non_validation_fallback_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            cli = temp / "install" / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (temp / "install" / "config.json").write_text(
+                json.dumps({"python_executable": sys.executable}), encoding="utf-8"
+            )
+            paths = mock.Mock(install_root=temp / "install", launcher=temp / "missing")
+            with mock.patch(
+                "vibe_memory_router.vibe_memory_paths.for_home", return_value=paths
+            ), mock.patch(
+                "vibe_memory_router.vibe_memory_install.validate_python",
+                side_effect=RuntimeError("business failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "business failure"):
+                    build_context(self.event(), project_root=None, pending={})
 
     def test_build_context_command_executes_hostile_project_root_with_bin_sh(self) -> None:
         with tempfile.TemporaryDirectory() as value:

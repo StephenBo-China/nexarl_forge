@@ -91,7 +91,7 @@ def _candidate_cli_parts(paths: Any | None = None) -> list[str]:
     if isinstance(interpreter, str) and interpreter and cli.is_file():
         try:
             validated_interpreter = vibe_memory_install.validate_python(interpreter)
-        except vibe_memory_install.InstallError:
+        except (vibe_memory_install.InstallError, ValueError):
             pass
         else:
             return [validated_interpreter, str(cli)]

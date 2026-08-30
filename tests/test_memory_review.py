@@ -70,7 +70,16 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertEqual(line, expected)
 
     def test_agent_candidate_protocol_rejects_invalid_persisted_python_fallback_values(self) -> None:
-        invalid_values = [None, "", 123, [], {}, "/missing/python"]
+        invalid_values = [
+            None,
+            "",
+            123,
+            [],
+            {},
+            "/missing/python",
+            "\x00",
+            "python\x00invalid",
+        ]
         for persisted in invalid_values:
             with self.subTest(persisted=persisted), tempfile.TemporaryDirectory() as value:
                 temp = pathlib.Path(value)
@@ -116,6 +125,25 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 f"{shlex.quote(str(source))} memory propose \\"
             )
             self.assertEqual(line, expected)
+
+    def test_agent_candidate_protocol_does_not_swallow_non_validation_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            install_root = temp / "install"
+            cli = install_root / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (install_root / "config.json").write_text(
+                json.dumps({"python_executable": sys.executable}), encoding="utf-8"
+            )
+            paths = mock.Mock(launcher=temp / "missing", install_root=install_root)
+            with mock.patch.object(memory_project, "RUNTIME_PATHS", paths), mock.patch.object(
+                memory_project.vibe_memory_install,
+                "validate_python",
+                side_effect=RuntimeError("business failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "business failure"):
+                    memory_project.agent_candidate_protocol(pathlib.Path("/tmp/project"))
 
     def test_start_script_without_project_does_not_promote_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as value:
