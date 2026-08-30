@@ -15,6 +15,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 from typing import Any
 import uuid
 
@@ -514,9 +515,27 @@ def project_title(root: pathlib.Path) -> str:
 
 
 def agent_candidate_protocol(root: pathlib.Path) -> str:
-    stable_cli = RUNTIME_PATHS.install_root / "current/scripts/vibe_memory_cli.py"
     project_environment = shlex.quote(str(root))
-    cli_command = shlex.quote(str(stable_cli))
+    try:
+        launcher = pathlib.Path(RUNTIME_PATHS.launcher)
+    except TypeError:
+        launcher = pathlib.Path("")
+    cli_parts: list[str]
+    if launcher.is_file() and os.access(launcher, os.X_OK):
+        cli_parts = [str(launcher)]
+    else:
+        config = pathlib.Path(RUNTIME_PATHS.install_root) / "config.json"
+        try:
+            value = json.loads(config.read_text(encoding="utf-8"))
+            interpreter = value.get("python_executable") if isinstance(value, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            interpreter = None
+        cli = pathlib.Path(RUNTIME_PATHS.install_root) / "current/scripts/vibe_memory_cli.py"
+        if isinstance(interpreter, str) and interpreter and cli.is_file():
+            cli_parts = [interpreter, str(cli)]
+        else:
+            cli_parts = [sys.executable, str(APP_ROOT / "scripts/vibe_memory_cli.py")]
+    cli_command = " ".join(shlex.quote(part) for part in cli_parts)
     return f"""## Agent-Generated Memory Candidates
 
 The active conversation model performs candidate summarization itself. Hooks
@@ -547,7 +566,7 @@ pending and approved memory before writing.
 Write a distilled candidate with:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT={project_environment} python3 {cli_command} memory propose \\
+MEMORY_REVIEW_PROJECT_ROOT={project_environment} {cli_command} memory propose \\
   --scope personal|project --target long|short --category CATEGORY \\
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```

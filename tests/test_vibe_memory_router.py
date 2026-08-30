@@ -916,14 +916,11 @@ class VibeMemoryRouterTest(unittest.TestCase):
         marker = "Candidate CLI:\n\n    "
         self.assertIn(marker, context)
         command = context.split(marker, 1)[1].splitlines()[0]
-        script = (
-            vibe_memory_router.vibe_memory_paths.for_home().install_root
-            / "current/scripts/vibe_memory_cli.py"
-        )
+        script = pathlib.Path(vibe_memory_router.__file__).with_name("vibe_memory_cli.py")
         expected_parts = [
             "env",
             f"MEMORY_REVIEW_PROJECT_ROOT={project}",
-            "python3",
+            sys.executable,
             str(script),
             "memory",
             "propose",
@@ -938,6 +935,35 @@ class VibeMemoryRouterTest(unittest.TestCase):
         ]
         self.assertEqual(shlex.split(command), expected_parts)
         self.assertEqual(command, " ".join(shlex.quote(part) for part in expected_parts))
+
+    def test_build_context_prefers_stable_launcher_for_candidate_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            launcher = temp / "bin" / "vibe-memory"
+            launcher.parent.mkdir()
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            paths = mock.Mock(install_root=temp / "install", launcher=launcher)
+            with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=paths):
+                context = build_context(self.event(), project_root=None, pending={})
+            command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
+            self.assertEqual(shlex.split(command)[0], str(launcher))
+            self.assertNotIn("python3", command)
+
+    def test_build_context_uses_persisted_python_when_launcher_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            cli = temp / "install" / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (temp / "install" / "config.json").write_text(
+                json.dumps({"python_executable": "/opt/vibe/python3"}), encoding="utf-8"
+            )
+            paths = mock.Mock(install_root=temp / "install", launcher=temp / "missing")
+            with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=paths):
+                context = build_context(self.event(), project_root=None, pending={})
+            command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
+            self.assertEqual(shlex.split(command)[:2], ["/opt/vibe/python3", str(cli)])
 
     def test_build_context_command_executes_hostile_project_root_with_bin_sh(self) -> None:
         with tempfile.TemporaryDirectory() as value:

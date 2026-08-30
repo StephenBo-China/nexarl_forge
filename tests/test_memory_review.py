@@ -31,6 +31,19 @@ import vibe_memory_paths
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_agent_candidate_protocol_prefers_stable_launcher(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            launcher = pathlib.Path(value) / "bin" / "vibe-memory"
+            launcher.parent.mkdir()
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            launcher.chmod(0o755)
+            paths = mock.Mock(launcher=launcher, install_root=pathlib.Path(value) / "install")
+            with mock.patch.object(memory_project, "RUNTIME_PATHS", paths):
+                text = memory_project.agent_candidate_protocol(pathlib.Path("/tmp/project"))
+            command = text.split("MEMORY_REVIEW_PROJECT_ROOT=", 1)[1].split(" memory propose", 1)[0]
+            self.assertIn(str(launcher), command)
+            self.assertNotIn("python3", command)
+
     def test_start_script_without_project_does_not_promote_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             temp = pathlib.Path(value)

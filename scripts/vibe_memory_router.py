@@ -71,6 +71,27 @@ PROTECTED_CODEX_NAMES = (
 )
 
 
+def _candidate_cli_parts(paths: Any | None = None) -> list[str]:
+    """Return an executable command that survives PATH/runtime changes."""
+    runtime_paths = paths or vibe_memory_paths.for_home()
+    try:
+        launcher = pathlib.Path(runtime_paths.launcher)
+    except TypeError:
+        launcher = pathlib.Path("")
+    if launcher.is_file() and os.access(launcher, os.X_OK):
+        return [str(launcher)]
+    config = pathlib.Path(runtime_paths.install_root) / "config.json"
+    try:
+        value = json.loads(config.read_text(encoding="utf-8"))
+        interpreter = value.get("python_executable") if isinstance(value, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        interpreter = None
+    cli = pathlib.Path(runtime_paths.install_root) / "current" / "scripts" / "vibe_memory_cli.py"
+    if cli.is_file():
+        return [str(interpreter or sys.executable), str(cli)]
+    return [sys.executable, str(pathlib.Path(__file__).with_name("vibe_memory_cli.py"))]
+
+
 def _markdown_escape(value: object) -> str:
     return (
         str(value)
@@ -250,7 +271,7 @@ def build_context(
     project_pending_line = ""
     project_category_line = ""
     approval_scope = "Official personal long/short memory"
-    command_parts = ["python3"]
+    command_parts = _candidate_cli_parts()
     if project_root is not None:
         root = pathlib.Path(project_root)
         required = [
@@ -274,15 +295,8 @@ def build_context(
         ]
     required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
-    stable_cli = (
-        vibe_memory_paths.for_home().install_root
-        / "current"
-        / "scripts"
-        / "vibe_memory_cli.py"
-    )
     command_parts.extend(
         [
-            str(stable_cli),
             "memory",
             "propose",
             "--scope",

@@ -2150,8 +2150,8 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
         initialized = self.run_lifecycle(notes, "project", "init", str(notes))
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
         instructions = (notes / "AGENTS.md").read_text(encoding="utf-8")
-        stable_cli = self.home / "Library/Application Support/VibeMemory/current/scripts/vibe_memory_cli.py"
-        self.assertIn(str(stable_cli), instructions)
+        self.assertIn(str(CLI), instructions)
+        self.assertIn(sys.executable, instructions)
         self.assertIn("memory propose", instructions)
         self.assertNotIn(str(ROOT / "scripts/memory_review.py"), instructions)
         proposed = self.run_lifecycle(
@@ -2240,10 +2240,8 @@ class VibeMemoryCLIIntegrationTest(unittest.TestCase):
         context = output["hookSpecificOutput"]["additionalContext"]
         self.assertIn(f"Registered project: `{project.resolve()}`", context)
         self.assertIn("source agent: claude-code", context)
-        self.assertIn(
-            str(self.home / "Library/Application Support/VibeMemory/current/scripts/vibe_memory_cli.py"),
-            context,
-        )
+        self.assertIn(str(CLI), context)
+        self.assertIn(sys.executable, context)
         self.assertIn("memory propose", context)
         self.assertNotIn("do not save", context)
         queue = json.loads((codex / "memory_review_queue.json").read_text(encoding="utf-8"))
