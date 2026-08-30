@@ -4318,6 +4318,118 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     vibe_memory_install._remove_quarantined_release(quarantine, snapshot)
             self.assertIs(raised.exception, interruption)
 
+    def test_restore_quarantined_release_preserves_keyboard_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            quarantine = root / "quarantine"
+            quarantine.mkdir(mode=0o700)
+            for directory in ("scripts", "templates", "docs"):
+                (quarantine / directory).mkdir(mode=0o700)
+            (quarantine / "README.md").write_bytes(b"# Runtime\n")
+            (quarantine / "release.json").write_bytes(json.dumps(MANIFEST).encode())
+            (quarantine / "scripts" / "server.py").write_bytes(b"print('server')\n")
+            (quarantine / "templates" / "template.txt").write_bytes(b"template\n")
+            (quarantine / "docs" / "guide.md").write_bytes(b"# Guide\n")
+            for file in quarantine.rglob("*"):
+                if file.is_file():
+                    file.chmod(0o600)
+            snapshot = vibe_memory_install._snapshot_owned_release(quarantine)
+            interruption = KeyboardInterrupt()
+            with mock.patch(
+                "vibe_memory_install._snapshot_complete_release_tree",
+                side_effect=interruption,
+            ):
+                with self.assertRaises(KeyboardInterrupt) as raised:
+                    vibe_memory_install._restore_quarantined_release(
+                        root / "restored", quarantine, snapshot
+                    )
+            self.assertIs(raised.exception, interruption)
+            self.assertTrue(quarantine.is_dir())
+
+    def test_materialize_release_snapshot_does_not_replace_concurrent_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            target = root / "restored"
+            outside = root / "outside"
+            outside.write_bytes(b"keep\n")
+            entries = {
+                "scripts": ("directory", None),
+                "templates": ("directory", None),
+                "docs": ("directory", None),
+                "README.md": ("file", b"manager\n"),
+                "release.json": ("file", json.dumps(MANIFEST).encode()),
+            }
+            real_noreplace = vibe_memory_install._rename_noreplace_at
+
+            def race_noreplace(
+                parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+            ) -> None:
+                target.symlink_to(outside)
+                return real_noreplace(parent_fd, source_name, destination_parent_fd, destination_name)
+
+            with mock.patch(
+                "vibe_memory_install._rename_noreplace_at", side_effect=race_noreplace
+            ), self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install._materialize_release_snapshot(target, entries)
+            self.assertEqual(outside.read_bytes(), b"keep\n")
+            self.assertTrue(target.is_symlink())
+
+    def test_restore_regular_file_absent_expected_rejects_late_foreign_addition(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            target = root / "managed"
+            calls = 0
+            real_snapshot = vibe_memory_install._snapshot_regular_file
+
+            def add_foreign_after_snapshot(path: pathlib.Path) -> object:
+                nonlocal calls
+                result = real_snapshot(path)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(b"foreign\n")
+                return result
+
+            with mock.patch(
+                "vibe_memory_install._snapshot_regular_file", side_effect=add_foreign_after_snapshot
+            ), self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install._restore_regular_file(
+                    target, None, expected_current=None
+                )
+            self.assertEqual(target.read_bytes(), b"foreign\n")
+
+    def test_restore_regular_file_existing_expected_rejects_foreign_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            target = root / "managed"
+            target.write_bytes(b"manager\n")
+            target.chmod(0o600)
+            expected = vibe_memory_install._snapshot_regular_file(target)
+            assert expected is not None
+            calls = 0
+            real_snapshot = vibe_memory_install._snapshot_regular_file
+
+            def replace_after_check(path: pathlib.Path) -> object:
+                nonlocal calls
+                result = real_snapshot(path)
+                calls += 1
+                if calls == 1:
+                    path.write_bytes(b"foreign\n")
+                    path.chmod(0o600)
+                return result
+
+            with mock.patch(
+                "vibe_memory_install._snapshot_regular_file", side_effect=replace_after_check
+            ), self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install._restore_regular_file(
+                    target,
+                    (expected[0], b"restored\n", expected[2]),
+                    expected_current=expected,
+                )
+            self.assertEqual(target.read_bytes(), b"foreign\n")
+
     def test_verify_private_release_closes_directory_fd(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)

@@ -1514,11 +1514,29 @@ def _validate_launch_agent(
     python_executable = plist.get("ProgramArguments", [None])[0] if isinstance(plist, dict) else None
     if not isinstance(python_executable, str):
         raise ValueError("launch agent ProgramArguments are invalid")
-    expected_arguments = [python_executable, runtime + "/scripts/memory_review_server.py"]
+    _validate_launch_agent_shape(
+        plist,
+        runtime,
+        port,
+        python_executable=python_executable,
+        run_at_load=run_at_load,
+    )
     try:
         validate_python(python_executable)
     except InstallError as error:
         raise ValueError("launch agent Python interpreter is invalid") from error
+
+
+def _validate_launch_agent_shape(
+    plist: object,
+    runtime: str,
+    port: int,
+    *,
+    python_executable: str,
+    run_at_load: bool,
+) -> None:
+    """Validate plist ownership fields without executing its interpreter."""
+    expected_arguments = [python_executable, runtime + "/scripts/memory_review_server.py"]
     expected_environment = {
         "HOME": str(pathlib.Path(runtime).parents[3]),
         "MEMORY_REVIEW_HOST": "127.0.0.1",
@@ -2161,7 +2179,11 @@ def install_launch_agent(paths: RuntimePaths, content: str) -> dict[str, object]
 
 def _ensure_private_data_file(path: pathlib.Path, content: str) -> dict[str, str]:
     _validate_install_ancestor_chain(path.parent)
-    parent_fd = _open_or_create_directory_chain(_canonical_install_path(path.parent))
+    parent_path = _canonical_install_path(path.parent)
+    try:
+        parent_fd = os.open(parent_path, _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        parent_fd = _open_or_create_directory_chain(parent_path)
     try:
         if _entry_exists(parent_fd, path.name):
             metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -2767,23 +2789,7 @@ def _claim_entry_for_removal(parent_fd: int, name: str, stem: str) -> str:
                     RENAME_EXCL,
                 )
             else:
-                source_metadata = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                if stat.S_ISDIR(source_metadata.st_mode):
-                    _rename_noreplace_at(
-                        parent_fd,
-                        name,
-                        parent_fd,
-                        claimed_name,
-                    )
-                else:
-                    os.link(
-                        name,
-                        claimed_name,
-                        src_dir_fd=parent_fd,
-                        dst_dir_fd=parent_fd,
-                        follow_symlinks=False,
-                    )
-                    os.unlink(name, dir_fd=parent_fd)
+                _rename_noreplace_at(parent_fd, name, parent_fd, claimed_name)
             return claimed_name
         except FileExistsError:
             continue
@@ -2802,26 +2808,7 @@ def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str
                 RENAME_EXCL,
             )
         else:
-            # Emulate no-replace rename where renameatx_np is unavailable.  A
-            # hard-link create fails if a concurrent actor already occupied the
-            # destination, and unlinking the claimed name completes the move.
-            metadata = os.stat(claimed_name, dir_fd=parent_fd, follow_symlinks=False)
-            if stat.S_ISDIR(metadata.st_mode):
-                _rename_noreplace_at(
-                    parent_fd,
-                    claimed_name,
-                    parent_fd,
-                    original_name,
-                )
-            else:
-                os.link(
-                    claimed_name,
-                    original_name,
-                    src_dir_fd=parent_fd,
-                    dst_dir_fd=parent_fd,
-                    follow_symlinks=False,
-                )
-                os.unlink(claimed_name, dir_fd=parent_fd)
+            _rename_noreplace_at(parent_fd, claimed_name, parent_fd, original_name)
     except OSError as error:
         raise InstallError(
             f"managed file changed concurrently during uninstall: {original_name}"
@@ -2847,7 +2834,25 @@ def _unlink_claimed_entry_exact(
             except BaseException:
                 pass
             raise InstallError(f"managed file changed concurrently during uninstall: {display_path}")
-        os.unlink(final_name, dir_fd=parent_fd)
+        # Claim the final name once more immediately before deletion.  This
+        # binds the unlink to the entry that passed the final CAS snapshots;
+        # a replacement at the prior private name is moved aside and checked.
+        delete_name = _claim_entry_for_removal(parent_fd, final_name, f"{stem}-delete")
+        try:
+            deleted = snapshot(parent_fd, delete_name)
+            confirmed_deleted = snapshot(parent_fd, delete_name)
+            if deleted != expected or confirmed_deleted != expected:
+                raise InstallError(
+                    f"managed file changed concurrently during uninstall: {display_path}"
+                )
+            os.unlink(delete_name, dir_fd=parent_fd)
+        except BaseException:
+            if _entry_exists(parent_fd, delete_name):
+                try:
+                    _restore_claimed_entry(parent_fd, delete_name, final_name)
+                except BaseException:
+                    pass
+            raise
     except BaseException:
         primary = sys.exc_info()[1]
         cleanup_failures: list[LifecycleCleanupFailure] = []
@@ -2874,28 +2879,90 @@ def _restore_regular_file(
 ) -> None:
     if path.is_symlink():
         raise InstallError(f"managed file changed to symlink: {path}")
+    parent_path = _canonical_install_path(path.parent)
+    try:
+        parent_fd = os.open(parent_path, _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        parent_fd = _open_or_create_directory_chain(parent_path)
+    temporary_name: str | None = None
+    claimed_name: str | None = None
     if expected_current is not _NO_SNAPSHOT_CHECK:
         current = _snapshot_regular_file(path)
         if current != expected_current:
+            os.close(parent_fd)
             raise InstallError(f"managed file changed concurrently during rollback: {path}")
-    if snapshot is None:
-        try:
-            metadata = path.stat()
-        except FileNotFoundError:
-            return
-        if not stat.S_ISREG(metadata.st_mode):
-            raise InstallError(f"managed file changed type: {path}")
-        path.unlink()
-        return
-    _before_identity, content, mode = snapshot
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.restore-{uuid.uuid4().hex}")
     try:
-        temporary.write_bytes(content)
-        temporary.chmod(mode)
-        os.replace(temporary, path)
+        if snapshot is None:
+            current = _snapshot_regular_file(path)
+            if current is None:
+                return
+            if expected_current is not _NO_SNAPSHOT_CHECK and current != expected_current:
+                raise InstallError(f"managed file changed concurrently during rollback: {path}")
+            claimed_name = _claim_entry_for_removal(parent_fd, path.name, path.name)
+            claimed = _snapshot_regular_file_at(parent_fd, claimed_name, path)
+            if expected_current is not _NO_SNAPSHOT_CHECK and claimed != expected_current:
+                _restore_claimed_entry(parent_fd, claimed_name, path.name)
+                claimed_name = None
+                raise InstallError(f"managed file changed concurrently during rollback: {path}")
+            _unlink_claimed_entry_exact(
+                parent_fd,
+                claimed_name,
+                claimed,
+                lambda descriptor, entry: _snapshot_regular_file_at(descriptor, entry, path),
+                path.name,
+                path,
+            )
+            claimed_name = None
+            return
+
+        _before_identity, content, mode = snapshot
+        temporary_name = f".{path.name}.restore-{uuid.uuid4().hex}"
+        _write_file_at(content, parent_fd, temporary_name)
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            os.fchmod(temporary_fd, mode)
+        finally:
+            os.close(temporary_fd)
+
+        current = _snapshot_regular_file(path)
+        if current is not None:
+            claimed_name = _claim_entry_for_removal(parent_fd, path.name, path.name)
+            claimed = _snapshot_regular_file_at(parent_fd, claimed_name, path)
+            if expected_current is not _NO_SNAPSHOT_CHECK and claimed != expected_current:
+                _restore_claimed_entry(parent_fd, claimed_name, path.name)
+                claimed_name = None
+                raise InstallError(f"managed file changed concurrently during rollback: {path}")
+        try:
+            _rename_noreplace_at(parent_fd, temporary_name, parent_fd, path.name)
+            temporary_name = None
+        except OSError as error:
+            raise InstallError(f"managed file changed concurrently during rollback: {path}") from error
+        if claimed_name is not None:
+            _unlink_claimed_entry_exact(
+                parent_fd,
+                claimed_name,
+                claimed,
+                lambda descriptor, entry: _snapshot_regular_file_at(descriptor, entry, path),
+                path.name,
+                path,
+            )
+            claimed_name = None
     finally:
-        temporary.unlink(missing_ok=True)
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        if claimed_name is not None and _entry_exists(parent_fd, claimed_name):
+            try:
+                _restore_claimed_entry(parent_fd, claimed_name, path.name)
+            except BaseException:
+                pass
+        os.close(parent_fd)
 
 
 def _repair_lifecycle_hook(
@@ -3049,11 +3116,49 @@ def _remove_new_managed_release(
 ) -> bool:
     if preexisted or not path.exists():
         return False
-    metadata = path.stat(follow_symlinks=False)
-    if expected_identity is None or _identity(metadata) != expected_identity or _managed_release_version(path) != path.name:
-        raise InstallError(f"new release changed or is not manager-owned: {path}")
-    shutil.rmtree(path)
-    return True
+    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    claimed_name: str | None = None
+    try:
+        metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        if (
+            expected_identity is None
+            or _identity(metadata) != expected_identity
+            or _managed_release_version(path) != path.name
+            or not stat.S_ISDIR(metadata.st_mode)
+        ):
+            raise InstallError(f"new release changed or is not manager-owned: {path}")
+        release_fd = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            ledger = _temporary_tree_inventory_fd(release_fd)
+        finally:
+            os.close(release_fd)
+        claimed_name = _claim_entry_for_removal(parent_fd, path.name, path.name)
+        claimed_fd = os.open(claimed_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(claimed_fd)) != expected_identity:
+                raise InstallError(f"new release changed during cleanup: {path}")
+            if _temporary_tree_inventory_fd(claimed_fd) != ledger:
+                raise InstallError(f"new release changed during cleanup: {path}")
+            _delete_tree_contents_fd(claimed_fd, ledger)
+            if _identity(os.fstat(claimed_fd)) != expected_identity:
+                raise InstallError(f"new release changed during cleanup: {path}")
+        finally:
+            os.close(claimed_fd)
+        os.rmdir(claimed_name, dir_fd=parent_fd)
+        claimed_name = None
+        return True
+    except OSError as error:
+        if isinstance(error, InstallError):
+            raise
+        raise InstallError(f"new release changed during cleanup: {path}") from error
+    finally:
+        if claimed_name is not None:
+            try:
+                if _entry_exists(parent_fd, claimed_name):
+                    _restore_claimed_entry(parent_fd, claimed_name, path.name)
+            except BaseException:
+                pass
+        os.close(parent_fd)
 
 
 def _install_state_document(
@@ -3443,10 +3548,24 @@ def _is_managed_launch_agent_content(content: bytes, paths: RuntimePaths) -> boo
         run_at_load = plist.get("RunAtLoad")
         if not isinstance(run_at_load, bool):
             return False
-        _validate_launch_agent(
+        arguments = plist.get("ProgramArguments")
+        if (
+            not isinstance(arguments, list)
+            or len(arguments) != 2
+            or not isinstance(arguments[0], str)
+        ):
+            return False
+        python_executable = arguments[0]
+        executable_name = pathlib.Path(python_executable).name
+        if not pathlib.Path(python_executable).is_absolute() or not re.fullmatch(
+            r"python(?:3(?:\.[0-9]+)?)?", executable_name
+        ):
+            return False
+        _validate_launch_agent_shape(
             plist,
             str(pathlib.Path(paths.install_root) / "current"),
             port,
+            python_executable=python_executable,
             run_at_load=run_at_load,
         )
     except (OSError, ValueError, TypeError, plistlib.InvalidFileException, InstallError):
@@ -3589,6 +3708,10 @@ def _validate_explicit_data_paths(
     validated: list[pathlib.Path] = []
     for raw_path in data_paths:
         candidate = pathlib.Path(raw_path).expanduser().absolute()
+        try:
+            _validate_install_ancestor_chain(candidate.parent)
+        except (OSError, ValueError, RuntimeError) as error:
+            raise InstallError(f"data deletion path has unsafe ancestor: {candidate}") from error
         if candidate.is_symlink():
             raise InstallError(f"data deletion refuses symlink: {candidate}")
         if candidate.exists() and not candidate.is_file():
@@ -3667,23 +3790,53 @@ def _materialize_release_snapshot(
     path: pathlib.Path,
     entries: dict[str, tuple[str, bytes | None]],
 ) -> None:
-    path.mkdir(mode=0o700)
+    parent_path = _canonical_install_path(path.parent)
+    parent_fd = _open_or_create_directory_chain(parent_path)
+    temporary_name = f".{path.name}.restore-{uuid.uuid4().hex}"
+    temporary_fd: int | None = None
+    temporary_identity: tuple[int, int, int] | None = None
+    temporary_release = _AnchoredPath(
+        parent_fd,
+        temporary_name,
+        parent_path / temporary_name,
+    )
     try:
-        for relative, (entry_type, content) in sorted(
-            entries.items(), key=lambda item: (len(pathlib.PurePosixPath(item[0]).parts), item[0])
-        ):
-            destination = path / relative
-            if entry_type == "directory":
-                destination.mkdir(mode=0o700)
-            elif entry_type == "file" and content is not None:
-                destination.write_bytes(content)
-                destination.chmod(0o600)
-            else:
-                raise InstallError(f"invalid release snapshot entry: {relative}")
-        path.chmod(0o700)
-    except BaseException:
-        shutil.rmtree(path, ignore_errors=True)
+        os.mkdir(temporary_name, 0o700, dir_fd=parent_fd)
+        temporary_fd = os.open(temporary_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        opened = os.fstat(temporary_fd)
+        if not stat.S_ISDIR(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o700:
+            raise InstallError(f"unsafe release restore directory: {path}")
+        temporary_identity = _temporary_identity(opened)
+        temporary_release.directory_fd = temporary_fd
+        _copy_release_content(entries, temporary_release)
+        try:
+            _verify_and_make_private_fd(temporary_fd, entries)
+        except FileExistsError as error:
+            raise InstallError(f"invalid release snapshot: {path}") from error
+        try:
+            _rename_noreplace_at(parent_fd, temporary_name, parent_fd, path.name)
+        except OSError as error:
+            raise InstallError(f"managed release changed during rollback: {path}") from error
+        temporary_name = ""
+    except BaseException as primary:
+        cleanup_failures: list[LifecycleCleanupFailure] = []
+        if temporary_fd is not None and temporary_name:
+            try:
+                active = os.stat(temporary_name, dir_fd=parent_fd, follow_symlinks=False)
+                if temporary_identity is not None and _temporary_identity(active) == temporary_identity:
+                    _delete_tree_contents_fd(temporary_fd, temporary_release.creation_ledger)
+                    os.rmdir(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            except BaseException as cleanup_error:
+                cleanup_failures.append((f"cleanup release restore {path}", cleanup_error))
+        if cleanup_failures:
+            _attach_lifecycle_cleanup_failures(primary, cleanup_failures)
         raise
+    finally:
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        os.close(parent_fd)
 
 
 def _quarantine_owned_release(
@@ -3723,7 +3876,7 @@ def _restore_quarantined_release(
         raise InstallError(f"managed release changed concurrently during rollback: {path}")
     try:
         current_entries = _snapshot_complete_release_tree(quarantine)
-    except BaseException:
+    except Exception:
         current_entries = None
     if current_entries == entries:
         _darwin_rename(quarantine, path, RENAME_EXCL)
