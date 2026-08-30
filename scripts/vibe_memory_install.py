@@ -3216,7 +3216,11 @@ def update(
     run_at_load: bool = True,
 ) -> dict[str, Any]:
     """Install a new runtime release, validate it, then switch current."""
-    previous_version = _current_version(paths)
+    # Keep the complete identity-bearing snapshot until activation.  Reading
+    # only the version would allow a concurrent replacement of ``current`` to
+    # be silently overwritten by the update transaction.
+    original_current = _snapshot_managed_current(paths)
+    previous_version = None if original_current is None else original_current[1][len("releases/"):]
     runtime_config = pathlib.Path(paths.install_root) / "config.json"
     state_path = install_state_path(paths)
     clients = _installed_clients(paths) if installed_clients is None else list(installed_clients)
@@ -3231,6 +3235,7 @@ def update(
     new_release: pathlib.Path | None = None
     new_release_identity: tuple[int, int] | None = None
     release_preexisted = True
+    committed_current: ManagedCurrentSnapshot | None = None
 
     def cleanup_update() -> list[LifecycleCleanupFailure]:
         failures: list[LifecycleCleanupFailure] = []
@@ -3242,19 +3247,21 @@ def update(
                 snapshots, written, exact_paths=hook_paths
             )
         )
-        if previous_version is not None:
-            _record_lifecycle_cleanup(
-                failures,
-                "version",
-                lambda: _activate_managed_version(paths, previous_version),
-            )
-            _record_lifecycle_cleanup(
-                failures,
-                "service",
-                lambda: activate_launch_agent(
-                    paths, expected_version=previous_version
-                ),
-            )
+        if original_current is not None and committed_current is not None:
+            restored = True
+            try:
+                _restore_managed_current(paths, original_current, committed_current)
+            except BaseException as error:
+                restored = False
+                failures.append(("version", error))
+            if restored:
+                _record_lifecycle_cleanup(
+                    failures,
+                    "service",
+                    lambda: activate_launch_agent(
+                        paths, expected_version=previous_version
+                    ),
+                )
         if new_release is not None:
             _record_lifecycle_cleanup(
                 failures,
@@ -3283,7 +3290,15 @@ def update(
         )
         install_launcher(paths, python_executable=selected_python)
         control_plane = _validate_control_plane(paths, validation)
-        _activate_managed_version(paths, new_version)
+        try:
+            committed_current = _activate_managed_version(
+                paths, new_version, expected_current=original_current
+            )
+        except BaseException as activation_error:
+            committed_current = getattr(
+                activation_error, "_current_commit_snapshot", None
+            )
+            raise
         install_launch_agent(
             paths,
             render_launch_agent(paths, port=selected_port, python_executable=selected_python, run_at_load=run_at_load),

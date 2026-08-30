@@ -749,36 +749,76 @@ def start_command(_args: argparse.Namespace) -> int:
             python_executable, str
         ):
             raise LifecycleError("runtime configuration is incomplete")
+        # Starting the service is a privileged lifecycle action.  Validate
+        # the identity of ``current`` and its release before writing a plist
+        # or touching launchd; a foreign/rebound symlink must fail closed.
+        current_version = vibe_memory_install._current_version(paths)
+        release = pathlib.Path(paths.install_root) / "releases" / version
+        if (
+            current_version != version
+            or vibe_memory_install._managed_release_version(release) != version
+        ):
+            raise LifecycleError("current runtime is not a manager-owned release")
+        launch_agent_snapshot = _snapshot_managed_file(paths.launch_agent)
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        written_launch_agent: ManagedFileSnapshot | None = None
+        transitional_action: dict[str, object] | None = None
+        lifecycle_attempted = False
         plist = vibe_memory_install.render_launch_agent(
             paths,
             port=port,
             python_executable=python_executable,
             run_at_load=bool(settings["start_at_login"]),
         )
-        vibe_memory_install.install_launch_agent(paths, plist)
-        desired_start_at_login = bool(settings["start_at_login"])
-        previous_action = vibe_memory_settings.read_service_action(paths)
-        transitional_action = vibe_memory_settings.write_service_action(
-            paths,
-            desired_start_at_login=desired_start_at_login,
-            status="start_pending",
-        )
         try:
+            vibe_memory_install.install_launch_agent(paths, plist)
+        except BaseException:
+            try:
+                written_launch_agent = _snapshot_managed_file(paths.launch_agent)
+                _restore_managed_file(
+                    paths.launch_agent, launch_agent_snapshot, written_launch_agent
+                )
+            except BaseException:
+                pass
+            raise
+        written_launch_agent = _snapshot_managed_file(paths.launch_agent)
+        desired_start_at_login = bool(settings["start_at_login"])
+        try:
+            transitional_action = vibe_memory_settings.write_service_action(
+                paths,
+                desired_start_at_login=desired_start_at_login,
+                status="start_pending",
+            )
+            lifecycle_attempted = True
             result = vibe_memory_install.activate_launch_agent(
                 paths, expected_version=version
             )
-        except Exception:
-            vibe_memory_settings.restore_service_action_if_generation(
+            vibe_memory_settings.write_service_action(
                 paths,
-                expected_generation=str(transitional_action["generation"]),
-                previous=previous_action,
+                desired_start_at_login=desired_start_at_login,
+                status="active" if desired_start_at_login else "current_session_active",
             )
+        except BaseException:
+            try:
+                if transitional_action is not None:
+                    vibe_memory_settings.restore_service_action_if_generation(
+                        paths,
+                        expected_generation=str(transitional_action["generation"]),
+                        previous=previous_action,
+                    )
+            finally:
+                if lifecycle_attempted:
+                    try:
+                        vibe_memory_install.bootout_launch_agent(paths)
+                    except BaseException:
+                        pass
+                try:
+                    _restore_managed_file(
+                        paths.launch_agent, launch_agent_snapshot, written_launch_agent
+                    )
+                except BaseException:
+                    pass
             raise
-        vibe_memory_settings.write_service_action(
-            paths,
-            desired_start_at_login=desired_start_at_login,
-            status="active" if desired_start_at_login else "current_session_active",
-        )
     _json(result)
     return 0
 

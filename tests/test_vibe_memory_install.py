@@ -2876,6 +2876,46 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertFalse((paths.install_root / "releases/1.1.0").exists())
             self.assertEqual(activate.call_args_list[-1], mock.call(paths, expected_version="1.0.0"))
 
+    def test_update_refuses_to_replace_current_rebound_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = RuntimeInstallTest().make_paths(root)
+            source = RuntimeInstallTest().make_source(root, {**MANIFEST, "app_version": "1.1.0"})
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "releases/2.0.0").mkdir(parents=True)
+            current = paths.install_root / "current"
+            current.symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(
+                paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+            )
+            vibe_memory_install.write_install_state(
+                paths,
+                vibe_memory_install._install_state_document(
+                    current_version="1.0.0", previous_version=None, port=9123,
+                    installed_clients=[], python_executable=sys.executable,
+                ),
+            )
+            real_runtime_port = vibe_memory_install._runtime_port
+
+            def replace_current_before_activation(*args: object, **kwargs: object) -> int:
+                current.unlink()
+                current.symlink_to("releases/2.0.0")
+                return real_runtime_port(*args, **kwargs)
+
+            with mock.patch(
+                "vibe_memory_install._runtime_port",
+                side_effect=replace_current_before_activation,
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+            ) as activate:
+                with self.assertRaisesRegex(
+                    vibe_memory_install.InstallError, "concurrently"
+                ):
+                    vibe_memory_install.update(source, paths, validation={"control": "ok"})
+
+            self.assertEqual(os.readlink(current), "releases/2.0.0")
+            activate.assert_not_called()
+
     def test_uninstall_boots_out_before_removing_owned_releases_and_runtime_home_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)

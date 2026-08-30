@@ -61,6 +61,25 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         output = stdout.getvalue()
         return code, json.loads(output) if output else None, stderr.getvalue()
 
+    def prepare_manager_owned_runtime(self, version: str = "1.0.0") -> None:
+        release = self.paths.install_root / "releases" / version
+        release.mkdir(parents=True, exist_ok=True)
+        release.chmod(0o700)
+        for directory in ("scripts", "templates", "docs"):
+            (release / directory).mkdir(parents=True, exist_ok=True)
+            (release / directory).chmod(0o700)
+        (release / "README.md").write_text("# runtime\n", encoding="utf-8")
+        (release / "release.json").write_text(json.dumps({
+            "app_version": version,
+            "data_schema_version": 1,
+            "hook_protocol_version": 1,
+            "minimum_python": "3.10",
+            "platform": "macOS",
+        }), encoding="utf-8")
+        for path in (release / "README.md", release / "release.json"):
+            path.chmod(0o600)
+        (self.paths.install_root / "current").symlink_to(f"releases/{version}")
+
     def test_doctor_json_has_exact_stable_keys_and_exit_semantics(self) -> None:
         healthy = {name: {"ok": True, "status": "current"} for name in (
             "runtime", "codex_hooks", "claude_hooks", "service", "data"
@@ -1223,6 +1242,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable=sys.executable,
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1264,6 +1284,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable=sys.executable,
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1311,6 +1332,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable=sys.executable,
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1342,6 +1364,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1384,6 +1407,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1404,8 +1428,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             vibe_memory_cli.start_command(argparse.Namespace())
 
         transitional = memory_review_server.read_service_action(self.paths)
-        self.assertNotEqual(transitional["generation"], pending["generation"])
-        self.assertEqual(transitional["status"], "start_pending")
+        self.assertEqual(transitional, pending)
         with mock.patch.object(
             memory_review_server.vibe_memory_settings.vibe_memory_install,
             "bootout_launch_agent",
@@ -1413,7 +1436,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             memory_review_server.scheduled_bootout_worker(
                 self.paths, str(pending["generation"])
             )
-        bootout.assert_not_called()
+        bootout.assert_called_once()
 
     def test_failed_start_restore_does_not_overwrite_newer_generation(self) -> None:
         previous = memory_review_server.write_service_action(self.paths, desired=False)
@@ -1440,6 +1463,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1501,6 +1525,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1563,6 +1588,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable=sys.executable,
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
@@ -1595,6 +1621,76 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             ]
         )
 
+    def test_start_fails_closed_for_external_current_without_writing_or_starting(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {**vibe_memory_cli.vibe_memory_settings.default_settings(), "first_run_complete": True},
+        )
+        outside = pathlib.Path(self.temporary.name) / "outside"
+        outside.mkdir()
+        current = self.paths.install_root / "current"
+        current.symlink_to(outside)
+        previous_plist = b"sentinel plist\n"
+        self.paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
+        self.paths.launch_agent.write_bytes(previous_plist)
+        previous_action = memory_review_server.write_service_action(self.paths, desired=True)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_launch_agent"
+        ) as install_plist, mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent"
+        ) as activate:
+            code, _, stderr = self.invoke(["start"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stderr, "start failed; run doctor for actionable status\n")
+        install_plist.assert_not_called()
+        activate.assert_not_called()
+        self.assertEqual(self.paths.launch_agent.read_bytes(), previous_plist)
+        self.assertEqual(memory_review_server.read_service_action(self.paths), previous_action)
+
+    def test_start_restores_plist_and_service_action_on_system_exit(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        self.prepare_manager_owned_runtime()
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {**vibe_memory_cli.vibe_memory_settings.default_settings(), "first_run_complete": True},
+        )
+        self.paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
+        old_plist = b"old plist\n"
+        self.paths.launch_agent.write_bytes(old_plist)
+        previous_action = memory_review_server.write_service_action(self.paths, desired=False)
+        real_write = vibe_memory_cli.vibe_memory_settings.write_service_action
+
+        def interrupt_final_write(paths: object, *, desired_start_at_login: bool, status: str) -> dict[str, object]:
+            if status != "start_pending":
+                raise SystemExit(47)
+            return real_write(
+                paths,
+                desired_start_at_login=desired_start_at_login,
+                status=status,
+            )
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.activate_launch_agent",
+            return_value={"status": "healthy"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_settings.write_service_action",
+            side_effect=interrupt_final_write,
+        ), self.assertRaises(SystemExit) as raised:
+            vibe_memory_cli.start_command(argparse.Namespace())
+
+        self.assertEqual(raised.exception.code, 47)
+        self.assertEqual(self.paths.launch_agent.read_bytes(), old_plist)
+        self.assertEqual(memory_review_server.read_service_action(self.paths), previous_action)
+
     def test_start_and_first_run_serialize_settings_plist_and_activation(self) -> None:
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths,
@@ -1602,6 +1698,7 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
             app_version="1.0.0",
             python_executable=sys.executable,
         )
+        self.prepare_manager_owned_runtime()
         vibe_memory_cli.vibe_memory_settings.save_settings(
             self.paths,
             {
