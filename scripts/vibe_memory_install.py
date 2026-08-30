@@ -3236,25 +3236,32 @@ def update(
     new_release_identity: tuple[int, int] | None = None
     release_preexisted = True
     committed_current: ManagedCurrentSnapshot | None = None
+    activation_attempted = False
+    service_stopped = False
 
     def cleanup_update() -> list[LifecycleCleanupFailure]:
         failures: list[LifecycleCleanupFailure] = []
-        _record_lifecycle_cleanup(
-            failures, "bootout", lambda: bootout_launch_agent(paths)
-        )
+        nonlocal service_stopped
+        try:
+            bootout_result = bootout_launch_agent(paths)
+            service_stopped = bootout_result.get("status") in {"booted_out", "absent"}
+        except BaseException as error:
+            failures.append(("bootout", error))
         failures.extend(
             _restore_lifecycle_files(
                 snapshots, written, exact_paths=hook_paths
             )
         )
-        if original_current is not None and committed_current is not None:
+        if committed_current is not None or (
+            original_current is not None and activation_attempted and service_stopped
+        ):
             restored = True
             try:
                 _restore_managed_current(paths, original_current, committed_current)
             except BaseException as error:
                 restored = False
                 failures.append(("version", error))
-            if restored:
+            if restored and original_current is not None:
                 _record_lifecycle_cleanup(
                     failures,
                     "service",
@@ -3290,6 +3297,7 @@ def update(
         )
         install_launcher(paths, python_executable=selected_python)
         control_plane = _validate_control_plane(paths, validation)
+        activation_attempted = True
         try:
             committed_current = _activate_managed_version(
                 paths, new_version, expected_current=original_current

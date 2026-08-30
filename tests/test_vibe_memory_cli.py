@@ -1691,6 +1691,66 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(self.paths.launch_agent.read_bytes(), old_plist)
         self.assertEqual(memory_review_server.read_service_action(self.paths), previous_action)
 
+    def test_start_recovers_committed_pending_action_before_propagating_interrupt(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        self.prepare_manager_owned_runtime()
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {**vibe_memory_cli.vibe_memory_settings.default_settings(), "first_run_complete": True},
+        )
+        previous_action = memory_review_server.write_service_action(self.paths, desired=False)
+        real_write = vibe_memory_cli.vibe_memory_settings.write_service_action
+
+        def commit_then_interrupt(paths: object, *, desired_start_at_login: bool, status: str) -> dict[str, object]:
+            value = real_write(
+                paths,
+                desired_start_at_login=desired_start_at_login,
+                status=status,
+            )
+            if status == "start_pending":
+                raise KeyboardInterrupt()
+            return value
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_settings.write_service_action",
+            side_effect=commit_then_interrupt,
+        ), self.assertRaises(KeyboardInterrupt):
+            vibe_memory_cli.start_command(argparse.Namespace())
+
+        self.assertEqual(memory_review_server.read_service_action(self.paths), previous_action)
+
+    def test_start_restores_plist_when_post_write_snapshot_is_interrupted(self) -> None:
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+        )
+        self.prepare_manager_owned_runtime()
+        vibe_memory_cli.vibe_memory_settings.save_settings(
+            self.paths,
+            {**vibe_memory_cli.vibe_memory_settings.default_settings(), "first_run_complete": True},
+        )
+        snapshot = vibe_memory_cli._snapshot_managed_file
+        calls = 0
+
+        def interrupt_after_write(path: pathlib.Path) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise KeyboardInterrupt()
+            return snapshot(path)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+        ), mock.patch.object(
+            vibe_memory_cli, "_snapshot_managed_file", side_effect=interrupt_after_write
+        ), self.assertRaises(KeyboardInterrupt):
+            vibe_memory_cli.start_command(argparse.Namespace())
+
+        self.assertFalse(self.paths.launch_agent.exists())
+
     def test_start_and_first_run_serialize_settings_plist_and_activation(self) -> None:
         vibe_memory_cli.vibe_memory_install.install_runtime_config(
             self.paths,
@@ -1771,6 +1831,42 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(settings["start_at_login"], lifecycle["RunAtLoad"])
         self.assertEqual(settings["start_at_login"], lifecycle["KeepAlive"])
 
+    def test_lifecycle_commands_restore_service_action_on_final_write_interrupt(self) -> None:
+        commands = (
+            ("update", vibe_memory_cli.update_command, {"source_root": str(ROOT)}),
+            ("rollback", vibe_memory_cli.rollback_command, {}),
+            ("repair", vibe_memory_cli.repair_command, {}),
+        )
+        for name, command, values in commands:
+            with self.subTest(command=name):
+                self.paths = vibe_memory_cli.vibe_memory_paths.for_home(self.home)
+                previous = memory_review_server.write_service_action(self.paths, desired=False)
+                real_write = vibe_memory_cli.vibe_memory_settings.write_service_action
+
+                def commit_then_interrupt(paths: object, *, desired_start_at_login: bool, status: str) -> dict[str, object]:
+                    value = real_write(
+                        paths,
+                        desired_start_at_login=desired_start_at_login,
+                        status=status,
+                    )
+                    raise SystemExit(39)
+
+                with mock.patch(
+                    "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
+                ), mock.patch.object(
+                    vibe_memory_cli.vibe_memory_install,
+                    name,
+                    return_value={"status": name},
+                ), mock.patch(
+                    "vibe_memory_cli.vibe_memory_settings.write_service_action",
+                    side_effect=commit_then_interrupt,
+                ), self.assertRaises(SystemExit) as raised:
+                    command(argparse.Namespace(**values))
+
+                self.assertEqual(raised.exception.code, 39)
+                self.assertEqual(
+                    memory_review_server.read_service_action(self.paths), previous
+                )
     def test_runtime_lifecycle_commands_delegate_and_gate_data_deletion(self) -> None:
         with mock.patch(
             "vibe_memory_cli.vibe_memory_install.update",

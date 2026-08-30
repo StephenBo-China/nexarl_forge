@@ -2916,6 +2916,60 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             self.assertEqual(os.readlink(current), "releases/2.0.0")
             activate.assert_not_called()
 
+    def test_update_removes_committed_new_current_when_original_current_was_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = RuntimeInstallTest().make_paths(root)
+            source = RuntimeInstallTest().make_source(root, {**MANIFEST, "app_version": "1.1.0"})
+            real_activate = vibe_memory_install._activate_managed_version
+
+            def activate_current(*args: object, **kwargs: object) -> object:
+                return real_activate(*args, **kwargs)
+
+            with mock.patch(
+                "vibe_memory_install._activate_managed_version",
+                side_effect=activate_current,
+            ), mock.patch(
+                "vibe_memory_install.install_launch_agent",
+                side_effect=vibe_memory_install.InstallError("plist"),
+            ), mock.patch("vibe_memory_install.bootout_launch_agent"):
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.update(
+                        source, paths, installed_clients=[], validation={"control": "ok"}
+                    )
+
+            self.assertFalse(os.path.lexists(paths.install_root / "current"))
+
+    def test_update_restarts_old_service_when_activation_stops_it_before_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = RuntimeInstallTest().make_paths(root)
+            source = RuntimeInstallTest().make_source(root, {**MANIFEST, "app_version": "1.1.0"})
+            (paths.install_root / "releases/1.0.0").mkdir(parents=True)
+            (paths.install_root / "current").symlink_to("releases/1.0.0")
+            vibe_memory_install.install_runtime_config(
+                paths, port=9123, app_version="1.0.0", python_executable=sys.executable
+            )
+            with mock.patch(
+                "vibe_memory_install._activate_managed_version",
+                side_effect=vibe_memory_install.InstallError("current CAS"),
+            ), mock.patch(
+                "vibe_memory_install.bootout_launch_agent",
+                return_value={"status": "booted_out"},
+            ), mock.patch(
+                "vibe_memory_install.activate_launch_agent",
+                return_value={"status": "healthy"},
+            ) as activate:
+                with self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.update(
+                        source, paths, installed_clients=[], validation={"control": "ok"}
+                    )
+
+            self.assertEqual(
+                activate.call_args_list,
+                [mock.call(paths, expected_version="1.0.0")],
+            )
+
     def test_uninstall_boots_out_before_removing_owned_releases_and_runtime_home_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             root = pathlib.Path(value)

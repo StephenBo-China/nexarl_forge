@@ -695,14 +695,19 @@ def update_command(args: argparse.Namespace) -> int:
     with vibe_memory_settings.lifecycle_lock(paths):
         settings = vibe_memory_settings.load_settings(paths)
         desired = bool(settings["start_at_login"])
-        value = vibe_memory_install.update(
-            pathlib.Path(args.source_root), paths, run_at_load=desired
-        )
-        vibe_memory_settings.write_service_action(
-            paths,
-            desired_start_at_login=desired,
-            status="active" if desired else "current_session_active",
-        )
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        try:
+            value = vibe_memory_install.update(
+                pathlib.Path(args.source_root), paths, run_at_load=desired
+            )
+            vibe_memory_settings.write_service_action(
+                paths,
+                desired_start_at_login=desired,
+                status="active" if desired else "current_session_active",
+            )
+        except BaseException:
+            _restore_service_action_after_interrupt(paths, previous_action)
+            raise
     _json(value)
     return 0
 
@@ -712,12 +717,17 @@ def rollback_command(_args: argparse.Namespace) -> int:
     with vibe_memory_settings.lifecycle_lock(paths):
         settings = vibe_memory_settings.load_settings(paths)
         desired = bool(settings["start_at_login"])
-        value = vibe_memory_install.rollback(paths, run_at_load=desired)
-        vibe_memory_settings.write_service_action(
-            paths,
-            desired_start_at_login=desired,
-            status="active" if desired else "current_session_active",
-        )
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        try:
+            value = vibe_memory_install.rollback(paths, run_at_load=desired)
+            vibe_memory_settings.write_service_action(
+                paths,
+                desired_start_at_login=desired,
+                status="active" if desired else "current_session_active",
+            )
+        except BaseException:
+            _restore_service_action_after_interrupt(paths, previous_action)
+            raise
     _json(value)
     return 0
 
@@ -727,14 +737,35 @@ def repair_command(_args: argparse.Namespace) -> int:
     with vibe_memory_settings.lifecycle_lock(paths):
         settings = vibe_memory_settings.load_settings(paths)
         desired = bool(settings["start_at_login"])
-        value = vibe_memory_install.repair(paths, run_at_load=desired)
-        vibe_memory_settings.write_service_action(
-            paths,
-            desired_start_at_login=desired,
-            status="active" if desired else "current_session_active",
-        )
+        previous_action = vibe_memory_settings.read_service_action(paths)
+        try:
+            value = vibe_memory_install.repair(paths, run_at_load=desired)
+            vibe_memory_settings.write_service_action(
+                paths,
+                desired_start_at_login=desired,
+                status="active" if desired else "current_session_active",
+            )
+        except BaseException:
+            _restore_service_action_after_interrupt(paths, previous_action)
+            raise
     _json(value)
     return 0
+
+
+def _restore_service_action_after_interrupt(
+    paths: vibe_memory_paths.RuntimePaths,
+    previous: dict[str, object],
+) -> None:
+    """Undo a possibly committed action write without masking the interrupt."""
+    try:
+        current = vibe_memory_settings.read_service_action(paths)
+        generation = current.get("generation")
+        if isinstance(generation, str) and generation != previous.get("generation"):
+            vibe_memory_settings.restore_service_action_if_generation(
+                paths, expected_generation=generation, previous=previous
+            )
+    except BaseException:
+        return
 
 
 def start_command(_args: argparse.Namespace) -> int:
@@ -781,7 +812,20 @@ def start_command(_args: argparse.Namespace) -> int:
             except BaseException:
                 pass
             raise
-        written_launch_agent = _snapshot_managed_file(paths.launch_agent)
+        try:
+            written_launch_agent = _snapshot_managed_file(paths.launch_agent)
+        except BaseException:
+            # A snapshot failure after an atomic plist write is still inside
+            # the transaction; take one best-effort identity snapshot and
+            # restore it before propagating the original interruption.
+            try:
+                observed = _snapshot_managed_file(paths.launch_agent)
+                _restore_managed_file(
+                    paths.launch_agent, launch_agent_snapshot, observed
+                )
+            except BaseException:
+                pass
+            raise
         desired_start_at_login = bool(settings["start_at_login"])
         try:
             transitional_action = vibe_memory_settings.write_service_action(
@@ -799,25 +843,39 @@ def start_command(_args: argparse.Namespace) -> int:
                 status="active" if desired_start_at_login else "current_session_active",
             )
         except BaseException:
-            try:
-                if transitional_action is not None:
+            # The atomic write may have committed before raising, so recover
+            # the pending generation from disk.  Cleanup failures must never
+            # replace the KeyboardInterrupt/SystemExit being propagated.
+            if transitional_action is None:
+                try:
+                    candidate = vibe_memory_settings.read_service_action(paths)
+                    if (
+                        candidate.get("status") == "start_pending"
+                        and candidate.get("generation") != previous_action.get("generation")
+                    ):
+                        transitional_action = candidate
+                except BaseException:
+                    pass
+            if transitional_action is not None:
+                try:
                     vibe_memory_settings.restore_service_action_if_generation(
                         paths,
                         expected_generation=str(transitional_action["generation"]),
                         previous=previous_action,
                     )
-            finally:
-                if lifecycle_attempted:
-                    try:
-                        vibe_memory_install.bootout_launch_agent(paths)
-                    except BaseException:
-                        pass
-                try:
-                    _restore_managed_file(
-                        paths.launch_agent, launch_agent_snapshot, written_launch_agent
-                    )
                 except BaseException:
                     pass
+            if lifecycle_attempted:
+                try:
+                    vibe_memory_install.bootout_launch_agent(paths)
+                except BaseException:
+                    pass
+            try:
+                _restore_managed_file(
+                    paths.launch_agent, launch_agent_snapshot, written_launch_agent
+                )
+            except BaseException:
+                pass
             raise
     _json(result)
     return 0
