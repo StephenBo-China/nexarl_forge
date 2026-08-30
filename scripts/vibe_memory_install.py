@@ -3244,7 +3244,7 @@ def update(
         nonlocal service_stopped
         try:
             bootout_result = bootout_launch_agent(paths)
-            service_stopped = bootout_result.get("status") in {"booted_out", "absent"}
+            service_stopped = bootout_result.get("status") == "booted_out"
         except BaseException as error:
             failures.append(("bootout", error))
         failures.extend(

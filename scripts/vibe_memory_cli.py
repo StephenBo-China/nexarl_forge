@@ -846,16 +846,12 @@ def start_command(_args: argparse.Namespace) -> int:
             # The atomic write may have committed before raising, so recover
             # the pending generation from disk.  Cleanup failures must never
             # replace the KeyboardInterrupt/SystemExit being propagated.
-            if transitional_action is None:
-                try:
-                    candidate = vibe_memory_settings.read_service_action(paths)
-                    if (
-                        candidate.get("status") == "start_pending"
-                        and candidate.get("generation") != previous_action.get("generation")
-                    ):
-                        transitional_action = candidate
-                except BaseException:
-                    pass
+            try:
+                candidate = vibe_memory_settings.read_service_action(paths)
+                if candidate.get("generation") != previous_action.get("generation"):
+                    transitional_action = candidate
+            except BaseException:
+                pass
             if transitional_action is not None:
                 try:
                     vibe_memory_settings.restore_service_action_if_generation(

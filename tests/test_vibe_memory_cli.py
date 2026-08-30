@@ -1668,13 +1668,14 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         real_write = vibe_memory_cli.vibe_memory_settings.write_service_action
 
         def interrupt_final_write(paths: object, *, desired_start_at_login: bool, status: str) -> dict[str, object]:
-            if status != "start_pending":
-                raise SystemExit(47)
-            return real_write(
+            value = real_write(
                 paths,
                 desired_start_at_login=desired_start_at_login,
                 status=status,
             )
+            if status != "start_pending":
+                raise SystemExit(47)
+            return value
 
         with mock.patch(
             "vibe_memory_cli.vibe_memory_paths.for_home", return_value=self.paths
