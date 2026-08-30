@@ -2705,14 +2705,25 @@ def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str
             # Emulate no-replace rename where renameatx_np is unavailable.  A
             # hard-link create fails if a concurrent actor already occupied the
             # destination, and unlinking the claimed name completes the move.
-            os.link(
-                claimed_name,
-                original_name,
-                src_dir_fd=parent_fd,
-                dst_dir_fd=parent_fd,
-                follow_symlinks=False,
-            )
-            os.unlink(claimed_name, dir_fd=parent_fd)
+            metadata = os.stat(claimed_name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISDIR(metadata.st_mode):
+                if _entry_exists(parent_fd, original_name):
+                    raise FileExistsError(original_name)
+                os.rename(
+                    claimed_name,
+                    original_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            else:
+                os.link(
+                    claimed_name,
+                    original_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+                os.unlink(claimed_name, dir_fd=parent_fd)
     except OSError as error:
         raise InstallError(
             f"managed file changed concurrently during uninstall: {original_name}"
@@ -3584,6 +3595,7 @@ def _remove_quarantined_release(
         # A concurrent replacement at the public quarantine path is then left intact.
         claimed_name = _claim_entry_for_removal(parent_fd, quarantine.name, "quarantine")
         claimed_fd = os.open(claimed_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        claimed_ok = False
         try:
             if _identity(os.fstat(claimed_fd)) != identity:
                 raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
@@ -3592,10 +3604,16 @@ def _remove_quarantined_release(
             _delete_tree_contents_fd(claimed_fd, ledger)
             if _identity(os.fstat(claimed_fd)) != identity:
                 raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+            claimed_ok = True
         except TemporaryCleanupConflict as error:
             raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
         finally:
             os.close(claimed_fd)
+            if not claimed_ok and _entry_exists(parent_fd, claimed_name):
+                try:
+                    _restore_claimed_entry(parent_fd, claimed_name, quarantine.name)
+                except InstallError:
+                    pass
         try:
             os.rmdir(claimed_name, dir_fd=parent_fd)
         except OSError as error:
