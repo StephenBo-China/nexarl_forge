@@ -635,6 +635,20 @@ def _open_or_create_directory_chain(path: pathlib.Path) -> int:
         raise
 
 
+def _open_directory_chain(path: pathlib.Path) -> int:
+    """Open an existing directory path one component at a time, no-follow."""
+    descriptor = os.open(path.anchor, _DIRECTORY_OPEN_FLAGS)
+    try:
+        for component in path.parts[1:]:
+            child = os.open(component, _DIRECTORY_OPEN_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
 def _open_install_layout(paths: RuntimePaths) -> tuple[pathlib.Path, int, pathlib.Path, int]:
     requested = pathlib.Path(paths.install_root)
     _validate_install_ancestor_chain(requested)
@@ -2881,9 +2895,15 @@ def _restore_regular_file(
         raise InstallError(f"managed file changed to symlink: {path}")
     parent_path = _canonical_install_path(path.parent)
     try:
-        parent_fd = os.open(parent_path, _DIRECTORY_OPEN_FLAGS)
-    except FileNotFoundError:
-        parent_fd = _open_or_create_directory_chain(parent_path)
+        _validate_install_ancestor_chain(path.parent)
+    except ValueError as error:
+        try:
+            if stat.S_ISREG(os.lstat(parent_path).st_mode):
+                raise NotADirectoryError(parent_path) from error
+        except FileNotFoundError:
+            pass
+        raise
+    parent_fd = _open_or_create_directory_chain(parent_path)
     temporary_name: str | None = None
     claimed_name: str | None = None
     if expected_current is not _NO_SNAPSHOT_CHECK:
@@ -3116,7 +3136,8 @@ def _remove_new_managed_release(
 ) -> bool:
     if preexisted or not path.exists():
         return False
-    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    _validate_install_ancestor_chain(path.parent)
+    parent_fd = _open_or_create_directory_chain(_canonical_install_path(path.parent))
     claimed_name: str | None = None
     try:
         metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -3622,7 +3643,8 @@ def _unlink_regular_file(
         if current is not None:
             raise InstallError(f"managed file changed concurrently during uninstall: {path}")
         return False
-    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    _validate_install_ancestor_chain(path.parent)
+    parent_fd = _open_directory_chain(_canonical_install_path(path.parent))
     try:
         current = _snapshot_regular_file_at(parent_fd, path.name, path)
         if expected is not _NO_SNAPSHOT_CHECK and current != expected:
@@ -3865,24 +3887,48 @@ def _restore_quarantined_release(
     snapshot: ReleaseSnapshot,
 ) -> None:
     identity, entries, _ledger = snapshot
-    if os.path.lexists(path):
-        raise InstallError(f"managed release changed concurrently during rollback: {path}")
+    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    claimed_name: str | None = None
     try:
-        metadata = quarantine.stat(follow_symlinks=False)
-    except FileNotFoundError:
-        _materialize_release_snapshot(path, entries)
-        return
-    if _identity(metadata) != identity:
-        raise InstallError(f"managed release changed concurrently during rollback: {path}")
-    try:
-        current_entries = _snapshot_complete_release_tree(quarantine)
-    except Exception:
-        current_entries = None
-    if current_entries == entries:
-        _darwin_rename(quarantine, path, RENAME_EXCL)
-        return
-    _materialize_release_snapshot(path, entries)
-    # The quarantine was modified concurrently; leave it intact for recovery.
+        if _entry_exists(parent_fd, path.name):
+            raise InstallError(f"managed release changed concurrently during rollback: {path}")
+        try:
+            quarantine_metadata = os.stat(quarantine.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            _materialize_release_snapshot(path, entries)
+            return
+        if _identity(quarantine_metadata) != identity:
+            raise InstallError(f"managed release changed concurrently during rollback: {path}")
+        claimed_name = _claim_entry_for_removal(parent_fd, quarantine.name, "quarantine-restore")
+        claimed_fd = os.open(claimed_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(claimed_fd)) != identity:
+                raise InstallError(f"managed release changed concurrently during rollback: {path}")
+            if _snapshot_directory_fd(claimed_fd, quarantine, pathlib.Path()) != entries:
+                raise InstallError(f"managed release changed concurrently during rollback: {path}")
+        finally:
+            os.close(claimed_fd)
+        try:
+            _rename_noreplace_at(parent_fd, claimed_name, parent_fd, path.name)
+        except OSError as error:
+            raise InstallError(f"managed release changed concurrently during rollback: {path}") from error
+        claimed_name = None
+        restored_fd = os.open(path.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(restored_fd)) != identity:
+                raise InstallError(f"managed release changed concurrently during rollback: {path}")
+            if _snapshot_directory_fd(restored_fd, path, pathlib.Path()) != entries:
+                raise InstallError(f"managed release changed concurrently during rollback: {path}")
+        finally:
+            os.close(restored_fd)
+    finally:
+        if claimed_name is not None:
+            try:
+                if _entry_exists(parent_fd, claimed_name):
+                    _restore_claimed_entry(parent_fd, claimed_name, quarantine.name)
+            except BaseException:
+                pass
+        os.close(parent_fd)
 
 
 def _remove_quarantined_release(
@@ -3974,10 +4020,27 @@ def _remove_quarantined_release(
                 raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
         finally:
             os.close(final_fd)
+        delete_name = _claim_entry_for_removal(parent_fd, final_name, "quarantine-delete")
         try:
-            os.rmdir(final_name, dir_fd=parent_fd)
-        except OSError as error:
-            raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+            try:
+                delete_fd = os.open(delete_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+                try:
+                    if _identity(os.fstat(delete_fd)) != identity:
+                        raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+                    if _temporary_tree_inventory_fd(delete_fd):
+                        raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+                finally:
+                    os.close(delete_fd)
+                os.rmdir(delete_name, dir_fd=parent_fd)
+            except OSError as error:
+                raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+        except BaseException:
+            try:
+                if _entry_exists(parent_fd, delete_name):
+                    _restore_claimed_entry(parent_fd, delete_name, final_name)
+            except BaseException:
+                pass
+            raise
     except BaseException:
         # The claimed directory is deliberately not force-removed on failure;
         # preserving it allows recovery if a concurrent actor changed it.

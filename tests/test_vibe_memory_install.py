@@ -4336,7 +4336,7 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             snapshot = vibe_memory_install._snapshot_owned_release(quarantine)
             interruption = KeyboardInterrupt()
             with mock.patch(
-                "vibe_memory_install._snapshot_complete_release_tree",
+                "vibe_memory_install._snapshot_directory_fd",
                 side_effect=interruption,
             ):
                 with self.assertRaises(KeyboardInterrupt) as raised:
@@ -4429,6 +4429,73 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                     expected_current=expected,
                 )
             self.assertEqual(target.read_bytes(), b"foreign\n")
+
+    def test_restore_regular_file_rejects_ancestor_symlink_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            parent = root / "safe" / "nested"
+            parent.mkdir(parents=True)
+            outside = root / "outside" / "nested"
+            outside.mkdir(parents=True)
+            target = parent / "managed"
+            outside_target = outside / "managed"
+            outside_target.write_bytes(b"outside\n")
+            real_validate = vibe_memory_install._validate_install_ancestor_chain
+            rebound = False
+
+            def validate_then_rebind(path: pathlib.Path) -> None:
+                nonlocal rebound
+                real_validate(path)
+                if not rebound and path == parent:
+                    rebound = True
+                    moved = root / "safe-original"
+                    (root / "safe").rename(moved)
+                    (root / "safe").symlink_to(root / "outside", target_is_directory=True)
+
+            with mock.patch(
+                "vibe_memory_install._validate_install_ancestor_chain",
+                side_effect=validate_then_rebind,
+            ), self.assertRaises((OSError, ValueError, vibe_memory_install.InstallError)):
+                vibe_memory_install._restore_regular_file(
+                    target,
+                    ((1, 1), b"manager\n", 0o600),
+                    expected_current=None,
+                )
+            self.assertTrue(rebound)
+            self.assertEqual(outside_target.read_bytes(), b"outside\n")
+
+    def test_unlink_regular_file_rejects_ancestor_symlink_rebind(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            parent = root / "safe" / "nested"
+            parent.mkdir(parents=True)
+            target = parent / "managed"
+            target.write_bytes(b"manager\n")
+            target.chmod(0o600)
+            outside = root / "outside" / "nested"
+            outside.mkdir(parents=True)
+            outside_target = outside / "managed"
+            outside_target.write_bytes(b"outside\n")
+            real_validate = vibe_memory_install._validate_install_ancestor_chain
+            rebound = False
+
+            def validate_then_rebind(path: pathlib.Path) -> None:
+                nonlocal rebound
+                real_validate(path)
+                if not rebound and path == parent:
+                    rebound = True
+                    moved = root / "safe-original"
+                    (root / "safe").rename(moved)
+                    (root / "safe").symlink_to(root / "outside", target_is_directory=True)
+
+            expected = vibe_memory_install._snapshot_regular_file(target)
+            with mock.patch(
+                "vibe_memory_install._validate_install_ancestor_chain",
+                side_effect=validate_then_rebind,
+            ), self.assertRaises((OSError, ValueError, vibe_memory_install.InstallError)):
+                vibe_memory_install._unlink_regular_file(target, expected=expected)
+            self.assertTrue(rebound)
+            self.assertEqual(outside_target.read_bytes(), b"outside\n")
 
     def test_verify_private_release_closes_directory_fd(self) -> None:
         with tempfile.TemporaryDirectory() as value:
