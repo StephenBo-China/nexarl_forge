@@ -1134,6 +1134,14 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
         agent_candidate_protocol(project_root),
         changes,
     )
+    registered = any(
+        isinstance(item, dict)
+        and isinstance(item.get("root"), str)
+        and normalize_project_root(item["root"]) == project_root
+        for item in registry().get("projects", [])
+    )
+    if registered:
+        register_project(project_root, make_current=True)
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 

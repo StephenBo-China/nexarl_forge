@@ -32,6 +32,53 @@ import vibe_memory_paths
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_init_project_refreshes_and_selects_an_existing_registered_project(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "project"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "current_project": str(temp / "other"),
+                        "projects": [
+                            {"root": str(root.resolve()), "name": "stale-project"},
+                            {"root": str(temp / "other"), "name": "other"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                memory_project.init_project(root)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(registry["current_project"], str(root.resolve()))
+            self.assertEqual(
+                next(item for item in registry["projects"] if item["root"] == str(root.resolve()))["name"],
+                root.name,
+            )
+
+    def test_init_project_does_not_create_a_registry_for_an_unregistered_project(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "project"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                memory_project.init_project(root)
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            self.assertFalse(registry_path.exists())
+
     def test_init_project_does_not_register_an_unregistered_project(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             temp = pathlib.Path(value)
