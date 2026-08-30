@@ -3288,7 +3288,11 @@ def _uninstall_lifecycle_hook(
     return result
 
 
-ReleaseSnapshot = tuple[tuple[int, int], dict[str, tuple[str, bytes | None]]]
+ReleaseSnapshot = tuple[
+    tuple[int, int],
+    dict[str, tuple[str, bytes | None]],
+    dict[str, tuple[int, int, int]],
+]
 
 
 def _snapshot_complete_release_tree(path: pathlib.Path) -> dict[str, tuple[str, bytes | None]]:
@@ -3302,10 +3306,15 @@ def _snapshot_complete_release_tree(path: pathlib.Path) -> dict[str, tuple[str, 
 def _snapshot_owned_release(path: pathlib.Path) -> ReleaseSnapshot:
     before = path.stat(follow_symlinks=False)
     entries = _snapshot_source_release(path)
+    fd = os.open(path, _DIRECTORY_OPEN_FLAGS)
+    try:
+        ledger = _temporary_tree_inventory_fd(fd)
+    finally:
+        os.close(fd)
     after = path.stat(follow_symlinks=False)
     if _identity(before) != _identity(after):
         raise InstallError(f"managed release changed while snapshotting: {path}")
-    return _identity(after), entries
+    return _identity(after), entries, ledger
 
 
 def _materialize_release_snapshot(
@@ -3335,7 +3344,7 @@ def _quarantine_owned_release(
     path: pathlib.Path,
     snapshot: ReleaseSnapshot,
 ) -> pathlib.Path:
-    identity, entries = snapshot
+    identity, entries, _ledger = snapshot
     quarantine = path.with_name(f".{path.name}.uninstall-{uuid.uuid4().hex}")
     _darwin_rename(path, quarantine, RENAME_EXCL)
     try:
@@ -3356,7 +3365,7 @@ def _restore_quarantined_release(
     quarantine: pathlib.Path,
     snapshot: ReleaseSnapshot,
 ) -> None:
-    identity, entries = snapshot
+    identity, entries, _ledger = snapshot
     if os.path.lexists(path):
         raise InstallError(f"managed release changed concurrently during rollback: {path}")
     try:
@@ -3382,7 +3391,7 @@ def _remove_quarantined_release(
     snapshot: ReleaseSnapshot,
 ) -> None:
     """Delete a quarantined release only when identity and full content still match."""
-    identity, entries = snapshot
+    identity, entries, ledger = snapshot
     try:
         metadata = quarantine.stat(follow_symlinks=False)
     except FileNotFoundError as error:
@@ -3396,7 +3405,24 @@ def _remove_quarantined_release(
         raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
     if current_entries != expected_entries:
         raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
-    shutil.rmtree(quarantine)
+    directory_fd = os.open(quarantine, _DIRECTORY_OPEN_FLAGS)
+    try:
+        if _identity(os.fstat(directory_fd)) != identity:
+            raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+        if _temporary_tree_inventory_fd(directory_fd) != ledger:
+            raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+        _delete_tree_contents_fd(directory_fd, ledger)
+    except TemporaryCleanupConflict as error:
+        raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+    finally:
+        os.close(directory_fd)
+    try:
+        final_metadata = quarantine.stat(follow_symlinks=False)
+        if _identity(final_metadata) != identity:
+            raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+        quarantine.rmdir()
+    except OSError as error:
+        raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
 
 
 def _remove_managed_current_exact(
