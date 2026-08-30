@@ -92,6 +92,14 @@ class InstallError(RuntimeError):
     """Raised when an install lifecycle operation safely refuses to continue."""
 
 
+def _is_release_path_excluded(relative: pathlib.PurePath) -> bool:
+    """Keep source snapshots and public release scans on one asset boundary."""
+    return relative.name == "__pycache__" or relative.suffix == ".pyc" or any(
+        relative == excluded or excluded in relative.parents
+        for excluded in _RELEASE_EXCLUDED_PREFIXES
+    )
+
+
 LAUNCH_AGENT_LABEL = "com.noema.vibe-memory"
 LaunchctlRunner = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -504,13 +512,8 @@ def _snapshot_directory_fd(
 ) -> dict[str, tuple[str, bytes | None]]:
     entries: dict[str, tuple[str, bytes | None]] = {}
     for name in os.listdir(directory_fd):
-        if name == "__pycache__" or name.endswith(".pyc"):
-            continue
         relative = prefix / name
-        if any(
-            relative == excluded or excluded in relative.parents
-            for excluded in _RELEASE_EXCLUDED_PREFIXES
-        ):
+        if _is_release_path_excluded(relative):
             continue
         display_path = display_root / relative
         try:

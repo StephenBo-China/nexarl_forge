@@ -11,16 +11,10 @@ import subprocess
 import sys
 from collections.abc import Iterable
 
+import vibe_memory_install
 
-_ROOT_FILES = (
-    "README.md",
-    "AGENTS.md",
-    "CLAUDE.md",
-    "LICENSE",
-    "SECURITY.md",
-    "release.json",
-    "install.sh",
-)
+_ROOT_FILES = (*vibe_memory_install._REQUIRED_FILES, *vibe_memory_install._OPTIONAL_FILES)
+_RELEASE_DIRECTORIES = vibe_memory_install._REQUIRED_DIRECTORIES
 _LOCAL_CLIENT_RUNTIME_CONFIGS = frozenset({".codex/hooks.json", ".claude/settings.json"})
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("personal_path", re.compile(r"/U" + r"sers/")),
@@ -51,43 +45,31 @@ def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
         if candidate.is_symlink() or candidate.is_file():
             yield candidate
 
-    docs = root / "docs"
-    if docs.is_symlink():
-        yield docs
-    elif docs.is_dir():
-        # Keep the historical docs boundary: only top-level Markdown files are
-        # release candidates; nested plans/specs remain out of scope.
-        yield from sorted(
-            path
-            for path in docs.iterdir()
-            if _is_top_level_doc_candidate(path)
-        )
-
-    scripts = root / "scripts"
-    if scripts.is_symlink():
-        yield scripts
-    elif scripts.is_dir():
-        yield from _iter_release_tree(scripts, suffix=".py")
-
-    templates = root / "templates"
-    if templates.is_symlink():
-        yield templates
-    elif templates.is_dir():
-        yield from _iter_release_tree(templates)
+    for name in _RELEASE_DIRECTORIES:
+        directory = root / name
+        if directory.is_symlink():
+            yield directory
+        elif directory.is_dir():
+            yield from _iter_release_tree(
+                directory, root_relative=pathlib.PurePosixPath(name)
+            )
 
 
-def _is_top_level_doc_candidate(path: pathlib.Path) -> bool:
-    return path.suffix == ".md" and (path.is_symlink() or path.is_file())
-
-
-def _iter_release_tree(directory: pathlib.Path, *, suffix: str | None = None) -> Iterable[pathlib.Path]:
+def _iter_release_tree(
+    directory: pathlib.Path,
+    *,
+    root_relative: pathlib.PurePosixPath,
+) -> Iterable[pathlib.Path]:
     """Walk release assets without following directory symlinks."""
     for path in sorted(directory.iterdir()):
+        relative = root_relative / path.name
+        if vibe_memory_install._is_release_path_excluded(relative):
+            continue
         if path.is_symlink():
             yield path
         elif path.is_dir():
-            yield from _iter_release_tree(path, suffix=suffix)
-        elif suffix is None or path.suffix == suffix:
+            yield from _iter_release_tree(path, root_relative=relative)
+        elif path.is_file():
             yield path
 
 

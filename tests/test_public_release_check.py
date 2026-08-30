@@ -17,10 +17,64 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import public_release_check
 import verify_release
+import vibe_memory_install
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
-    def test_docs_scan_preserves_markdown_boundary_for_symlinks_and_nested_plans(self) -> None:
+    def test_scanner_release_candidates_match_installer_file_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            for directory in ("scripts", "templates", "docs"):
+                (root / directory).mkdir(parents=True)
+            (root / "README.md").write_text("# Readme\n", encoding="utf-8")
+            (root / "release.json").write_text("{}\n", encoding="utf-8")
+            (root / "LICENSE").write_text("license\n", encoding="utf-8")
+            for relative in (
+                "scripts/nested/tool.py",
+                "templates/nested/template.txt",
+                "docs/nested/guide.md",
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("asset\n", encoding="utf-8")
+            plans = root / "docs/superpowers/plans"
+            plans.mkdir(parents=True)
+            (plans / "historical.md").write_text("historical\n", encoding="utf-8")
+            (root / "AGENTS.md").write_text("internal\n", encoding="utf-8")
+            (root / "CLAUDE.md").write_text("internal\n", encoding="utf-8")
+
+            installer_files = {
+                relative
+                for relative, (entry_type, _content) in vibe_memory_install
+                ._snapshot_source_release(root)
+                .items()
+                if entry_type == "file"
+            }
+            scanner_files = {
+                path.relative_to(root).as_posix()
+                for path in public_release_check._file_candidates(root)
+                if path.is_file()
+            }
+
+        self.assertEqual(scanner_files, installer_files)
+
+    def test_scanner_finds_private_path_in_nested_release_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            docs = root / "docs/nested/reference"
+            docs.mkdir(parents=True)
+            (docs / "guide.md").write_text(
+                "Workspace: /Users/example\n", encoding="utf-8"
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertIn(
+            {"path": "docs/nested/reference/guide.md", "pattern": "personal_path", "match": "/Users/"},
+            violations,
+        )
+
+    def test_docs_scan_covers_nested_assets_but_excludes_historical_plans(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = pathlib.Path(temporary)
             root = base / "public-tree"
@@ -36,7 +90,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             )
             (docs / "note.txt").symlink_to(external / "note.txt")
             (docs / "guide.md").symlink_to(external / "guide.md")
-            nested = docs / "nested" / "plans"
+            nested = docs / "superpowers" / "plans"
             nested.mkdir(parents=True)
             (nested / "secret.md").write_text(
                 "token = 'unique-nested-secret'\n", encoding="utf-8"
@@ -46,7 +100,10 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertEqual(
             [(violation["path"], violation["pattern"]) for violation in violations],
-            [("docs/guide.md", "release_asset_symlink")],
+            [
+                ("docs/guide.md", "release_asset_symlink"),
+                ("docs/note.txt", "release_asset_symlink"),
+            ],
         )
 
     def test_scan_tree_rejects_external_release_file_symlink_without_reading_target(self) -> None:
