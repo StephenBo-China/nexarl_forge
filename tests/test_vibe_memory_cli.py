@@ -293,7 +293,9 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         discover.assert_called_once_with()
         validate.assert_called_once_with(pathlib.Path("/portable/source"))
         install.assert_called_once_with(pathlib.Path("/portable/source"), self.paths, activate=False)
-        activate_version.assert_called_once_with(self.paths, "1.0.0")
+        activate_version.assert_called_once_with(
+            self.paths, "1.0.0", expected_current=None
+        )
         prepare.assert_called_once_with(self.paths)
         render.assert_called_once_with(
             self.paths,
@@ -559,6 +561,78 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(os.readlink(current), "releases/0.9.0")
         self.assertEqual(codex.read_text(encoding="utf-8"), "{malformed")
         self.assertEqual(plist.read_text(encoding="utf-8"), "sentinel plist\n")
+
+    def test_install_rejects_foreign_current_symlink_without_replacing_it(self) -> None:
+        foreign_target = self.home / "foreign-runtime"
+        foreign_target.mkdir()
+        current = self.paths.install_root / "current"
+        current.parent.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(foreign_target)
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.validate_runtime_source",
+            return_value={"version": "1.0.0"},
+        ), mock.patch("vibe_memory_cli.vibe_memory_install.install_runtime") as install:
+            code, output, stderr = self.invoke(
+                ["install", "--source-root", "/portable/source"]
+            )
+
+        self.assertEqual(code, 1)
+        self.assertEqual(output["phase"], "preflight")
+        self.assertEqual(stderr, "")
+        install.assert_not_called()
+        self.assertTrue(current.is_symlink())
+        self.assertEqual(os.readlink(current), str(foreign_target))
+
+    def test_install_reraises_keyboard_interrupt_after_restoring_written_assets(self) -> None:
+        interrupted = KeyboardInterrupt()
+        original_config = self.paths.install_root / "config.json"
+        original_config.parent.mkdir(parents=True, exist_ok=True)
+        original_settings = vibe_memory_cli.vibe_memory_settings.default_settings()
+        original_config.write_text(json.dumps(original_settings) + "\n", encoding="utf-8")
+
+        def install_config(*_args: object, **_kwargs: object) -> dict[str, object]:
+            original_config.write_text("{\"managed\": true}\n", encoding="utf-8")
+            raise interrupted
+
+        with mock.patch(
+            "vibe_memory_cli.vibe_memory_install.discover_python",
+            return_value=sys.executable,
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.validate_runtime_source",
+            return_value={"version": "1.0.0"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.render_launch_agent",
+            return_value="<plist />",
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.render_runtime_config",
+            return_value="{}\n",
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.render_launcher",
+            return_value="#!/bin/sh\n",
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_hooks.preview",
+            return_value={"status": "missing"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.read_install_state",
+            return_value={},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_runtime",
+            return_value={"version": "1.0.0"},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install._activate_managed_version"
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.prepare_data",
+            return_value={"files": []},
+        ), mock.patch(
+            "vibe_memory_cli.vibe_memory_install.install_runtime_config",
+            side_effect=install_config,
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.invoke(["install", "--source-root", "/portable/source"])
+
+        self.assertIs(raised.exception, interrupted)
+        self.assertEqual(json.loads(original_config.read_text(encoding="utf-8")), original_settings)
 
     def test_install_commit_failure_rolls_back_hooks_plist_and_current(self) -> None:
         codex = self.home / ".codex/hooks.json"

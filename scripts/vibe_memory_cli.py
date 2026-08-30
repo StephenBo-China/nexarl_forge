@@ -286,7 +286,20 @@ def _snapshot_current(path: pathlib.Path) -> str | None:
         return None
     if not stat.S_ISLNK(metadata.st_mode):
         raise ValueError("current runtime must be a managed symlink")
-    return os.readlink(path)
+    target = os.readlink(path)
+    target_path = pathlib.PurePosixPath(target)
+    if (
+        target_path.parent != pathlib.PurePosixPath("releases")
+        or not vibe_memory_install._VERSION_PATTERN.fullmatch(target_path.name)
+    ):
+        raise ValueError("current runtime symlink target is not managed")
+    try:
+        release_metadata = (path.parent / "releases" / target_path.name).lstat()
+    except FileNotFoundError as error:
+        raise ValueError("current runtime symlink target is missing") from error
+    if not stat.S_ISDIR(release_metadata.st_mode):
+        raise ValueError("current runtime symlink target is not a release directory")
+    return target
 
 
 def _restore_current(path: pathlib.Path, before: str | None, installed_version: str) -> None:
@@ -365,6 +378,7 @@ def _install_command_locked(
         snapshots[launcher] = _snapshot_managed_file(launcher)
         snapshots[install_state_path] = _snapshot_managed_file(install_state_path)
         current_before = _snapshot_current(runtime)
+        managed_current_before = vibe_memory_install._snapshot_managed_current(paths)
     except Exception:
         _json({"status": "failed", "phase": "preflight", "error": "installation preflight failed"})
         return 1
@@ -385,7 +399,11 @@ def _install_command_locked(
         if not release_preexisted and release_path.exists():
             metadata = release_path.stat(follow_symlinks=False)
             release_identity = (metadata.st_dev, metadata.st_ino)
-        vibe_memory_install._activate_managed_version(paths, installed["version"])
+        vibe_memory_install._activate_managed_version(
+            paths,
+            installed["version"],
+            expected_current=managed_current_before,
+        )
         data = vibe_memory_install.prepare_data(paths)
         rollback_paths.add(runtime_config_path)
         try:
@@ -470,7 +488,7 @@ def _install_command_locked(
             "hook_smoke": smoke,
         })
         return 0
-    except Exception:
+    except BaseException as error:
         rollback_errors = []
         if previous_action is not None and transitional_action is not None:
             try:
@@ -479,21 +497,21 @@ def _install_command_locked(
                     expected_generation=str(transitional_action["generation"]),
                     previous=previous_action,
                 )
-            except Exception:
+            except BaseException:
                 rollback_errors.append("service action state")
         if lifecycle_attempted:
             try:
                 vibe_memory_install.bootout_launch_agent(paths)
-            except Exception:
+            except BaseException:
                 rollback_errors.append("launchctl bootout")
         for target in rollback_paths:
             try:
                 _restore_managed_file(target, snapshots[target], written.get(target))
-            except Exception:
+            except BaseException:
                 rollback_errors.append(str(target))
         try:
             _restore_current(runtime, current_before, validated["version"])
-        except Exception:
+        except BaseException:
             rollback_errors.append(str(runtime))
         if current_before is not None:
             previous_version = current_before.removeprefix("releases/")
@@ -501,7 +519,7 @@ def _install_command_locked(
                 vibe_memory_install.activate_launch_agent(
                     paths, expected_version=previous_version
                 )
-            except Exception:
+            except BaseException:
                 rollback_errors.append("previous launch agent restart")
         if release_identity is not None:
             try:
@@ -510,7 +528,7 @@ def _install_command_locked(
                     preexisted=release_preexisted,
                     expected_identity=release_identity,
                 )
-            except Exception:
+            except BaseException:
                 rollback_errors.append(str(release_path))
         if not rollback_errors:
             for target in attempted_hook_targets:
@@ -520,8 +538,14 @@ def _install_command_locked(
                         if artifact.is_symlink() or not artifact.is_file():
                             raise ValueError("hook backup changed type during rollback")
                         artifact.unlink()
-                    except Exception:
+                    except BaseException:
                         rollback_errors.append(str(artifact))
+        if not isinstance(error, Exception):
+            try:
+                setattr(error, "_rollback_conflicts", rollback_errors)
+            except BaseException:
+                pass
+            raise
         _json({
             "status": "failed",
             "phase": "commit",
