@@ -233,6 +233,50 @@ class UISkillPublicationTest(unittest.TestCase):
         self.assertEqual((self.codex_dir / "VERSION").read_text(), "old")
         self.assertEqual((self.claude_dir / "VERSION").read_text(), "old")
 
+    def test_publication_audit_failure_restores_registry_and_targets(self) -> None:
+        fixture = ROOT / "tests/fixtures/ui_skills/minimal"
+        draft = registry.create_draft(
+            name="sample-ui",
+            source={"type": "local"},
+            package_root=fixture,
+            scope={"type": "global"},
+            targets=["codex", "claude"],
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+        targets = {"codex": self.codex_dir, "claude": self.claude_dir}
+        idempotency_key = "audit-failure"
+
+        original_audit = registry._audit
+
+        def fail_publication_audit(event: str, record: dict[str, object]) -> None:
+            if event == "draft_published":
+                raise OSError("audit unavailable")
+            original_audit(event, record)
+
+        with mock.patch.object(registry, "_audit", side_effect=fail_publication_audit):
+            with self.assertRaises(publisher.PublishError):
+                publisher.publish(
+                    approved,
+                    targets=targets,
+                    idempotency_key=idempotency_key,
+                )
+
+        current = registry.load_registry()
+        self.assertEqual(registry.get_draft(draft["id"])["status"], "publish_failed")
+        self.assertNotIn(idempotency_key, current["idempotency"])
+        self.assertFalse(current["deployments"])
+        self.assertFalse(self.codex_dir.exists())
+        self.assertFalse(self.claude_dir.exists())
+
+        retried = publisher.publish(
+            approved,
+            targets=targets,
+            idempotency_key=idempotency_key,
+        )
+        self.assertEqual(retried["status"], "published")
+        self.assertEqual(registry.get_draft(draft["id"])["status"], "published")
+        self.assertIn(idempotency_key, registry.load_registry()["idempotency"])
+
     def test_idempotency_key_cannot_be_reused_for_different_targets(self) -> None:
         targets = {"codex": self.codex_dir, "claude": self.claude_dir}
         publisher.publish(
