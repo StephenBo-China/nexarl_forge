@@ -586,15 +586,15 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             latest = registry.latest_deployment(args.name)
             if latest is None:
                 raise ValueError(f"skill has no deployment: {args.name}")
-            targets = {
-                agent: pathlib.Path(path)
-                for agent, path in latest.get("targets", {}).items()
-            }
+            targets = _destination_paths(version, args.project)
+            if {agent: str(path) for agent, path in targets.items()} != latest.get("targets", {}):
+                raise publisher.ScopeConflict("latest deployment targets do not match approved scope")
             report = publisher.rollback(
                 version,
                 targets=targets,
                 expected_target_digests=dict(latest["target_digests"]),
                 idempotency_key=args.idempotency_key,
+                project_root=(pathlib.Path(args.project).expanduser().resolve() if args.project else None),
             )
             _sync_active_skill(version, report, enabled=True)
             return report
@@ -602,15 +602,21 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
             latest = registry.latest_deployment(args.name)
             if latest is None:
                 raise ValueError(f"skill has no deployment: {args.name}")
-            targets = {
-                agent: pathlib.Path(path)
-                for agent, path in latest.get("targets", {}).items()
+            scope_record = {
+                "name": args.name,
+                "scope": latest.get("scope", {}),
+                "targets": list(latest.get("targets", {})),
             }
+            targets = _destination_paths(scope_record, args.project)
+            if {agent: str(path) for agent, path in targets.items()} != latest.get("targets", {}):
+                raise publisher.ScopeConflict("latest deployment targets do not match approved scope")
             report = publisher.disable(
                 name=args.name,
                 targets=targets,
                 expected_target_digests=dict(latest["target_digests"]),
                 idempotency_key=args.idempotency_key,
+                approved=scope_record,
+                project_root=(pathlib.Path(args.project).expanduser().resolve() if args.project else None),
             )
             _sync_active_skill(
                 {

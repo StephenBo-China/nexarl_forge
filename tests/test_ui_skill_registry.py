@@ -43,7 +43,12 @@ description: Broken duplicate skill.
             encoding="utf-8",
         )
         self.environment = mock.patch.dict(
-            os.environ, {"UI_DESIGN_HOME": str(self.temp / "ui-design-home")}
+            os.environ,
+            {
+                "UI_DESIGN_HOME": str(self.temp / "ui-design-home"),
+                "CODEX_UI_SKILLS_DIR": str(self.temp / "global-codex"),
+                "CLAUDE_UI_SKILLS_DIR": str(self.temp / "global-claude"),
+            },
         )
         self.environment.start()
 
@@ -342,8 +347,8 @@ description: Broken duplicate skill.
         approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
         before_publish = len(calls)
         targets = {
-            "codex": self.temp / "published/codex/ui-ux-pro-max",
-            "claude": self.temp / "published/claude/ui-ux-pro-max",
+            "codex": self.temp / "global-codex/ui-ux-pro-max",
+            "claude": self.temp / "global-claude/ui-ux-pro-max",
         }
 
         publisher.publish(
@@ -581,6 +586,46 @@ description: Broken duplicate skill.
         )
         self.assertFalse(project_b.exists())
         self.assertEqual(registry.get_draft(draft["id"])["status"], "approved")
+
+    def test_cli_rollback_and_disable_recheck_recorded_scope(self) -> None:
+        project_a = self.temp / "project-a"
+        project_b = self.temp / "project-b"
+        draft = registry.create_draft(
+            name="sample-ui",
+            source={"type": "local"},
+            package_root=self.fixture,
+            scope={"type": "project", "root": str(project_a)},
+            targets=["codex", "claude"],
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+        self.run_cli(
+            [
+                "ui-skill", "publish", draft["id"], "--digest", approved["digest"],
+                "--idempotency-key", "scope-lifecycle-publish",
+            ]
+        )
+        registry_before = (self.temp / "ui-design-home/registry.json").read_bytes()
+
+        rollback_args = memory_review.build_parser().parse_args(
+            [
+                "ui-skill", "rollback", "sample-ui", "--version", approved["version_id"],
+                "--project", str(project_b), "--idempotency-key", "scope-rollback-conflict",
+            ]
+        )
+        with self.assertRaises(publisher.ScopeConflict):
+            memory_review.ui_design_cli.dispatch(rollback_args)
+
+        disable_args = memory_review.build_parser().parse_args(
+            [
+                "ui-skill", "disable", "sample-ui", "--project", str(project_b),
+                "--idempotency-key", "scope-disable-conflict",
+            ]
+        )
+        with self.assertRaises(publisher.ScopeConflict):
+            memory_review.ui_design_cli.dispatch(disable_args)
+        self.assertEqual(
+            (self.temp / "ui-design-home/registry.json").read_bytes(), registry_before
+        )
 
 
 if __name__ == "__main__":

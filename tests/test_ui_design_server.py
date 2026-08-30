@@ -539,6 +539,12 @@ class UIDesignServerTest(unittest.TestCase):
                     else:
                         self.assertEqual(getattr(namespace, key), value)
 
+    def test_ui_skill_actions_only_send_current_project_for_project_scoped_skills(self) -> None:
+        source = (ROOT / "scripts/memory_review_server.py").read_text(encoding="utf-8")
+        action = source[source.index("async function handleUISkillAction"):]
+        self.assertIn("uiSkillProjectPayload", action)
+        self.assertNotIn("project: projectState.current_project", action)
+
     def test_mutating_routes_require_idempotency_and_dangerous_confirmation(self) -> None:
         with self.assertRaises(ValueError) as missing_key:
             server.ui_design_post(

@@ -34,8 +34,8 @@ class UISkillPublicationTest(unittest.TestCase):
         self.package.mkdir()
         (self.package / "SKILL.md").write_text("new package", encoding="utf-8")
         (self.package / "VERSION").write_text("new", encoding="utf-8")
-        self.codex_dir = self.temp / "targets/codex/sample-ui"
-        self.claude_dir = self.temp / "targets/claude/sample-ui"
+        self.codex_dir = self.temp / "global-codex/sample-ui"
+        self.claude_dir = self.temp / "global-claude/sample-ui"
         self.approved = {
             "id": "draft-test",
             "name": "sample-ui",
@@ -43,6 +43,7 @@ class UISkillPublicationTest(unittest.TestCase):
             "version_id": "2.0.0+new",
             "package_path": str(self.package),
             "digest": registry.package_digest(self.package),
+            "scope": {"type": "global"},
         }
 
     def tearDown(self) -> None:
@@ -172,6 +173,43 @@ class UISkillPublicationTest(unittest.TestCase):
         self.assertFalse(project.exists())
         self.assertFalse((self.temp / "ui-design-home/registry.json").exists())
 
+    def test_missing_or_malformed_scope_fails_closed_before_writes(self) -> None:
+        for scope in (None, "global", {}):
+            with self.subTest(scope=scope):
+                approved = dict(self.approved)
+                approved["scope"] = scope
+                with self.assertRaises(publisher.ScopeConflict):
+                    publisher.publish(
+                        approved,
+                        targets={"codex": self.codex_dir},
+                        idempotency_key=f"missing-scope-{scope}",
+                    )
+                self.assertFalse(self.codex_dir.exists())
+                self.assertFalse((self.temp / "ui-design-home/registry.json").exists())
+
+    def test_global_scope_requires_canonical_configured_target_roots(self) -> None:
+        custom = self.temp / "custom-root/sample-ui"
+        with self.assertRaises(publisher.ScopeConflict):
+            publisher.publish(
+                {**self.approved, "scope": {"type": "global"}},
+                targets={"codex": custom},
+                idempotency_key="global-custom-root",
+            )
+
+    def test_scope_rechecks_inside_lock_and_rejects_symlink_ancestor(self) -> None:
+        project = self.temp / "project"
+        project.mkdir()
+        (project / ".agents").symlink_to(self.temp / "outside", target_is_directory=True)
+        approved = {**self.approved, "scope": {"type": "project", "root": str(project)}}
+
+        with self.assertRaises(publisher.ScopeConflict):
+            publisher.publish(
+                approved,
+                targets={"codex": project / ".agents/skills/sample-ui"},
+                idempotency_key="symlink-ancestor",
+            )
+        self.assertFalse((self.temp / "outside").exists())
+
     def test_disable_and_rollback_use_the_same_two_target_transaction(self) -> None:
         current_codex = self.seed_target(self.codex_dir, "current")
         current_claude = self.seed_target(self.claude_dir, "current")
@@ -243,10 +281,17 @@ class UISkillPublicationTest(unittest.TestCase):
             "claude": self.temp / "other/claude/sample-ui",
         }
 
-        with self.assertRaises(publisher.IdempotencyConflict):
-            publisher.publish(
-                self.approved, targets=different, idempotency_key="stable-key"
-            )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_UI_SKILLS_DIR": str(self.temp / "other/codex"),
+                "CLAUDE_UI_SKILLS_DIR": str(self.temp / "other/claude"),
+            },
+        ):
+            with self.assertRaises(publisher.IdempotencyConflict):
+                publisher.publish(
+                    self.approved, targets=different, idempotency_key="stable-key"
+                )
 
     def test_discovery_classifies_managed_unknown_ignored_and_drifted(self) -> None:
         root = self.temp / "scan/codex"

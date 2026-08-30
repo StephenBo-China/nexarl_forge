@@ -2015,6 +2015,18 @@ async function uiSkillMutation(route, payload, dangerous, promptText) {
   return result;
 }
 
+function uiSkillProjectPayloadForDraft(draftId) {
+  const skill = (uiSkillState.items || []).find(item => item.id === draftId);
+  return skill && skill.scope && skill.scope.type === 'project' && projectState.current_project
+    ? {project: projectState.current_project} : {};
+}
+
+function uiSkillProjectPayloadForName(name) {
+  const skill = (uiSkillState.items || []).find(item => item.name === name);
+  return skill && skill.scope && skill.scope.type === 'project' && projectState.current_project
+    ? {project: projectState.current_project} : {};
+}
+
 async function handleUISkillAction(button) {
   const action = button.dataset.uiAction;
   const draft_id = button.dataset.id;
@@ -2022,15 +2034,15 @@ async function handleUISkillAction(button) {
   if (action === 'validate') await uiSkillMutation('validate', {draft_id}, false);
   if (action === 'request-revision') await uiSkillMutation('request-revision', {draft_id, reason: prompt('请输入修改要求') || '需要修改'}, false);
   if (action === 'reject') await uiSkillMutation('reject', {draft_id, reason: prompt('请输入拒绝原因') || ''}, true, '确认拒绝此 UI Skill 草稿？');
-  if (action === 'publish') await uiSkillMutation('publish', {draft_id, digest, project: projectState.current_project}, true, '确认原子发布到 Codex 与 Claude Code？');
+  if (action === 'publish') await uiSkillMutation('publish', {draft_id, digest, ...uiSkillProjectPayloadForDraft(draft_id)}, true, '确认原子发布到 Codex 与 Claude Code？');
   if (action === 'approve-publish') {
     if (!confirm('确认批准此摘要，并原子发布到 Codex 与 Claude Code？')) return;
     await api('/api/ui-skills/approve', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, confirmed: true, idempotency_key: idempotencyKey('skill-approve')})});
-    await api('/api/ui-skills/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, project: projectState.current_project, confirmed: true, idempotency_key: idempotencyKey('skill-publish')})});
+    await api('/api/ui-skills/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, ...uiSkillProjectPayloadForDraft(draft_id), confirmed: true, idempotency_key: idempotencyKey('skill-publish')})});
     await loadUISkills();
   }
-  if (action === 'rollback') await uiSkillMutation('rollback', {name: button.dataset.name, version: button.dataset.version, project: projectState.current_project}, true, '确认将 Codex 与 Claude Code 同时回滚到此版本？');
-  if (action === 'disable') await uiSkillMutation('disable', {name: button.dataset.name, project: projectState.current_project}, true, '确认同时停用 Codex 与 Claude Code 中的此 Skill？');
+  if (action === 'rollback') await uiSkillMutation('rollback', {name: button.dataset.name, version: button.dataset.version, ...uiSkillProjectPayloadForName(button.dataset.name)}, true, '确认将 Codex 与 Claude Code 同时回滚到此版本？');
+  if (action === 'disable') await uiSkillMutation('disable', {name: button.dataset.name, ...uiSkillProjectPayloadForName(button.dataset.name)}, true, '确认同时停用 Codex 与 Claude Code 中的此 Skill？');
 }
 
 function renderMemoryStrategy() {
