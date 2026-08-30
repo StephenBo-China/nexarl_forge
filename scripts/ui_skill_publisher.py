@@ -404,8 +404,14 @@ def _run_transaction(
             if operation == "publish" and approved is not None:
                 try:
                     _transition_if_registered(approved, "publish_failed", report)
-                except registry.InvalidTransition:
-                    pass
+                except Exception as compensation_error:
+                    report["recovery_errors"].append(
+                        f"publication failure status audit: {compensation_error}"
+                    )
+                    try:
+                        store.atomic_write_json(_report_path(transaction_id), report)
+                    except OSError:
+                        pass
             if isinstance(error, TargetDigestConflict):
                 raise
             raise PublishError(str(error)) from error

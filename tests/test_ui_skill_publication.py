@@ -277,6 +277,42 @@ class UISkillPublicationTest(unittest.TestCase):
         self.assertEqual(registry.get_draft(draft["id"])["status"], "published")
         self.assertIn(idempotency_key, registry.load_registry()["idempotency"])
 
+    def test_all_publication_audits_failing_still_returns_publish_error_and_retries(self) -> None:
+        fixture = ROOT / "tests/fixtures/ui_skills/minimal"
+        draft = registry.create_draft(
+            name="sample-ui",
+            source={"type": "local"},
+            package_root=fixture,
+            scope={"type": "global"},
+            targets=["codex", "claude"],
+        )
+        approved = registry.approve_draft(draft["id"], expected_digest=draft["digest"])
+        targets = {"codex": self.codex_dir, "claude": self.claude_dir}
+        idempotency_key = "all-audits-failure"
+
+        with mock.patch.object(registry, "_audit", side_effect=OSError("audit unavailable")):
+            with self.assertRaises(publisher.PublishError) as raised:
+                publisher.publish(
+                    approved,
+                    targets=targets,
+                    idempotency_key=idempotency_key,
+                )
+        self.assertEqual(str(raised.exception), "audit unavailable")
+
+        current = registry.load_registry()
+        self.assertEqual(registry.get_draft(draft["id"])["status"], "publish_failed")
+        self.assertNotIn(idempotency_key, current["idempotency"])
+        self.assertFalse(current["deployments"])
+        self.assertFalse(self.codex_dir.exists())
+        self.assertFalse(self.claude_dir.exists())
+
+        retried = publisher.publish(
+            approved,
+            targets=targets,
+            idempotency_key=idempotency_key,
+        )
+        self.assertEqual(retried["status"], "published")
+
     def test_idempotency_key_cannot_be_reused_for_different_targets(self) -> None:
         targets = {"codex": self.codex_dir, "claude": self.claude_dir}
         publisher.publish(
