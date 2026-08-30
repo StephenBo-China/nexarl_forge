@@ -138,7 +138,20 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
     runtime = paths.install_root / "current"
     runtime_cli = runtime / "scripts" / "vibe_memory_cli.py"
     launcher = paths.launcher
-    current_ok = runtime.is_symlink() and runtime_cli.is_file()
+    current_version: str | None = None
+    try:
+        current_version = vibe_memory_install._current_version(paths)
+    except (OSError, ValueError, vibe_memory_install.InstallError):
+        pass
+    release_owned = False
+    if current_version is not None:
+        release = paths.install_root / "releases" / current_version
+        try:
+            release_owned = (
+                vibe_memory_install._managed_release_version(release) == current_version
+            )
+        except (OSError, ValueError, vibe_memory_install.InstallError):
+            release_owned = False
     launcher_present = False
     try:
         launcher_metadata = launcher.stat(follow_symlinks=False)
@@ -166,12 +179,16 @@ def collect_status(paths: vibe_memory_paths.RuntimePaths) -> dict[str, dict[str,
             )
         except (OSError, ValueError, vibe_memory_install.InstallError):
             launcher_ok = False
-    if not current_ok:
+    if not runtime.is_symlink():
+        runtime_status = "missing"
+    elif not runtime_cli.is_file():
         runtime_status = "missing"
     elif not interpreter_ok:
         runtime_status = "python_error"
     elif not launcher_ok:
         runtime_status = "launcher_invalid" if launcher_present else "launcher_missing"
+    elif current_version is None or not release_owned:
+        runtime_status = "not_manager_owned"
     else:
         runtime_status = "current"
     runtime_ok = runtime_status == "current"

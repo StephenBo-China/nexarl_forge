@@ -31,6 +31,7 @@ _LAUNCH_AGENT_TEMPLATE = _PROJECT_ROOT / "templates/macos/com.noema.vibe-memory.
 _REQUIRED_DIRECTORIES = ("scripts", "templates", "docs")
 _REQUIRED_FILES = ("README.md", "release.json")
 _OPTIONAL_FILES = ("LICENSE",)
+_RELEASE_EXCLUDED_PREFIXES = (pathlib.PurePosixPath("docs/superpowers/plans"),)
 _SEMVER_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
 _VERSION_PATTERN = re.compile(
     r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
@@ -506,6 +507,11 @@ def _snapshot_directory_fd(
         if name == "__pycache__" or name.endswith(".pyc"):
             continue
         relative = prefix / name
+        if any(
+            relative == excluded or excluded in relative.parents
+            for excluded in _RELEASE_EXCLUDED_PREFIXES
+        ):
+            continue
         display_path = display_root / relative
         try:
             metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)

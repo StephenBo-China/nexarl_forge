@@ -87,6 +87,25 @@ class RuntimeInstallTest(unittest.TestCase):
             self.assertFalse((release / "__pycache__").exists())
             self.assertFalse((release / "ignored.pyc").exists())
 
+    def test_install_excludes_historical_superpowers_plans_from_release(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = self.make_source(root)
+            plans = source / "docs/superpowers/plans"
+            plans.mkdir(parents=True)
+            historical = plans / "historical-plan.md"
+            historical.write_text(
+                "workspace: /Users/example\n", encoding="utf-8"
+            )
+            paths = self.make_paths(root)
+
+            vibe_memory_install.install_runtime(source, paths)
+
+            self.assertTrue(historical.is_file())
+            self.assertFalse(
+                (paths.install_root / "releases/1.0.0/docs/superpowers/plans").exists()
+            )
+
     def test_runtime_config_persists_validated_interpreter_and_launcher_uses_current(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))

@@ -159,6 +159,30 @@ class VibeMemoryLifecycleTest(unittest.TestCase):
         self.assertEqual(result["runtime"]["status"], "launcher_invalid")
         self.assertEqual(result["runtime"]["action"], "run install")
 
+    def test_status_rejects_foreign_current_runtime_even_when_it_contains_the_cli(self) -> None:
+        foreign = pathlib.Path(self.temporary.name) / "foreign-runtime"
+        (foreign / "scripts").mkdir(parents=True)
+        (foreign / "scripts" / "vibe_memory_cli.py").write_text(
+            "# foreign runtime\n", encoding="utf-8"
+        )
+        (self.paths.install_root / "current").parent.mkdir(parents=True, exist_ok=True)
+        (self.paths.install_root / "current").symlink_to(foreign)
+        vibe_memory_cli.vibe_memory_install.install_runtime_config(
+            self.paths,
+            port=9123,
+            app_version="1.0.0",
+            python_executable=sys.executable,
+        )
+        vibe_memory_cli.vibe_memory_install.install_launcher(
+            self.paths, python_executable=sys.executable
+        )
+
+        result = vibe_memory_cli.collect_status(self.paths)
+
+        self.assertFalse(result["runtime"]["ok"])
+        self.assertEqual(result["runtime"]["status"], "not_manager_owned")
+        self.assertEqual(result["runtime"]["action"], "run install")
+
     def test_doctor_reports_missing_persisted_python_as_python_error(self) -> None:
         release = self.paths.install_root / "releases/1.0.0/scripts"
         release.mkdir(parents=True)
