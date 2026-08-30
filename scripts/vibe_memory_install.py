@@ -171,6 +171,11 @@ def bootout_launch_agent(
         return {"status": "absent", "absent": True}
     if identity != "managed":
         raise InstallError("foreign launch agent occupies the fixed service label")
+    confirmed_identity = _launch_agent_identity(paths, runner=runner, uid=uid)
+    if confirmed_identity == "absent":
+        return {"status": "absent", "absent": True}
+    if confirmed_identity != identity:
+        raise InstallError("foreign launch agent replaced the managed service")
     completed = _run_launchctl(["bootout", service], runner=runner)
     if completed.returncode == 0:
         return {"status": "booted_out", "absent": False}
@@ -2172,8 +2177,6 @@ def _atomic_write_private_json(path: pathlib.Path, value: dict[str, Any]) -> Non
 def _validate_install_state(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise InstallError("install state must be an object")
-    if not value:
-        return {}
     required = {
         "schema_version",
         "current_version",
@@ -2339,7 +2342,23 @@ def _remove_current_entry_exact_at(
         except OSError:
             pass
         raise InstallError("current runtime changed concurrently during rollback")
-    os.unlink(quarantine_name, dir_fd=install_fd)
+    delete_name = _claim_entry_for_removal(install_fd, quarantine_name, "current")
+    try:
+        deleting = _current_entry_snapshot_at(install_fd, delete_name)
+        if deleting != expected:
+            try:
+                _restore_claimed_entry(install_fd, delete_name, quarantine_name)
+            except InstallError:
+                pass
+            raise InstallError("current runtime changed concurrently during rollback")
+        os.unlink(delete_name, dir_fd=install_fd)
+    except BaseException:
+        if _entry_exists(install_fd, delete_name):
+            try:
+                _restore_claimed_entry(install_fd, delete_name, quarantine_name)
+            except InstallError:
+                pass
+        raise
 
 
 def _recover_current_exchange_mismatch(
@@ -2609,6 +2628,91 @@ def _snapshot_regular_file(path: pathlib.Path) -> FileSnapshot | None:
     if _identity(after) != _identity(metadata):
         raise InstallError(f"managed file changed while snapshotting: {path}")
     return _identity(after), content, stat.S_IMODE(after.st_mode)
+
+
+def _snapshot_regular_file_at(
+    parent_fd: int,
+    name: str,
+    display_path: pathlib.Path,
+) -> FileSnapshot:
+    """Snapshot a regular file through an already anchored parent directory."""
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError as error:
+        raise InstallError(f"managed file changed concurrently during uninstall: {display_path}") from error
+    if not stat.S_ISREG(before.st_mode):
+        raise InstallError(f"managed file must be regular: {display_path}")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+    except OSError as error:
+        raise InstallError(f"managed file changed concurrently during uninstall: {display_path}") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(before):
+            raise InstallError(f"managed file changed concurrently during uninstall: {display_path}")
+        with os.fdopen(descriptor, "rb", closefd=False) as handle:
+            content = handle.read()
+        after = os.fstat(descriptor)
+        if not stat.S_ISREG(after.st_mode) or _identity(after) != _identity(opened):
+            raise InstallError(f"managed file changed concurrently during uninstall: {display_path}")
+        return _identity(after), content, stat.S_IMODE(after.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def _claim_entry_for_removal(parent_fd: int, name: str, stem: str) -> str:
+    """Move an entry to a unique name without replacing an existing entry."""
+    while True:
+        claimed_name = f".{stem}.remove-{uuid.uuid4().hex}"
+        try:
+            if sys.platform == "darwin":
+                _darwin_renameat(
+                    parent_fd,
+                    name,
+                    parent_fd,
+                    claimed_name,
+                    RENAME_EXCL,
+                )
+            else:
+                os.rename(
+                    name,
+                    claimed_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            return claimed_name
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise InstallError(f"managed file changed concurrently during uninstall: {name}") from error
+
+
+def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str) -> None:
+    try:
+        if sys.platform == "darwin":
+            _darwin_renameat(
+                parent_fd,
+                claimed_name,
+                parent_fd,
+                original_name,
+                RENAME_EXCL,
+            )
+        else:
+            # The original name is expected to be absent after a successful claim.
+            os.rename(
+                claimed_name,
+                original_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+    except OSError as error:
+        raise InstallError(
+            f"managed file changed concurrently during uninstall: {original_name}"
+        ) from error
 
 
 def _restore_regular_file(
@@ -3194,22 +3298,78 @@ def _is_managed_launcher(path: pathlib.Path) -> bool:
     )
 
 
+def _validate_managed_asset_snapshot(
+    path: pathlib.Path,
+    kind: str,
+    snapshot: FileSnapshot | None,
+) -> None:
+    """Validate ownership against the exact bytes captured for deletion."""
+    if snapshot is None:
+        return
+    try:
+        text = snapshot[1].decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise InstallError(f"{kind} asset is not manager-owned") from error
+    if kind == "launch-agent":
+        owned = "com.noema.vibe-memory" in text and "memory_review_server.py" in text
+    elif kind == "launcher":
+        owned = LAUNCHER_MARKER in text
+    else:
+        raise InstallError(f"unknown managed asset kind: {kind}")
+    if not owned:
+        raise InstallError(f"{kind} asset is not manager-owned")
+
+
 def _unlink_regular_file(
     path: pathlib.Path,
     *,
     expected: FileSnapshot | None | object = _NO_SNAPSHOT_CHECK,
 ) -> bool:
-    if expected is not _NO_SNAPSHOT_CHECK:
+    if expected is None:
         current = _snapshot_regular_file(path)
-        if current != expected:
+        if current is not None:
             raise InstallError(f"managed file changed concurrently during uninstall: {path}")
-    if not path.exists():
         return False
-    if path.is_symlink():
-        raise InstallError(f"managed path must not be a symlink: {path}")
-    if not path.is_file():
-        raise InstallError(f"managed path must be a regular file: {path}")
-    path.unlink()
+    parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    try:
+        try:
+            current = _snapshot_regular_file_at(parent_fd, path.name, path)
+        except InstallError:
+            if expected is _NO_SNAPSHOT_CHECK:
+                raise
+            raise
+        if expected is not _NO_SNAPSHOT_CHECK and current != expected:
+            raise InstallError(f"managed file changed concurrently during uninstall: {path}")
+        claimed_name = _claim_entry_for_removal(parent_fd, path.name, path.name)
+        try:
+            claimed = _snapshot_regular_file_at(parent_fd, claimed_name, path)
+            if expected is not _NO_SNAPSHOT_CHECK and claimed != expected:
+                _restore_claimed_entry(parent_fd, claimed_name, path.name)
+                raise InstallError(f"managed file changed concurrently during uninstall: {path}")
+            delete_name = _claim_entry_for_removal(parent_fd, claimed_name, path.name)
+            try:
+                deleted = _snapshot_regular_file_at(parent_fd, delete_name, path)
+                if expected is not _NO_SNAPSHOT_CHECK and deleted != expected:
+                    _restore_claimed_entry(parent_fd, delete_name, claimed_name)
+                    _restore_claimed_entry(parent_fd, claimed_name, path.name)
+                    raise InstallError(f"managed file changed concurrently during uninstall: {path}")
+                os.unlink(delete_name, dir_fd=parent_fd)
+            except BaseException:
+                if _entry_exists(parent_fd, delete_name):
+                    try:
+                        _restore_claimed_entry(parent_fd, delete_name, claimed_name)
+                    except InstallError:
+                        pass
+                raise
+        except BaseException:
+            if _entry_exists(parent_fd, claimed_name):
+                try:
+                    _restore_claimed_entry(parent_fd, claimed_name, path.name)
+                except InstallError:
+                    pass
+            raise
+    finally:
+        os.close(parent_fd)
     return True
 
 
@@ -3230,6 +3390,8 @@ def _validate_owned_fixed_asset(path: pathlib.Path, kind: str, paths: RuntimePat
             except (UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ValueError("malformed install state") from error
             _validate_install_state(value)
+            if not isinstance(value, dict) or not {"schema_version", "current_version", "port", "installed_clients"}.issubset(value):
+                raise ValueError("install state ownership fields are missing")
         else:
             value = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(value, dict) or not isinstance(value.get("generation"), str) or not re.fullmatch(r"[0-9a-f]{32}", value["generation"]):
@@ -3399,28 +3561,47 @@ def _remove_quarantined_release(
     try:
         current_entries = _snapshot_complete_release_tree(quarantine)
         expected_entries = dict(entries)
-    except BaseException as error:
+    except Exception as error:
         raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
     if current_entries != expected_entries:
         raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
-    directory_fd = os.open(quarantine, _DIRECTORY_OPEN_FLAGS)
+    parent_fd = os.open(quarantine.parent, _DIRECTORY_OPEN_FLAGS)
     try:
-        if _identity(os.fstat(directory_fd)) != identity:
-            raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
-        if _temporary_tree_inventory_fd(directory_fd) != ledger:
-            raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
-        _delete_tree_contents_fd(directory_fd, ledger)
-    except TemporaryCleanupConflict as error:
-        raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+        directory_fd = os.open(quarantine.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(directory_fd)) != identity:
+                raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+            if _temporary_tree_inventory_fd(directory_fd) != ledger:
+                raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+        finally:
+            os.close(directory_fd)
+
+        # Claim the verified directory under a private name before deleting it.
+        # A concurrent replacement at the public quarantine path is then left intact.
+        claimed_name = _claim_entry_for_removal(parent_fd, quarantine.name, "quarantine")
+        claimed_fd = os.open(claimed_name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd)
+        try:
+            if _identity(os.fstat(claimed_fd)) != identity:
+                raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+            if _temporary_tree_inventory_fd(claimed_fd) != ledger:
+                raise InstallError(f"release quarantine contents changed during cleanup: {quarantine}")
+            _delete_tree_contents_fd(claimed_fd, ledger)
+            if _identity(os.fstat(claimed_fd)) != identity:
+                raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
+        except TemporaryCleanupConflict as error:
+            raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+        finally:
+            os.close(claimed_fd)
+        try:
+            os.rmdir(claimed_name, dir_fd=parent_fd)
+        except OSError as error:
+            raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+    except BaseException:
+        # The claimed directory is deliberately not force-removed on failure;
+        # preserving it allows recovery if a concurrent actor changed it.
+        raise
     finally:
-        os.close(directory_fd)
-    try:
-        final_metadata = quarantine.stat(follow_symlinks=False)
-        if _identity(final_metadata) != identity:
-            raise InstallError(f"release quarantine changed during cleanup: {quarantine}")
-        quarantine.rmdir()
-    except OSError as error:
-        raise InstallError(f"release quarantine changed during cleanup: {quarantine}") from error
+        os.close(parent_fd)
 
 
 def _remove_managed_current_exact(
@@ -3515,6 +3696,8 @@ def uninstall(
         path: _snapshot_regular_file(path)
         for path in [*hook_paths, *managed_files, *validated_data_paths]
     }
+    _validate_managed_asset_snapshot(launch_agent, "launch-agent", snapshots[launch_agent])
+    _validate_managed_asset_snapshot(launcher, "launcher", snapshots[launcher])
     # Bind fixed-asset ownership to the exact bytes captured for deletion.
     for path, kind in zip(managed_files[2:], ("config", "install-state", "service-action")):
         _validate_owned_fixed_asset(path, kind, paths)

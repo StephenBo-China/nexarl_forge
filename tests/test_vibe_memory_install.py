@@ -492,6 +492,15 @@ class RuntimeInstallTest(unittest.TestCase):
 
             self.assertEqual(outside.read_text(encoding="utf-8"), "{}")
 
+    def test_read_install_state_rejects_empty_document(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            state_path = vibe_memory_install.install_state_path(paths)
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(vibe_memory_install.InstallError):
+                vibe_memory_install.read_install_state(paths)
+
     def test_read_install_state_rejects_invalid_client_structure(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
@@ -2556,12 +2565,21 @@ class RuntimeInstallTest(unittest.TestCase):
 
 
 class FakeLaunchctlRunner:
-    def __init__(self, results: list[subprocess.CompletedProcess[str]] | None = None) -> None:
+    def __init__(
+        self,
+        results: list[subprocess.CompletedProcess[str]] | None = None,
+        *,
+        by_kind: dict[str, list[subprocess.CompletedProcess[str]]] | None = None,
+    ) -> None:
         self.results = list(results or [])
+        self.by_kind = {kind: list(items) for kind, items in (by_kind or {}).items()}
         self.commands: list[list[str]] = []
 
     def __call__(self, command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
+        kind = command[1] if len(command) > 1 else ""
+        if self.by_kind.get(kind):
+            return self.by_kind[kind].pop(0)
         if self.results:
             return self.results.pop(0)
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -2606,15 +2624,28 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
     def test_bootout_managed_print_then_bootout_and_absent_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
-            managed = FakeLaunchctlRunner([
-                self.launchctl_print(paths, managed=True),
-                subprocess.CompletedProcess([], 0, "", ""),
-            ])
+            managed = FakeLaunchctlRunner(by_kind={
+                "print": [self.launchctl_print(paths, managed=True)] * 2,
+                "bootout": [subprocess.CompletedProcess([], 0, "", "")],
+            })
             self.assertEqual(vibe_memory_install.bootout_launch_agent(paths, runner=managed, uid=501)["status"], "booted_out")
-            self.assertEqual([command[1] for command in managed.commands], ["print", "bootout"])
+            self.assertEqual([command[1] for command in managed.commands], ["print", "print", "bootout"])
             absent = FakeLaunchctlRunner([self.absent_print()])
             self.assertTrue(vibe_memory_install.bootout_launch_agent(paths, runner=absent, uid=501)["absent"])
             self.assertEqual(len(absent.commands), 1)
+
+    def test_bootout_refuses_identity_replacement_after_print_before_bootout(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            runner = FakeLaunchctlRunner(by_kind={
+                "print": [
+                    self.launchctl_print(paths, managed=True),
+                    self.launchctl_print(paths, managed=False),
+                ],
+            })
+            with self.assertRaisesRegex(vibe_memory_install.InstallError, "foreign"):
+                vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
+            self.assertEqual([command[1] for command in runner.commands], ["print", "print"])
 
     def test_bootout_fails_closed_for_ambiguous_or_failed_identity_print(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -2694,24 +2725,27 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
     def test_bootout_rejects_non_absent_failure(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
-            runner = FakeLaunchctlRunner([
-                self.launchctl_print(paths, managed=True),
-                subprocess.CompletedProcess([], 5, "", "Boot-out failed: 5: Input/output error"),
-            ])
+            runner = FakeLaunchctlRunner(by_kind={
+                "print": [self.launchctl_print(paths, managed=True)] * 2,
+                "bootout": [subprocess.CompletedProcess([], 5, "", "Boot-out failed: 5: Input/output error")],
+            })
             with self.assertRaisesRegex(vibe_memory_install.InstallError, "bootout"):
                 vibe_memory_install.bootout_launch_agent(paths, runner=runner, uid=501)
 
     def test_activate_health_failure_boots_out_new_service(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             paths = self.make_paths(pathlib.Path(value))
-            runner = FakeLaunchctlRunner([
-                self.absent_print(),
-                self.absent_print(),
-                subprocess.CompletedProcess([], 0, "", ""),
-                subprocess.CompletedProcess([], 0, "", ""),
-                self.launchctl_print(paths, managed=True),
-                subprocess.CompletedProcess([], 0, "", ""),
-            ])
+            runner = FakeLaunchctlRunner(by_kind={
+                "print": [
+                    self.absent_print(),
+                    self.absent_print(),
+                    self.launchctl_print(paths, managed=True),
+                    self.launchctl_print(paths, managed=True),
+                ],
+                "bootstrap": [subprocess.CompletedProcess([], 0, "", "")],
+                "kickstart": [subprocess.CompletedProcess([], 0, "", "")],
+                "bootout": [subprocess.CompletedProcess([], 0, "", "")],
+            })
             with self.assertRaisesRegex(vibe_memory_install.InstallError, "health"):
                 vibe_memory_install.activate_launch_agent(
                     paths, runner=runner,
@@ -2898,6 +2932,37 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 result = vibe_memory_install.uninstall(paths)
             self.assertTrue((unknown / "sentinel").exists())
             self.assertEqual(result["preserved_releases"], [str(unknown)])
+
+    def test_uninstall_does_not_touch_release_added_after_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            source = RuntimeInstallTest().make_source(root)
+            vibe_memory_install.install_runtime(source, paths)
+            original = paths.install_root / "releases/1.0.0"
+            external = paths.install_root / "releases/2.0.0"
+            real_snapshot = vibe_memory_install._snapshot_owned_release
+            injected = False
+
+            def snapshot_with_external_release(path: pathlib.Path) -> object:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    shutil.copytree(original, external)
+                    manifest = json.loads((external / "release.json").read_text(encoding="utf-8"))
+                    manifest["app_version"] = "2.0.0"
+                    (external / "release.json").write_text(json.dumps(manifest), encoding="utf-8")
+                    (external / "EXTERNAL_SENTINEL").write_text("keep\n", encoding="utf-8")
+                    (external / "EXTERNAL_SENTINEL").chmod(0o600)
+                return real_snapshot(path)
+
+            with mock.patch("vibe_memory_install.bootout_launch_agent", return_value={"status": "booted_out"}), mock.patch(
+                "vibe_memory_install._snapshot_owned_release", side_effect=snapshot_with_external_release
+            ):
+                vibe_memory_install.uninstall(paths)
+
+            self.assertTrue(injected)
+            self.assertEqual((external / "EXTERNAL_SENTINEL").read_text(encoding="utf-8"), "keep\n")
 
     def test_uninstall_never_deletes_semver_release_with_valid_manifest_and_user_extra(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -3131,6 +3196,53 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
             bootout.assert_not_called()
             self.assertEqual(state.read_bytes(), foreign)
             self.assertTrue((paths.install_root / "current").is_symlink())
+
+    def test_uninstall_rejects_launch_asset_replaced_after_marker_check(self) -> None:
+        for asset in ("launch_agent", "launcher"):
+            with self.subTest(asset=asset), tempfile.TemporaryDirectory() as value:
+                root = pathlib.Path(value)
+                paths = self.make_paths(root)
+                vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+                launch_agent = paths.launch_agent
+                launcher = paths.launcher
+                launch_agent.parent.mkdir(parents=True, exist_ok=True)
+                launcher.parent.mkdir(parents=True, exist_ok=True)
+                launch_agent.write_text(vibe_memory_install.render_launch_agent(paths), encoding="utf-8")
+                launcher.write_text(vibe_memory_install.render_launcher(paths), encoding="utf-8")
+                target = launch_agent if asset == "launch_agent" else launcher
+                foreign = b"#!/bin/sh\necho foreign\n"
+                real_snapshot = vibe_memory_install._snapshot_regular_file
+                replaced = False
+
+                def replace_after_marker(path: pathlib.Path) -> object:
+                    nonlocal replaced
+                    if path == target and not replaced:
+                        replaced = True
+                        target.write_bytes(foreign)
+                    return real_snapshot(path)
+
+                with mock.patch("vibe_memory_install._snapshot_regular_file", side_effect=replace_after_marker), mock.patch(
+                    "vibe_memory_install.bootout_launch_agent"
+                ) as bootout, self.assertRaises(vibe_memory_install.InstallError):
+                    vibe_memory_install.uninstall(paths)
+
+                bootout.assert_not_called()
+                self.assertEqual(target.read_bytes(), foreign)
+
+    def test_uninstall_rejects_empty_install_state_as_foreign(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(RuntimeInstallTest().make_source(root), paths)
+            state = vibe_memory_install.install_state_path(paths)
+            state.parent.mkdir(parents=True, exist_ok=True)
+            state.write_text("{}\n", encoding="utf-8")
+            with mock.patch("vibe_memory_install.bootout_launch_agent") as bootout, self.assertRaises(
+                vibe_memory_install.InstallError
+            ):
+                vibe_memory_install.uninstall(paths)
+            bootout.assert_not_called()
+            self.assertEqual(state.read_text(encoding="utf-8"), "{}\n")
 
     def test_uninstall_preserves_fixed_asset_replaced_after_hook_commit(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -3717,6 +3829,117 @@ class LaunchAgentLifecycleTest(unittest.TestCase):
                 self.assertIsNotNone(captured_fd)
                 with self.assertRaises(OSError):
                     os.fstat(captured_fd)
+
+    def test_remove_current_entry_preserves_foreign_replacement_after_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            paths = self.make_paths(pathlib.Path(value))
+            install_root = paths.install_root
+            install_root.mkdir(parents=True, exist_ok=True)
+            current = install_root / "current"
+            current.symlink_to("releases/1.0.0")
+            install_fd = os.open(install_root, vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+            expected = vibe_memory_install._current_entry_snapshot_at(install_fd, "current")
+            assert expected is not None
+            real_renameat = vibe_memory_install._darwin_renameat
+            injected = False
+
+            def replace_after_claim(
+                source_parent_fd: int,
+                source_name: str,
+                destination_parent_fd: int,
+                destination_name: str,
+                flags: int,
+            ) -> None:
+                nonlocal injected
+                real_renameat(
+                    source_parent_fd,
+                    source_name,
+                    destination_parent_fd,
+                    destination_name,
+                    flags,
+                )
+                if source_name == "current" and not injected:
+                    injected = True
+                    displaced = install_root / ".expected-current"
+                    os.replace(install_root / destination_name, displaced)
+                    foreign = install_root / ".foreign-current"
+                    foreign.symlink_to("releases/2.0.0")
+                    os.replace(foreign, install_root / destination_name)
+
+            try:
+                with mock.patch("vibe_memory_install._darwin_renameat", side_effect=replace_after_claim), self.assertRaises(
+                    vibe_memory_install.InstallError
+                ):
+                    vibe_memory_install._remove_current_entry_exact_at(install_fd, "current", expected)
+            finally:
+                os.close(install_fd)
+
+            self.assertTrue(injected)
+            self.assertTrue(current.is_symlink())
+            self.assertEqual(os.readlink(current), "releases/2.0.0")
+
+    def test_remove_quarantined_release_preserves_foreign_rebind_before_rmdir(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            quarantine = root / "quarantine"
+            quarantine.mkdir(mode=0o700)
+            for directory in ("scripts", "templates", "docs"):
+                (quarantine / directory).mkdir(mode=0o700)
+            (quarantine / "README.md").write_bytes(b"# Runtime\n")
+            (quarantine / "release.json").write_bytes(json.dumps(MANIFEST).encode())
+            (quarantine / "scripts" / "server.py").write_bytes(b"print('server')\n")
+            (quarantine / "templates" / "template.txt").write_bytes(b"template\n")
+            (quarantine / "docs" / "guide.md").write_bytes(b"# Guide\n")
+            for file in quarantine.rglob("*"):
+                if file.is_file():
+                    file.chmod(0o600)
+            snapshot = vibe_memory_install._snapshot_owned_release(quarantine)
+            real_claim = vibe_memory_install._claim_entry_for_removal
+            injected = False
+
+            def rebind_after_claim(parent_fd: int, name: str, stem: str) -> str:
+                nonlocal injected
+                claimed_name = real_claim(parent_fd, name, stem)
+                if name == quarantine.name and not injected:
+                    injected = True
+                    quarantine.mkdir(mode=0o700)
+                    (quarantine / "FOREIGN").write_bytes(b"keep")
+                    (quarantine / "FOREIGN").chmod(0o600)
+                return claimed_name
+
+            with mock.patch("vibe_memory_install._claim_entry_for_removal", side_effect=rebind_after_claim):
+                vibe_memory_install._remove_quarantined_release(quarantine, snapshot)
+
+            self.assertTrue(injected)
+            self.assertTrue(quarantine.is_dir())
+            self.assertEqual((quarantine / "FOREIGN").read_bytes(), b"keep")
+
+    def test_verify_private_release_closes_directory_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            root = pathlib.Path(value)
+            source = RuntimeInstallTest().make_source(root)
+            paths = self.make_paths(root)
+            vibe_memory_install.install_runtime(source, paths)
+            release = paths.install_root / "releases" / "1.0.0"
+            entries = vibe_memory_install._snapshot_source_release(source)
+            releases_fd = os.open(paths.install_root / "releases", vibe_memory_install._DIRECTORY_OPEN_FLAGS)
+            anchored = vibe_memory_install._AnchoredPath(releases_fd, "1.0.0", release)
+            child_fd: int | None = None
+            real_open = vibe_memory_install.os.open
+
+            def capture_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+                nonlocal child_fd
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if path == "1.0.0":
+                    child_fd = descriptor
+                return descriptor
+
+            with mock.patch("vibe_memory_install.os.open", side_effect=capture_open):
+                vibe_memory_install._verify_and_make_private_release(anchored, entries)
+            os.close(releases_fd)
+            assert child_fd is not None
+            with self.assertRaises(OSError):
+                os.fstat(child_fd)
 
     def test_lifecycle_hook_rollback_uses_immediate_commit_snapshots(self) -> None:
         operations = ("update", "rollback", "repair")
