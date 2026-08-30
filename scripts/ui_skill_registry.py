@@ -314,6 +314,7 @@ def complete_publication(
 ) -> dict[str, Any]:
     with store.exclusive_lock(registry_lock_path()):
         value = load_registry()
+        original_value = copy.deepcopy(value)
         record = value["drafts"].get(draft_id)
         if not isinstance(record, dict):
             raise DraftNotFound(draft_id)
@@ -340,7 +341,11 @@ def complete_publication(
         }
         _write_registry(value)
         updated = copy.deepcopy(record)
-    _audit("draft_published", updated)
+        try:
+            _audit("draft_published", updated)
+        except Exception:
+            _write_registry(original_value)
+            raise
     return updated
 
 
