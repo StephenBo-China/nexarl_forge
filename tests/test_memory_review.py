@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import memory_project
 import memory_review as review_cli
 import memory_review_queue as review
+import memory_review_server as server
 import loop_superpowers
 import ui_design_preferences as preferences
 import vibe_memory_install
@@ -32,6 +33,134 @@ import vibe_memory_paths
 
 
 class MemoryReviewQualityTest(unittest.TestCase):
+    def test_unregistered_project_root_is_personal_only_for_candidate_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            home = temp / "home"
+            registry = home / ".codex" / "memory_review" / "projects.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(json.dumps({"current_project": "", "projects": []}), encoding="utf-8")
+            root = temp / "unregistered"
+            root.mkdir()
+            environment = os.environ.copy()
+            environment.update({
+                "HOME": str(home),
+                "MEMORY_REVIEW_PROJECT_REGISTRY": str(registry),
+                "MEMORY_REVIEW_PROJECT_ROOT": str(root),
+                "PYTHONPATH": str(ROOT / "scripts"),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            })
+            code = (
+                "import json, memory_review_queue as q; "
+                "personal = q.create_agent_candidate('personal', 'long', 'work_style', "
+                "'个人工作方式', '用户希望跨项目保持清晰且可审核的工作方式。'); "
+                "error = ''; "
+                "\ntry: q.create_agent_candidate('project', 'long', 'project_workflow', "
+                "'项目工作方式', '项目候选不得写入未注册工作区。')\n"
+                "except ValueError as exc: error = str(exc); "
+                "print(json.dumps({'root': str(q.PROJECT_ROOT or ''), 'id': personal['id'], 'error': error}))"
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", code], cwd=root, env=environment,
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["root"], "")
+            self.assertIn("registered current project", result["error"])
+            self.assertTrue((home / ".codex/personal_memory/proposals.md").exists())
+            self.assertFalse((root / "codex").exists())
+
+    def test_project_payload_does_not_register_an_unregistered_review_root(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "unregistered"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            registry_path.write_text(
+                json.dumps({"current_project": "", "projects": []}), encoding="utf-8"
+            )
+            original_registry = memory_project.REGISTRY_PATH
+            original_project_root = server.review.PROJECT_ROOT
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                server.review.PROJECT_ROOT = root
+                before = registry_path.read_bytes()
+                payload = server.project_payload()
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+                server.review.PROJECT_ROOT = original_project_root
+
+            self.assertEqual(registry_path.read_bytes(), before)
+            self.assertEqual(payload["current_project"], "")
+            self.assertIsNone(payload["project"])
+            self.assertEqual(payload["registry"]["projects"], [])
+
+    def test_switch_registered_project_rejects_unregistered_root(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            registered = temp / "registered"
+            unregistered = temp / "unregistered"
+            registered.mkdir()
+            unregistered.mkdir()
+            registry_path = temp / "projects.json"
+            original_registry = memory_project.REGISTRY_PATH
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                memory_project.register_project(registered, make_current=False)
+                before = registry_path.read_bytes()
+                with self.assertRaisesRegex(ValueError, "project is not registered"):
+                    server.switch_registered_project(str(unregistered))
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+
+            self.assertEqual(registry_path.read_bytes(), before)
+
+    def test_console_init_project_preserves_registration_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "unregistered"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            original_registry = memory_project.REGISTRY_PATH
+            original_project_root = server.review.PROJECT_ROOT
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                server.review.PROJECT_ROOT = None
+                result = server.init_project_payload(str(root))
+                registry = memory_project.registry()
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+                server.review.PROJECT_ROOT = original_project_root
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(registry_path.exists())
+            self.assertEqual(registry.get("projects", []), [])
+            self.assertEqual(result["projects"]["current_project"], "")
+            self.assertTrue((root / "codex/codex_long_memory.md").exists())
+
+    def test_console_init_registered_project_still_selects_and_refreshes_it(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            root = temp / "registered"
+            root.mkdir()
+            registry_path = temp / "projects.json"
+            original_registry = memory_project.REGISTRY_PATH
+            original_project_root = server.review.PROJECT_ROOT
+            try:
+                memory_project.REGISTRY_PATH = registry_path
+                memory_project.register_project(root, make_current=False)
+                server.review.PROJECT_ROOT = None
+                result = server.init_project_payload(str(root))
+                registry = memory_project.registry()
+            finally:
+                memory_project.REGISTRY_PATH = original_registry
+                server.review.PROJECT_ROOT = original_project_root
+
+            self.assertEqual(result["projects"]["current_project"], str(root.resolve()))
+            self.assertEqual(registry["current_project"], str(root.resolve()))
+            self.assertEqual(len(registry["projects"]), 1)
+
     def test_init_project_refreshes_and_selects_an_existing_registered_project(self) -> None:
         with tempfile.TemporaryDirectory() as value:
             temp = pathlib.Path(value)
