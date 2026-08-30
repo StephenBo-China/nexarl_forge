@@ -2702,13 +2702,17 @@ def _restore_claimed_entry(parent_fd: int, claimed_name: str, original_name: str
                 RENAME_EXCL,
             )
         else:
-            # The original name is expected to be absent after a successful claim.
-            os.rename(
+            # Emulate no-replace rename where renameatx_np is unavailable.  A
+            # hard-link create fails if a concurrent actor already occupied the
+            # destination, and unlinking the claimed name completes the move.
+            os.link(
                 claimed_name,
                 original_name,
                 src_dir_fd=parent_fd,
                 dst_dir_fd=parent_fd,
+                follow_symlinks=False,
             )
+            os.unlink(claimed_name, dir_fd=parent_fd)
     except OSError as error:
         raise InstallError(
             f"managed file changed concurrently during uninstall: {original_name}"
