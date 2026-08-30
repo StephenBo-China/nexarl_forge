@@ -926,6 +926,18 @@ def decision_target_path(target: str) -> pathlib.Path:
     raise ValueError(f"Unsupported approval target: {target}")
 
 
+def validate_approval_target(item: dict[str, Any], target: str) -> None:
+    if not isinstance(target, str):
+        raise ValueError("approval target must be a string")
+    scope = item.get("scope")
+    if scope == "personal" and target not in {"personal_long", "personal_short"}:
+        raise ValueError("personal candidates must target personal memory")
+    if scope == "project" and target != "project_long":
+        raise ValueError("project candidates must target project memory")
+    if scope not in {"personal", "project"}:
+        raise ValueError("candidate has unsupported memory scope")
+
+
 def approve(candidate_id: str, target: str | None = None, content: str | None = None) -> dict[str, Any]:
     item = find_item(candidate_id)
     if target is None:
@@ -935,6 +947,7 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
             target = "personal_short"
         else:
             target = "personal_long"
+    validate_approval_target(item, target)
     approved_content = (content if content is not None else item.get("content", "")).strip()
     if not approved_content:
         raise ValueError("Cannot approve empty memory content")

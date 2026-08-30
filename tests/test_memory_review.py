@@ -724,6 +724,80 @@ class MemoryReviewQualityTest(unittest.TestCase):
             self.assertFalse((temp / "personal_long.md").exists())
             self.assertFalse((temp / "project_long.md").exists())
 
+    def test_personal_candidate_cannot_be_approved_to_project_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_value:
+            temp = pathlib.Path(temp_value)
+            paths = {
+                "PROJECT_ROOT": temp,
+                "CODEX_DIR": temp / "codex",
+                "PROJECT_PROPOSALS": temp / "codex/memory_proposals.md",
+                "PROJECT_LONG": temp / "codex/codex_long_memory.md",
+                "PROJECT_QUEUE": temp / "codex/memory_review_queue.json",
+                "PROJECT_STATE": temp / "codex/memory_review_state.json",
+                "PERSONAL_PROPOSALS": temp / "personal/proposals.md",
+                "PERSONAL_LONG": temp / "personal/long.md",
+                "PERSONAL_SHORT": temp / "personal/short.md",
+            }
+            with mock.patch.multiple(review, **paths):
+                paths["PROJECT_PROPOSALS"].parent.mkdir(parents=True)
+                paths["PERSONAL_PROPOSALS"].parent.mkdir(parents=True)
+                paths["PROJECT_PROPOSALS"].write_text("# Project proposals\n", encoding="utf-8")
+                paths["PERSONAL_PROPOSALS"].write_text("# Personal proposals\n", encoding="utf-8")
+                candidate = review.create_agent_candidate(
+                    "personal", "long", "work_style", "个人工作方式",
+                    "用户希望跨项目保持清晰且可审核的工作方式。",
+                )
+                paths["PROJECT_LONG"].parent.mkdir(parents=True, exist_ok=True)
+                paths["PROJECT_LONG"].write_text("project sentinel\n", encoding="utf-8")
+                state_before = paths["PROJECT_STATE"].read_bytes()
+                project_before = paths["PROJECT_LONG"].read_bytes()
+
+                with self.assertRaisesRegex(ValueError, "personal candidates must target personal memory"):
+                    review.approve(candidate["id"], target="project_long")
+
+                self.assertEqual(paths["PROJECT_LONG"].read_bytes(), project_before)
+                self.assertEqual(paths["PROJECT_STATE"].read_bytes(), state_before)
+                self.assertEqual(review.find_item(candidate["id"])["status"], "pending")
+
+    def test_project_candidate_cannot_be_approved_to_personal_memory(self) -> None:
+        for target in ("personal_long", "personal_short"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temp_value:
+                temp = pathlib.Path(temp_value)
+                paths = {
+                    "PROJECT_ROOT": temp,
+                    "CODEX_DIR": temp / "codex",
+                    "PROJECT_PROPOSALS": temp / "codex/memory_proposals.md",
+                    "PROJECT_LONG": temp / "codex/codex_long_memory.md",
+                    "PROJECT_QUEUE": temp / "codex/memory_review_queue.json",
+                    "PROJECT_STATE": temp / "codex/memory_review_state.json",
+                    "PERSONAL_PROPOSALS": temp / "personal/proposals.md",
+                    "PERSONAL_LONG": temp / "personal/long.md",
+                    "PERSONAL_SHORT": temp / "personal/short.md",
+                }
+                with mock.patch.multiple(review, **paths):
+                    paths["PROJECT_PROPOSALS"].parent.mkdir(parents=True)
+                    paths["PERSONAL_PROPOSALS"].parent.mkdir(parents=True)
+                    paths["PROJECT_PROPOSALS"].write_text("# Project proposals\n", encoding="utf-8")
+                    paths["PERSONAL_PROPOSALS"].write_text("# Personal proposals\n", encoding="utf-8")
+                    candidate = review.create_agent_candidate(
+                        "project", "long", "project_workflow", "项目工作流",
+                        "项目要求所有发布操作经过明确的审核流程。",
+                    )
+                    destination = paths[
+                        "PERSONAL_LONG" if target == "personal_long" else "PERSONAL_SHORT"
+                    ]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(f"{target} sentinel\n", encoding="utf-8")
+                    state_before = paths["PROJECT_STATE"].read_bytes()
+                    destination_before = destination.read_bytes()
+
+                    with self.assertRaisesRegex(ValueError, "project candidates must target project memory"):
+                        review.approve(candidate["id"], target=target)
+
+                    self.assertEqual(destination.read_bytes(), destination_before)
+                    self.assertEqual(paths["PROJECT_STATE"].read_bytes(), state_before)
+                    self.assertEqual(review.find_item(candidate["id"])["status"], "pending")
+
     def test_proposal_atomic_replace_failure_preserves_bytes_and_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_value:
             temp = pathlib.Path(temp_value)
