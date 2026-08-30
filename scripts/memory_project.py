@@ -531,8 +531,14 @@ def agent_candidate_protocol(root: pathlib.Path) -> str:
         except (OSError, ValueError, json.JSONDecodeError):
             interpreter = None
         cli = pathlib.Path(RUNTIME_PATHS.install_root) / "current/scripts/vibe_memory_cli.py"
+        validated_interpreter = None
         if isinstance(interpreter, str) and interpreter and cli.is_file():
-            cli_parts = [interpreter, str(cli)]
+            try:
+                validated_interpreter = vibe_memory_install.validate_python(interpreter)
+            except vibe_memory_install.InstallError:
+                pass
+        if validated_interpreter is not None:
+            cli_parts = [validated_interpreter, str(cli)]
         else:
             cli_parts = [sys.executable, str(APP_ROOT / "scripts/vibe_memory_cli.py")]
     cli_command = " ".join(shlex.quote(part) for part in cli_parts)

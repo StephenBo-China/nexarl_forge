@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 import memory_project
 import memory_review_queue
+import vibe_memory_install
 import vibe_memory_paths
 import vibe_memory_settings
 from ui_design_store import atomic_write_json
@@ -87,8 +88,13 @@ def _candidate_cli_parts(paths: Any | None = None) -> list[str]:
     except (OSError, ValueError, json.JSONDecodeError):
         interpreter = None
     cli = pathlib.Path(runtime_paths.install_root) / "current" / "scripts" / "vibe_memory_cli.py"
-    if cli.is_file():
-        return [str(interpreter or sys.executable), str(cli)]
+    if isinstance(interpreter, str) and interpreter and cli.is_file():
+        try:
+            validated_interpreter = vibe_memory_install.validate_python(interpreter)
+        except vibe_memory_install.InstallError:
+            pass
+        else:
+            return [validated_interpreter, str(cli)]
     return [sys.executable, str(pathlib.Path(__file__).with_name("vibe_memory_cli.py"))]
 
 

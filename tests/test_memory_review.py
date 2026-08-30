@@ -7,6 +7,7 @@ import io
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import signal
 import stat
@@ -43,6 +44,78 @@ class MemoryReviewQualityTest(unittest.TestCase):
             command = text.split("MEMORY_REVIEW_PROJECT_ROOT=", 1)[1].split(" memory propose", 1)[0]
             self.assertIn(str(launcher), command)
             self.assertNotIn("python3", command)
+
+    def test_agent_candidate_protocol_uses_valid_persisted_python_with_current_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            install_root = temp / "install"
+            cli = install_root / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (install_root / "config.json").write_text(
+                json.dumps({"python_executable": sys.executable}), encoding="utf-8"
+            )
+            paths = mock.Mock(launcher=temp / "missing", install_root=install_root)
+            with mock.patch.object(memory_project, "RUNTIME_PATHS", paths):
+                text = memory_project.agent_candidate_protocol(pathlib.Path("/tmp/project"))
+            line = next(
+                line.strip()
+                for line in text.splitlines()
+                if "MEMORY_REVIEW_PROJECT_ROOT=" in line and " memory propose" in line
+            )
+            expected = (
+                f"MEMORY_REVIEW_PROJECT_ROOT=/tmp/project {shlex.quote(sys.executable)} "
+                f"{shlex.quote(str(cli))} memory propose \\"
+            )
+            self.assertEqual(line, expected)
+
+    def test_agent_candidate_protocol_rejects_invalid_persisted_python_fallback_values(self) -> None:
+        invalid_values = [None, "", 123, [], {}, "/missing/python"]
+        for persisted in invalid_values:
+            with self.subTest(persisted=persisted), tempfile.TemporaryDirectory() as value:
+                temp = pathlib.Path(value)
+                install_root = temp / "install"
+                cli = install_root / "current" / "scripts" / "vibe_memory_cli.py"
+                cli.parent.mkdir(parents=True)
+                cli.write_text("# cli\n", encoding="utf-8")
+                config = {} if persisted is None else {"python_executable": persisted}
+                (install_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+                paths = mock.Mock(launcher=temp / "missing", install_root=install_root)
+                with mock.patch.object(memory_project, "RUNTIME_PATHS", paths):
+                    text = memory_project.agent_candidate_protocol(pathlib.Path("/tmp/project"))
+                command = next(
+                    line.strip()
+                    for line in text.splitlines()
+                    if "MEMORY_REVIEW_PROJECT_ROOT=" in line and " memory propose" in line
+                )
+                source = memory_project.APP_ROOT / "scripts" / "vibe_memory_cli.py"
+                expected = (
+                    f"MEMORY_REVIEW_PROJECT_ROOT=/tmp/project {shlex.quote(sys.executable)} "
+                    f"{shlex.quote(str(source))} memory propose \\"
+                )
+                self.assertEqual(command, expected)
+
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            install_root = temp / "install"
+            cli = install_root / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (install_root / "config.json").write_text("{malformed", encoding="utf-8")
+            paths = mock.Mock(launcher=temp / "missing", install_root=install_root)
+            with mock.patch.object(memory_project, "RUNTIME_PATHS", paths):
+                text = memory_project.agent_candidate_protocol(pathlib.Path("/tmp/project"))
+            line = next(
+                line.strip()
+                for line in text.splitlines()
+                if "MEMORY_REVIEW_PROJECT_ROOT=" in line and " memory propose" in line
+            )
+            source = memory_project.APP_ROOT / "scripts" / "vibe_memory_cli.py"
+            expected = (
+                f"MEMORY_REVIEW_PROJECT_ROOT=/tmp/project {shlex.quote(sys.executable)} "
+                f"{shlex.quote(str(source))} memory propose \\"
+            )
+            self.assertEqual(line, expected)
 
     def test_start_script_without_project_does_not_promote_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as value:

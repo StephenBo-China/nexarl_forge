@@ -957,13 +957,45 @@ class VibeMemoryRouterTest(unittest.TestCase):
             cli.parent.mkdir(parents=True)
             cli.write_text("# cli\n", encoding="utf-8")
             (temp / "install" / "config.json").write_text(
-                json.dumps({"python_executable": "/opt/vibe/python3"}), encoding="utf-8"
+                json.dumps({"python_executable": sys.executable}), encoding="utf-8"
             )
             paths = mock.Mock(install_root=temp / "install", launcher=temp / "missing")
             with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=paths):
                 context = build_context(self.event(), project_root=None, pending={})
             command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
-            self.assertEqual(shlex.split(command)[:2], ["/opt/vibe/python3", str(cli)])
+            self.assertEqual(shlex.split(command)[:2], [sys.executable, str(cli)])
+
+    def test_build_context_rejects_invalid_persisted_python_fallback_values(self) -> None:
+        invalid_values = [None, "", 123, [], {}, "/missing/python"]
+        for persisted in invalid_values:
+            with self.subTest(persisted=persisted), tempfile.TemporaryDirectory() as value:
+                temp = pathlib.Path(value)
+                cli = temp / "install" / "current" / "scripts" / "vibe_memory_cli.py"
+                cli.parent.mkdir(parents=True)
+                cli.write_text("# cli\n", encoding="utf-8")
+                config = {} if persisted is None else {"python_executable": persisted}
+                (temp / "install" / "config.json").write_text(
+                    json.dumps(config), encoding="utf-8"
+                )
+                paths = mock.Mock(install_root=temp / "install", launcher=temp / "missing")
+                with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=paths):
+                    context = build_context(self.event(), project_root=None, pending={})
+                command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
+                source = pathlib.Path(vibe_memory_router.__file__).with_name("vibe_memory_cli.py")
+                self.assertEqual(shlex.split(command)[:2], [sys.executable, str(source)])
+
+        with tempfile.TemporaryDirectory() as value:
+            temp = pathlib.Path(value)
+            cli = temp / "install" / "current" / "scripts" / "vibe_memory_cli.py"
+            cli.parent.mkdir(parents=True)
+            cli.write_text("# cli\n", encoding="utf-8")
+            (temp / "install" / "config.json").write_text("{malformed", encoding="utf-8")
+            paths = mock.Mock(install_root=temp / "install", launcher=temp / "missing")
+            with mock.patch("vibe_memory_router.vibe_memory_paths.for_home", return_value=paths):
+                context = build_context(self.event(), project_root=None, pending={})
+            command = context.split("Candidate CLI:\n\n    ", 1)[1].splitlines()[0]
+            source = pathlib.Path(vibe_memory_router.__file__).with_name("vibe_memory_cli.py")
+            self.assertEqual(shlex.split(command)[:2], [sys.executable, str(source)])
 
     def test_build_context_command_executes_hostile_project_root_with_bin_sh(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -977,6 +1009,9 @@ class VibeMemoryRouterTest(unittest.TestCase):
                 "print(json.dumps({'root': os.environ.get('MEMORY_REVIEW_PROJECT_ROOT'), "
                 "'argv': sys.argv[1:]}))\n",
                 encoding="utf-8",
+            )
+            (install_root / "config.json").write_text(
+                json.dumps({"python_executable": sys.executable}), encoding="utf-8"
             )
             project = temp / "project with spaces ' $(touch injected) `touch injected2`"
             fake_paths = mock.Mock(install_root=install_root)
