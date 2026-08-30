@@ -224,7 +224,12 @@ def build_complete_legacy_fixture(base: pathlib.Path) -> LegacyFixture:
         (base / "worktrees" / "beta").mkdir(parents=True)
 
         with mock.patch.dict(
-            os.environ, {"UI_DESIGN_HOME": str(paths.ui_design_home)}
+            os.environ,
+            {
+                "UI_DESIGN_HOME": str(paths.ui_design_home),
+                "CODEX_UI_SKILLS_DIR": str(base / "targets/codex"),
+                "CLAUDE_UI_SKILLS_DIR": str(base / "targets/claude"),
+            },
         ):
             design_manifest = {
                 "schema_version": 1,
