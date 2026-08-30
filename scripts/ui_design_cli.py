@@ -411,10 +411,28 @@ def _validate_draft(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _destination_paths(record: dict[str, Any], project: str | None) -> dict[str, pathlib.Path]:
-    configured_root = record.get("scope", {}).get("root")
-    project_root = pathlib.Path(project or configured_root) if (project or configured_root) else None
+    scope = record.get("scope", {})
+    configured_root = scope.get("root")
+    if scope.get("type") == "project":
+        if not isinstance(configured_root, str) or not configured_root.strip():
+            raise publisher.ScopeConflict("project-scoped approval is missing scope.root")
+        approved_root = pathlib.Path(configured_root).expanduser().resolve()
+        project_root = pathlib.Path(project).expanduser().resolve() if project else approved_root
+        if project_root != approved_root:
+            raise publisher.ScopeConflict(
+                f"publication project does not match approved scope.root: "
+                f"approved {approved_root}, requested {project_root}"
+            )
+    else:
+        if project is not None:
+            raise publisher.ScopeConflict(
+                f"{scope.get('type', 'unknown')} approval cannot publish into a project"
+            )
+        project_root = None
     bases = publisher.resolve_targets(record["scope"], project_root=project_root)
-    return {agent: bases[agent] / record["name"] for agent in record["targets"]}
+    targets = {agent: bases[agent] / record["name"] for agent in record["targets"]}
+    publisher.validate_publication_scope(record, targets, project_root=project_root)
+    return targets
 
 
 def _previous_digests(
@@ -555,6 +573,11 @@ def dispatch(args: argparse.Namespace) -> dict[str, Any]:
                 approved,
                 targets=targets,
                 idempotency_key=args.idempotency_key,
+                project_root=(
+                    pathlib.Path(args.project).expanduser().resolve()
+                    if args.project
+                    else None
+                ),
             )
             _sync_active_skill(approved, report, enabled=True)
             return report

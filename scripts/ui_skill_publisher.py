@@ -30,6 +30,10 @@ class PublishError(RuntimeError):
     pass
 
 
+class ScopeConflict(PublishError):
+    """The approved scope does not authorize the requested publication target."""
+
+
 class TargetDigestConflict(PublishError):
     pass
 
@@ -54,6 +58,58 @@ def resolve_targets(
         root = pathlib.Path(project_root).expanduser()
         return {"codex": root / ".agents/skills", "claude": root / ".claude/skills"}
     raise PublishError(f"unsupported publication scope: {scope}")
+
+
+def _canonical_root(value: pathlib.Path | str) -> pathlib.Path:
+    return pathlib.Path(value).expanduser().resolve()
+
+
+def _is_project_target(path: pathlib.Path) -> bool:
+    return path.parent.name == "skills" and path.parent.parent.name in {".agents", ".claude"}
+
+
+def validate_publication_scope(
+    approved: dict[str, Any],
+    targets: dict[str, pathlib.Path],
+    *,
+    project_root: pathlib.Path | None = None,
+) -> None:
+    """Ensure publication targets remain within the approved scope.
+
+    This check is intentionally performed before idempotency lookup, target
+    preparation, or draft status transitions so a scope violation is
+    fail-closed and leaves no target or registry state behind.
+    """
+    scope = approved.get("scope")
+    if not isinstance(scope, dict) or "type" not in scope:
+        # Keep compatibility with low-level callers that supply a package
+        # record rather than a registry-approved draft.
+        return
+    scope_type = scope.get("type")
+    if scope_type == "project":
+        recorded_root = scope.get("root")
+        if not isinstance(recorded_root, str) or not recorded_root.strip():
+            raise ScopeConflict("project-scoped approval is missing scope.root")
+        approved_root = _canonical_root(recorded_root)
+        if project_root is not None and _canonical_root(project_root) != approved_root:
+            raise ScopeConflict(
+                f"publication project does not match approved scope.root: "
+                f"approved {approved_root}, requested {_canonical_root(project_root)}"
+            )
+        expected = resolve_targets(scope, project_root=approved_root)
+        for agent, target in targets.items():
+            if agent not in expected or _canonical_root(target.parent) != _canonical_root(expected[agent]):
+                raise ScopeConflict(
+                    f"publication target is outside approved project scope for {agent}: {target}"
+                )
+        return
+    if scope_type == "global":
+        if project_root is not None or any(_is_project_target(pathlib.Path(path)) for path in targets.values()):
+            raise ScopeConflict("global approval cannot publish into a project")
+        return
+    if scope_type == "personal":
+        raise ScopeConflict("personal approval cannot publish as a project UI skill")
+    raise ScopeConflict(f"unsupported approved publication scope: {scope_type}")
 
 
 def _ordered_agents(targets: dict[str, pathlib.Path]) -> list[str]:
@@ -186,12 +242,15 @@ def _run_transaction(
     idempotency_key: str,
     replace: Callable[[pathlib.Path, pathlib.Path], None],
     approved: dict[str, Any] | None = None,
+    project_root: pathlib.Path | None = None,
     variants: dict[str, Any] | None = None,
     record_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not idempotency_key:
         raise PublishError("idempotency_key is required")
     targets = _validate_targets(name, targets)
+    if approved is not None:
+        validate_publication_scope(approved, targets, project_root=project_root)
     package_paths: dict[str, pathlib.Path] = {}
     desired_target_digests: dict[str, str | None] = {
         agent: None for agent in targets
@@ -363,6 +422,7 @@ def publish(
     targets: dict[str, pathlib.Path],
     idempotency_key: str,
     replace: Callable[[pathlib.Path, pathlib.Path], None] = os.replace,
+    project_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     return _run_transaction(
         operation="publish",
@@ -374,6 +434,7 @@ def publish(
         idempotency_key=idempotency_key,
         replace=replace,
         approved=approved,
+        project_root=project_root,
         variants=approved.get("source", {}).get("variants"),
         record_metadata=approved,
     )
