@@ -10,6 +10,10 @@ approval-gated long- and short-term memory, design governance, and a loopback-on
 management console. Moving or deleting the source clone after installation does
 not break the installed runtime.
 
+![Nexarl Forge overview](docs/community/nexarl-forge-overview.svg)
+
+![Nexarl Forge Loop workflow](docs/community/nexarl-forge-loop-workflow.svg)
+
 ## Community
 
 Join the Nexarl Forge community:
