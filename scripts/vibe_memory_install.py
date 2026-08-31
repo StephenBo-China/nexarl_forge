@@ -249,8 +249,8 @@ def activate_launch_agent(
     health: Callable[[], dict[str, object]] | None = None,
     expected_version: str | None = None,
     uid: int | None = None,
-    attempts: int = 20,
-    delay: float = 0.1,
+    attempts: int = 60,
+    delay: float = 0.25,
     sleeper: Callable[[float], None] = time.sleep,
 ) -> dict[str, object]:
     """Replace the user service and require an identity-bound health response."""
