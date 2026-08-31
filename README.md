@@ -10,6 +10,16 @@ approval-gated long- and short-term memory, design governance, and a loopback-on
 management console. Moving or deleting the source clone after installation does
 not break the installed runtime.
 
+## Community
+
+Join the Nexarl Forge community:
+
+- GitHub: [Discussions](https://github.com/StephenBo-China/nexarl_forge/discussions) for questions, ideas, and workflow sharing; [Issues](https://github.com/StephenBo-China/nexarl_forge/issues) for bugs.
+- Gitee: [Issues](https://gitee.com/StephenBo_China/nexarl_forge/issues) for Chinese-language support and bug reports.
+- Feishu: [Join the Nexarl Forge Open Source Community](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=00cu754b-2a38-486b-a8a5-0ef38eabd4e8). The QR code is available at [docs/community/feishu-qr.png](docs/community/feishu-qr.png).
+
+Please do not post API keys, tokens, passwords, private source code, personal memory files, or unsanitized logs. Report security vulnerabilities privately according to [SECURITY.md](SECURITY.md).
+
 The first public release supports macOS (Apple Silicon and Intel) and requires
 Python 3.10+. It has no third-party Python dependencies. See the
 [Chinese user guide](docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md) for the complete

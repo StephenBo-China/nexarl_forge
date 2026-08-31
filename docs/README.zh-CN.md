@@ -6,6 +6,14 @@ Nexarl 协作工坊是 Codex 与 Claude Code 共用的 macOS 本地管理器。�
 用户级 hooks 自动提供个人与项目上下文，并把候选记忆、设计治理、UI Skills、
 Loop 工作流和迁移/恢复操作集中到一个仅监听本机的后台中。
 
+## 社区阵地
+
+- GitHub：[Discussions](https://github.com/StephenBo-China/nexarl_forge/discussions) 用于提问、想法和实践分享；[Issues](https://github.com/StephenBo-China/nexarl_forge/issues) 用于 Bug。
+- Gitee：[Issues](https://gitee.com/StephenBo_China/nexarl_forge/issues) 用于中文支持与问题反馈。
+- 飞书：[加入 Nexarl Forge Open Source Community](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=00cu754b-2a38-486b-a8a5-0ef38eabd4e8)，或扫描[群二维码](community/feishu-qr.png)。
+
+请勿在社区发布 API Key、Token、密码、私有源码、个人记忆文件或未脱敏日志。安全漏洞请按 [SECURITY.md](../SECURITY.md) 的方式私下报告。
+
 ## 快速开始
 
 ```bash
