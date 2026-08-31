@@ -2612,6 +2612,11 @@ class Handler(BaseHTTPRequestHandler):
         if "#" in host or "?" in host:
             raise ValueError("Host is invalid")
         allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        if host.startswith("["):
+            if re.fullmatch(r"\[::1\](?::[0-9]{1,5})?", host) is None:
+                raise ValueError("Host is invalid")
+        elif "[" in host or "]" in host:
+            raise ValueError("Host is invalid")
         try:
             parsed_host = urlparse(f"//{host}")
             host_name = parsed_host.hostname

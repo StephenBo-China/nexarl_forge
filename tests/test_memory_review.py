@@ -733,7 +733,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 for name in (
                     "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
                     "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
-                    "PROJECT_STATE", "CODEX_DIR",
+                    "PROJECT_STATE", "CODEX_DIR", "PROJECT_ROOT",
                 )
             }
             try:
@@ -746,6 +746,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PROJECT_QUEUE = temp / "queue.json"
                 review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
+                review.PROJECT_ROOT = temp
                 first = review.create_agent_candidate(
                     "personal", "long", "collaboration_preference", "修改前确认计划",
                     "用户希望修改代码前先确认修改计划和不确定事项。",
@@ -819,7 +820,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 for name in (
                     "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
                     "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
-                    "PROJECT_STATE", "CODEX_DIR", "build_queue",
+                    "PROJECT_STATE", "CODEX_DIR", "PROJECT_ROOT", "build_queue",
                 )
             }
             try:
@@ -833,6 +834,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PROJECT_QUEUE = temp / "queue.json"
                 review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
+                review.PROJECT_ROOT = temp
                 review.build_queue = lambda: {}
                 summary = "用户希望相同摘要在身份字段不同时仍可形成独立候选。"
                 results = [
@@ -887,7 +889,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 for name in (
                     "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
                     "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
-                    "PROJECT_STATE", "CODEX_DIR",
+                    "PROJECT_STATE", "CODEX_DIR", "PROJECT_ROOT",
                 )
             }
             try:
@@ -900,6 +902,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PROJECT_QUEUE = temp / "queue.json"
                 review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
+                review.PROJECT_ROOT = temp
                 with self.assertRaisesRegex(ValueError, "sensitive"):
                     review.create_agent_candidate(
                         "personal", "long", "work_style", "api_key=do-not-store",
@@ -928,6 +931,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_value:
             temp = pathlib.Path(temp_value)
             paths = {
+                "PROJECT_ROOT": temp,
                 "PROJECT_ROOT": temp,
                 "CODEX_DIR": temp / "codex",
                 "PROJECT_PROPOSALS": temp / "codex/memory_proposals.md",
@@ -1062,6 +1066,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
             proposals = temp / "personal_proposals.md"
             original = b"# Proposals\n\nunchanged\n"
             paths = {
+                "PROJECT_ROOT": temp,
                 "PERSONAL_PROPOSALS": proposals,
                 "PERSONAL_LONG": temp / "personal_long.md",
                 "PERSONAL_SHORT": temp / "personal_short.md",
@@ -1202,7 +1207,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 for name in (
                     "PERSONAL_PROPOSALS", "PERSONAL_LONG", "PERSONAL_SHORT",
                     "PROJECT_PROPOSALS", "PROJECT_LONG", "PROJECT_QUEUE",
-                    "PROJECT_STATE", "CODEX_DIR", "build_queue", "read_text",
+                    "PROJECT_STATE", "CODEX_DIR", "PROJECT_ROOT", "build_queue", "read_text",
                 )
             }
             proposals = temp / "personal_proposals.md"
@@ -1242,6 +1247,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PROJECT_QUEUE = temp / "queue.json"
                 review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
+                review.PROJECT_ROOT = temp
                 review.build_queue = lambda: {}
                 review.read_text = synchronized_read
                 threads = [

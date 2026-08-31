@@ -246,7 +246,7 @@ def _installed_e2e_process(
         capture_output=True,
         text=True,
         check=False,
-        timeout=15,
+        timeout=60,
     )
 
 

@@ -581,6 +581,17 @@ class VibeMemoryRouterTest(unittest.TestCase):
             codex.mkdir()
             home = project / "home"
             (home / ".codex" / "personal_memory").mkdir(parents=True)
+            registry = home / ".codex" / "memory_review" / "projects.json"
+            registry.parent.mkdir(parents=True)
+            registry.write_text(
+                json.dumps(
+                    {
+                        "current_project": str(project.resolve()),
+                        "projects": [{"root": str(project.resolve()), "name": project.name}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             script = (
                 "import sys\n"
                 f"sys.path.insert(0, {str(ROOT / 'scripts')!r})\n"
@@ -598,6 +609,7 @@ class VibeMemoryRouterTest(unittest.TestCase):
                 {
                     "HOME": str(home),
                     "MEMORY_REVIEW_PROJECT_ROOT": str(project),
+                    "PYTHONPATH": str(ROOT / "scripts"),
                     "PYTHONDONTWRITEBYTECODE": "1",
                 }
             )
