@@ -1104,22 +1104,22 @@ class UIDesignServerTest(unittest.TestCase):
         )
         required_commands = (
             "git clone",
-            "cd vibe_coding_manage_platform",
+            "cd nexarl_forge",
             "./install.sh",
             "./install.sh --with-claude-hooks",
-            "vibe-memory open",
-            'vibe-memory project register "/path/to/workspace"',
-            'vibe-memory project init "/path/to/workspace"',
-            'vibe-memory migrate preview --project-root "/path/to/workspace"',
-            'vibe-memory migrate apply --approved --project-root "/path/to/workspace"',
-            "vibe-memory doctor",
-            'vibe-memory update --source-root "/path/to/local/clone"',
-            "vibe-memory rollback",
-            "vibe-memory repair",
-            "vibe-memory start",
-            "vibe-memory hooks status",
-            "vibe-memory hooks repair",
-            "vibe-memory uninstall",
+            "nexarl-forge open",
+            'nexarl-forge project register "/path/to/workspace"',
+            'nexarl-forge project init "/path/to/workspace"',
+            'nexarl-forge migrate preview --project-root "/path/to/workspace"',
+            'nexarl-forge migrate apply --approved --project-root "/path/to/workspace"',
+            "nexarl-forge doctor",
+            'nexarl-forge update --source-root "/path/to/local/clone"',
+            "nexarl-forge rollback",
+            "nexarl-forge repair",
+            "nexarl-forge start",
+            "nexarl-forge hooks status",
+            "nexarl-forge hooks repair",
+            "nexarl-forge uninstall",
             "--approved-data-deletion",
             '--data-path "$HOME/.codex/memory_review/projects.json"',
         )
@@ -1156,7 +1156,7 @@ class UIDesignServerTest(unittest.TestCase):
         for path in user_docs:
             text = path.read_text(encoding="utf-8")
             self.assertIn("cannot be a directory", text)
-            self.assertIn("vibe-memory start && vibe-memory open", text)
+            self.assertIn("nexarl-forge start && nexarl-forge open", text)
             self.assertIn(
                 "echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> \"$HOME/.zshrc\"",
                 text,
