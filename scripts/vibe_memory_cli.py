@@ -567,6 +567,7 @@ def _install_command_locked(
             "status": "failed",
             "phase": "commit",
             "error": "installation commit failed",
+            "detail": f"{type(error).__name__}: {error}",
             "rollback": {
                 "ok": not rollback_errors,
                 "failed_paths": rollback_errors,
