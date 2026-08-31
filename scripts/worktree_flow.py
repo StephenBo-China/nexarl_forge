@@ -22,6 +22,8 @@ import sys
 import uuid
 from typing import Any, Iterator
 
+import vibe_memory_paths
+
 
 MANAGER_ROOT = pathlib.Path(
     os.environ.get("CODEX_WORKTREE_MANAGER_ROOT", "~/.codex/worktree_manager")
@@ -29,7 +31,7 @@ MANAGER_ROOT = pathlib.Path(
 REGISTRY_PATH = MANAGER_ROOT / "tasks.json"
 LOCK_ROOT = MANAGER_ROOT / "locks"
 DEFAULT_WORKTREE_ROOT = pathlib.Path(
-    os.environ.get("CODEX_WORKTREE_ROOT", "/Users/stephenbo/Noema/Projects/worktrees")
+    os.environ.get("CODEX_WORKTREE_ROOT", str(vibe_memory_paths.for_home().worktree_root))
 ).expanduser()
 
 

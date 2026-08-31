@@ -4,29 +4,41 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
+import stat
 import subprocess
+import sys
 from typing import Any
+import uuid
 
 import loop_superpowers
 import ui_design_preferences
 import ui_design_store
+import vibe_memory_install
+import vibe_memory_paths
 
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
+RUNTIME_PATHS = vibe_memory_paths.for_home()
+DEFAULT_WORKTREE_ROOT = pathlib.Path(
+    os.environ.get("CODEX_WORKTREE_ROOT", str(RUNTIME_PATHS.worktree_root))
+).expanduser()
 REGISTRY_PATH = pathlib.Path(
     os.environ.get(
         "MEMORY_REVIEW_PROJECT_REGISTRY",
-        str(pathlib.Path.home() / ".codex" / "memory_review" / "projects.json"),
+        str(RUNTIME_PATHS.project_registry),
     )
 ).expanduser()
-CODEX_LOOP_DIR = pathlib.Path.home() / ".codex" / "loop_engineering"
-CLAUDE_LOOP_DIR = pathlib.Path.home() / ".claude" / "loop_engineering"
+CODEX_LOOP_DIR = RUNTIME_PATHS.personal_memory.parent / "loop_engineering"
+CLAUDE_LOOP_DIR = RUNTIME_PATHS.personal_memory.parents[1] / ".claude" / "loop_engineering"
 DEFAULT_STAGING_HOST = "root@8.210.155.175"
 DEFAULT_BASE_PORT = 8081
 UI_DESIGN_GATE_HOOK_TEMPLATE = (
@@ -61,13 +73,129 @@ def write_json(path: pathlib.Path, value: Any) -> None:
     )
 
 
-def registry() -> dict[str, Any]:
-    data = read_json(REGISTRY_PATH, {"current_project": "", "projects": []})
-    if not isinstance(data, dict):
-        data = {"current_project": "", "projects": []}
+def _empty_registry() -> dict[str, Any]:
+    return {"current_project": "", "projects": []}
+
+
+@contextlib.contextmanager
+def _registry_lock(exclusive: bool):
+    parent = REGISTRY_PATH.absolute().parent
+    vibe_memory_install._validate_install_ancestor_chain(parent)
+    canonical_parent = vibe_memory_install._canonical_install_path(parent)
+    if not exclusive and not canonical_parent.exists():
+        yield None
+        return
+    if exclusive:
+        parent_fd = vibe_memory_install._open_or_create_directory_chain(canonical_parent)
+    else:
+        parent_fd = os.open(
+            canonical_parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    try:
+        fcntl.flock(parent_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield parent_fd
+    finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+        os.close(parent_fd)
+
+
+def _read_registry_at(parent_fd: int) -> dict[str, Any]:
+    name = REGISTRY_PATH.name
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return _empty_registry()
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("project registry must be a regular file")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise ValueError("project registry changed while opening")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        data = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("project registry is malformed") from error
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("current_project", ""), str)
+        or not isinstance(data.get("projects", []), list)
+    ):
+        raise ValueError("project registry has an invalid structure")
     data.setdefault("current_project", "")
     data.setdefault("projects", [])
     return data
+
+
+def _write_registry_at(parent_fd: int, value: dict[str, Any]) -> None:
+    content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    temporary_name = f".{REGISTRY_PATH.name}.tmp-{uuid.uuid4().hex}"
+    descriptor = os.open(
+        temporary_name,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=parent_fd,
+    )
+    try:
+        offset = 0
+        while offset < len(content):
+            written = os.write(descriptor, content[offset:])
+            if written <= 0:
+                raise OSError("short project registry write")
+            offset += written
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        try:
+            active = os.stat(REGISTRY_PATH.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            active = None
+        if active is not None and not stat.S_ISREG(active.st_mode):
+            raise ValueError("project registry must be a regular file")
+        os.replace(
+            temporary_name,
+            REGISTRY_PATH.name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+
+
+def registry() -> dict[str, Any]:
+    with _registry_lock(exclusive=False) as parent_fd:
+        if parent_fd is None:
+            return _empty_registry()
+        return _read_registry_at(parent_fd)
+
+
+def _mutate_registry(mutator: Any) -> dict[str, Any]:
+    with _registry_lock(exclusive=True) as parent_fd:
+        data = _read_registry_at(parent_fd)
+        mutator(data)
+        _write_registry_at(parent_fd, data)
+        return data
 
 
 def ui_design_config(_root: pathlib.Path) -> dict[str, Any]:
@@ -246,7 +374,7 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
     managed_hooks_status = (
         "current"
         if all(state == "current" for state in hook_states)
-        else "missing"
+        else "not_applicable"
         if all(state == "missing" for state in hook_states)
         else "upgrade_available"
     )
@@ -254,7 +382,7 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
         "not_initialized"
         if not has_memory
         else "initialized"
-        if managed_rules_status == "current" and managed_hooks_status == "current"
+        if managed_rules_status == "current"
         else "upgrade_available"
     )
 
@@ -277,16 +405,63 @@ def project_entry(root: pathlib.Path) -> dict[str, Any]:
 
 def register_project(root: str | pathlib.Path, make_current: bool = True) -> dict[str, Any]:
     project_root = normalize_project_root(root)
-    data = registry()
+    if not project_root.is_dir():
+        raise ValueError(f"project root must be an existing directory: {project_root}")
     entry = project_entry(project_root)
-    projects = [p for p in data.get("projects", []) if p.get("root") != str(project_root)]
-    projects.append(entry)
-    projects.sort(key=lambda item: item.get("name", ""))
-    data["projects"] = projects
-    if make_current:
-        data["current_project"] = str(project_root)
-    write_json(REGISTRY_PATH, data)
-    return data
+    def mutate(data: dict[str, Any]) -> None:
+        projects = [p for p in data.get("projects", []) if p.get("root") != str(project_root)]
+        projects.append(entry)
+        projects.sort(key=lambda item: item.get("name", ""))
+        data["projects"] = projects
+        if make_current:
+            data["current_project"] = str(project_root)
+    return _mutate_registry(mutate)
+
+
+def unregister_project(root: str | pathlib.Path) -> dict[str, Any]:
+    project_path = normalize_project_root(root)
+    project_root = str(project_path)
+    import vibe_memory_migration
+
+    cleanup_plan = vibe_memory_migration.prepare_legacy_hook_cleanup(project_path)
+    with _registry_lock(exclusive=True) as parent_fd:
+        before_registry = _read_registry_at(parent_fd)
+        registered = {
+            str(normalize_project_root(raw_root))
+            for item in before_registry.get("projects", [])
+            if isinstance(item, dict)
+            for raw_root in [item.get("root")]
+            if isinstance(raw_root, str) and raw_root
+        }
+        if project_root not in registered:
+            raise ValueError(f"project is not registered: {project_root}")
+        data = json.loads(json.dumps(before_registry, ensure_ascii=False))
+        data["projects"] = [
+            item
+            for item in data.get("projects", [])
+            if not isinstance(item, dict)
+            or str(normalize_project_root(item.get("root", ""))) != project_root
+        ]
+        if data.get("current_project") and str(
+            normalize_project_root(data["current_project"])
+        ) == project_root:
+            data["current_project"] = ""
+        _write_registry_at(parent_fd, data)
+        try:
+            cleanup = vibe_memory_migration.execute_legacy_hook_cleanup(cleanup_plan)
+            if cleanup.get("result") == "failed":
+                raise RuntimeError("legacy hook cleanup failed")
+        except BaseException:
+            _write_registry_at(parent_fd, before_registry)
+            raise
+    return {
+        **data,
+        "status": "unregistered",
+        "project": project_root,
+        "removed_legacy_hooks": cleanup["changed_paths"],
+        "legacy_hook_backups": cleanup["backups"],
+        "registry": data,
+    }
 
 
 def set_current_project(root: str | pathlib.Path) -> dict[str, Any]:
@@ -302,19 +477,15 @@ def list_projects() -> dict[str, Any]:
             entry = project_entry(pathlib.Path(root))
             entry["last_opened_at"] = item.get("last_opened_at", "")
             refreshed.append(entry)
-    data["projects"] = refreshed
-    write_json(REGISTRY_PATH, data)
-    return data
+    return {**data, "projects": refreshed}
 
 
-def current_project(default: pathlib.Path | None = None) -> pathlib.Path:
+def current_project() -> pathlib.Path | None:
     data = registry()
     current = data.get("current_project") or ""
     if current:
         return normalize_project_root(current)
-    if default is not None:
-        return default.resolve()
-    return APP_ROOT
+    return None
 
 
 def ensure_file(path: pathlib.Path, content: str, changes: list[dict[str, str]]) -> None:
@@ -344,6 +515,33 @@ def project_title(root: pathlib.Path) -> str:
 
 
 def agent_candidate_protocol(root: pathlib.Path) -> str:
+    project_environment = shlex.quote(str(root))
+    try:
+        launcher = pathlib.Path(RUNTIME_PATHS.launcher)
+    except TypeError:
+        launcher = pathlib.Path("")
+    cli_parts: list[str]
+    if launcher.is_file() and os.access(launcher, os.X_OK):
+        cli_parts = [str(launcher)]
+    else:
+        config = pathlib.Path(RUNTIME_PATHS.install_root) / "config.json"
+        try:
+            value = json.loads(config.read_text(encoding="utf-8"))
+            interpreter = value.get("python_executable") if isinstance(value, dict) else None
+        except (OSError, ValueError, json.JSONDecodeError):
+            interpreter = None
+        cli = pathlib.Path(RUNTIME_PATHS.install_root) / "current/scripts/vibe_memory_cli.py"
+        validated_interpreter = None
+        if isinstance(interpreter, str) and interpreter and cli.is_file():
+            try:
+                validated_interpreter = vibe_memory_install.validate_python(interpreter)
+            except (vibe_memory_install.InstallError, ValueError):
+                pass
+        if validated_interpreter is not None:
+            cli_parts = [validated_interpreter, str(cli)]
+        else:
+            cli_parts = [sys.executable, str(APP_ROOT / "scripts/vibe_memory_cli.py")]
+    cli_command = " ".join(shlex.quote(part) for part in cli_parts)
     return f"""## Agent-Generated Memory Candidates
 
 The active conversation model performs candidate summarization itself. Hooks
@@ -374,7 +572,7 @@ pending and approved memory before writing.
 Write a distilled candidate with:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT={root} python3 {APP_ROOT}/scripts/memory_review.py propose \\
+MEMORY_REVIEW_PROJECT_ROOT={project_environment} {cli_command} memory propose \\
   --scope personal|project --target long|short --category CATEGORY \\
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```
@@ -450,8 +648,8 @@ If `.loop/config.json` exists, also load:
 - `codex/codex_long_memory.md`
 - `codex/codex_context_packet.md`
 - `codex/shared_memory_context_packet.md`
-- `/Users/stephenbo/.codex/personal_memory/long.md`
-- `/Users/stephenbo/.codex/personal_memory/short.md`
+- `{RUNTIME_PATHS.personal_memory / "long.md"}`
+- `{RUNTIME_PATHS.personal_memory / "short.md"}`
 
 Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
@@ -488,8 +686,8 @@ repository and the same approval-gated personal memory files.
   dirty canonical paths. Verify remote main, canonical main, and deployment
   commit equality before reporting final completion.
 - When `.loop/config.json` exists, also read:
-  - `/Users/stephenbo/.codex/loop_engineering`
-  - `/Users/stephenbo/.claude/loop_engineering`
+  - `{CODEX_LOOP_DIR}`
+  - `{CLAUDE_LOOP_DIR}`
 
 ## Write Policy
 
@@ -498,7 +696,7 @@ repository and the same approval-gated personal memory files.
   `codex/memory_proposals.md` first.
 - Personal long and short memory require explicit approval of exact content.
 - Personal candidates may be written only to
-  `/Users/stephenbo/.codex/personal_memory/proposals.md`, and only when they
+  `{RUNTIME_PATHS.personal_memory / "proposals.md"}`, and only when they
   are distilled cross-project habits, preferences, thinking style, workflow
   preferences, or user-profile facts.
 
@@ -519,7 +717,7 @@ For this project, pass:
 
 
 def hook_script(root: pathlib.Path, source: str) -> str:
-    source_label = "claude_code" if source == "claude" else "codex"
+    source_label = "claude-code" if source == "claude" else "codex"
     return f'''#!/usr/bin/env python3
 """Shared memory hook installed by vibe_coding_manage_platform."""
 
@@ -559,25 +757,7 @@ def read_stdin_json() -> Any:
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
-        return {{"raw_stdin": raw[:4000]}}
-
-
-def find_prompt(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        return "\\n".join(filter(None, [find_prompt(item) for item in value])).strip()
-    if isinstance(value, dict):
-        for key in ["prompt", "user_prompt", "userPrompt", "input", "message", "text", "content"]:
-            if key in value:
-                found = find_prompt(value[key])
-                if found:
-                    return found
-        for item in value.values():
-            found = find_prompt(item)
-            if found:
-                return found
-    return ""
+        return None
 
 
 def ensure_files() -> None:
@@ -648,8 +828,8 @@ def loop_context() -> str:
 - finish validation gate: {{gate}}; run configured validation before success claims.
 - Subagents and parallel agents require explicit user authorization and isolated
   Loop-safe worktrees.
-- Read `/Users/stephenbo/.codex/loop_engineering` and
-  `/Users/stephenbo/.claude/loop_engineering` before substantial Loop work.
+- Read `{CODEX_LOOP_DIR}` and
+  `{CLAUDE_LOOP_DIR}` before substantial Loop work.
 """
 
     return f"""
@@ -676,8 +856,8 @@ Repository: `{{ROOT}}`
 - `codex/codex_long_memory.md`
 - `codex/codex_short_memory.md` (read selectively)
 - `codex/memory_proposals.md`
-- `/Users/stephenbo/.codex/personal_memory/long.md`
-- `/Users/stephenbo/.codex/personal_memory/short.md`
+- `{RUNTIME_PATHS.personal_memory / "long.md"}`
+- `{RUNTIME_PATHS.personal_memory / "short.md"}`
 
 ## Pending Memory Review
 
@@ -699,15 +879,19 @@ Repository: `{{ROOT}}`
 
 
 def append_short(event: str, payload: Any) -> None:
-    prompt = find_prompt(payload)
-    entry = f"\\n### {{now()}} - {{SOURCE}}:{{event}}\\n\\n- cwd: `{{os.getcwd()}}`\\n"
-    if prompt:
-        compact = " ".join(prompt.split())
-        if len(compact) > 280:
-            compact = compact[:277].rstrip() + "..."
-        entry += "- summary: " + compact + "\\n"
-    else:
-        entry += "- no user prompt payload was available to this hook.\\n"
+    session_id = None
+    if isinstance(payload, dict):
+        value = payload.get("session_id", payload.get("sessionId"))
+        if isinstance(value, str) and value:
+            session_id = value
+    entry = (
+        f"\\n### {{now()}} - {{SOURCE}}:{{event}}\\n\\n"
+        f"- source_agent: {{SOURCE}}\\n"
+        f"- event: {{event}}\\n"
+        f"- cwd: `{{os.getcwd()}}`\\n"
+    )
+    if session_id is not None:
+        entry += f"- session_id: {{session_id}}\\n"
     with SHORT_MEMORY.open("a", encoding="utf-8") as handle:
         handle.write(entry)
 
@@ -897,42 +1081,23 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     ui_root = project_root / "codex" / "ui_design"
     ensure_file(
         ui_root / "config.json",
-        json.dumps(
-            ui_design_config(project_root),
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps(ui_design_config(project_root), ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "preferences.json",
-        json.dumps(
-            {"schema_version": 1, "overrides": {}},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps({"schema_version": 1, "overrides": {}}, ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "active-skills.json",
-        json.dumps(
-            {"schema_version": 1, "execution_order": [], "skills": []},
-            ensure_ascii=False,
-            indent=2,
-            sort_keys=True,
-        ),
+        json.dumps({"schema_version": 1, "execution_order": [], "skills": []}, ensure_ascii=False, indent=2, sort_keys=True),
         changes,
     )
     ensure_file(
         ui_root / "approvals.json",
         json.dumps(
-            {
-                "schema_version": 1,
-                "package_approvals": {},
-                "project_global_approval": None,
-            },
+            {"schema_version": 1, "package_approvals": {}, "project_global_approval": None},
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -942,27 +1107,21 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
     context_path = ui_root / "effective-context.json"
     context_existed = context_path.exists()
     publish_effective_ui_context(project_root)
-    changes.append(
-        {
-            "path": str(context_path),
-            "status": "existing" if context_existed else "created",
-        }
-    )
+    changes.append({
+        "path": str(context_path),
+        "status": "existing" if context_existed else "created",
+    })
     append_if_missing(project_root / "AGENTS.md", f"# {name} Codex Instructions", agent_memory_block(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "# " + name + " Shared Memory Instructions", claude_md(project_root), changes)
     append_if_missing(project_root / "AGENTS.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
     append_if_missing(project_root / "CLAUDE.md", "## Agent-Generated Memory Candidates", agent_candidate_protocol(project_root), changes)
-    ensure_file(project_root / ".codex" / "hooks.json", codex_hooks_json(), changes)
-    _merge_gate_hook_config(project_root / ".codex" / "hooks.json", "codex", changes)
-    ensure_file(project_root / ".codex" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "codex"), changes)
+    # These are inert compatibility assets: without project hook documents they
+    # are not hook entry points. Universal user hooks remain the sole entries.
     ensure_file(
         project_root / ".codex" / "hooks" / "ui_design_gate_hook.py",
         ui_design_gate_hook_text(),
         changes,
     )
-    ensure_file(project_root / ".claude" / "settings.json", claude_settings_json(), changes)
-    _merge_gate_hook_config(project_root / ".claude" / "settings.json", "claude", changes)
-    ensure_file(project_root / ".claude" / "hooks" / "shared_memory_hook.py", hook_script(project_root, "claude"), changes)
     ensure_file(
         project_root / ".claude" / "hooks" / "ui_design_gate_hook.py",
         ui_design_gate_hook_text(),
@@ -975,7 +1134,14 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
         agent_candidate_protocol(project_root),
         changes,
     )
-    register_project(project_root, make_current=True)
+    registered = any(
+        isinstance(item, dict)
+        and isinstance(item.get("root"), str)
+        and normalize_project_root(item["root"]) == project_root
+        for item in registry().get("projects", [])
+    )
+    if registered:
+        register_project(project_root, make_current=True)
     return {"ok": True, "project": project_entry(project_root), "changes": changes}
 
 
@@ -1108,8 +1274,8 @@ def loop_config(root: pathlib.Path, port: int) -> dict[str, Any]:
         "worktree": {
             "enabled": True,
             "trigger_phrase": "开 worktree",
-            "root": "/Users/stephenbo/Noema/Projects/worktrees",
-            "default_root": "/Users/stephenbo/Noema/Projects/worktrees",
+            "root": str(DEFAULT_WORKTREE_ROOT),
+            "default_root": str(DEFAULT_WORKTREE_ROOT),
             "finish_validation_commands": [loop_superpowers.COMPLETION_COMMAND],
             "allow_inside_canonical_root": False,
             "loop_requires_dedicated_worktree": True,
@@ -1439,7 +1605,7 @@ def main() -> int:
         print(json.dumps(list_projects(), ensure_ascii=False, indent=2))
         return 0
     if args.command == "current":
-        print(current_project())
+        print(current_project() or "")
         return 0
     if args.command == "recommend-port":
         print(recommend_port())

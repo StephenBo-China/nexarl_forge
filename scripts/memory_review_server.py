@@ -10,6 +10,7 @@ import os
 import pathlib
 import re
 import tempfile
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -20,10 +21,123 @@ import ui_design_gate
 import ui_design_preferences
 import ui_skill_publisher
 import ui_skill_registry
+import vibe_memory_paths
+import vibe_memory_settings
+
+MAX_JSON_BODY = 64 * 1024
 
 
-HOST = review.REVIEW_HOST
-PORT = review.REVIEW_PORT
+def server_address(environ: dict[str, str] | None = None) -> tuple[str, int]:
+    values = os.environ if environ is None else environ
+    host = values.get("MEMORY_REVIEW_HOST", review.REVIEW_HOST)
+    port_raw = values.get("MEMORY_REVIEW_PORT", str(review.REVIEW_PORT))
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError) as error:
+        raise ValueError("memory review server port must be an integer") from error
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("memory review server must bind to loopback")
+    return host, port
+
+
+HOST, PORT = server_address()
+review.REVIEW_HOST = HOST
+review.REVIEW_PORT = PORT
+review.REVIEW_URL = f"http://[{HOST}]:{PORT}" if HOST == "::1" else f"http://{HOST}:{PORT}"
+
+
+def health_payload() -> dict[str, object]:
+    manifest = vibe_memory_paths.read_release_manifest(review.APP_ROOT / "release.json")
+    return {
+        "ok": True,
+        "service": "vibe-memory",
+        "app_version": manifest["app_version"],
+        "data_schema_version": manifest["data_schema_version"],
+    }
+
+
+def settings_payload() -> dict[str, object]:
+    return vibe_memory_settings.load_settings(vibe_memory_paths.for_home())
+
+
+def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
+    paths = vibe_memory_paths.for_home()
+    return vibe_memory_settings.apply_first_run(
+        paths,
+        body,
+        manager_source_root=pathlib.Path(__file__).resolve().parents[1],
+        register_workspace=memory_project.register_project,
+    )
+
+
+def first_run_page() -> str:
+    return """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>设置 AI Coding 管理后台</title><style>
+:root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:#171717;color:#ececec}body{margin:0;display:grid;min-height:100vh;place-items:center}.wizard{width:min(680px,calc(100vw - 32px));background:#202020;border:1px solid #333;border-radius:12px;padding:28px;box-shadow:0 18px 60px #0006}h1{font-size:24px;margin:0 0 8px}p{color:#aaa;line-height:1.6}.row{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #303030}.stack{display:grid;gap:8px}.radios{display:flex;gap:14px;flex-wrap:wrap}input[type=text],input[type=number]{background:#2b2b2b;border:1px solid #444;border-radius:7px;color:#fff;padding:9px;width:min(380px,70vw)}button{margin-top:18px;background:#eee;border:0;border-radius:8px;color:#171717;font-weight:650;padding:11px 16px}.message{min-height:20px;color:#8ab4ff}</style></head>
+<body><form class="wizard" id="first-run"><h1>首次运行设置</h1><p>配置本机客户端与保留策略。工作区必须手动输入一个已存在的目录；浏览器无法打开原生目录选择器。</p>
+<label class="row"><span>Codex hooks</span><input name="codex_hooks" type="checkbox" checked></label>
+<label class="row"><span>Claude Code hooks</span><input name="claude_hooks" type="checkbox"></label>
+<label class="row"><span>自动候选检查</span><input name="automatic_candidate_checks" type="checkbox" checked></label>
+<div class="row"><span>个人短记忆保留</span><div class="radios"><label><input name="personal_short_retention_days" type="radio" value="0">不保留</label><label><input name="personal_short_retention_days" type="radio" value="14">14 天</label><label><input name="personal_short_retention_days" type="radio" value="30" checked>30 天</label></div></div>
+<label class="row"><span>登录时启动</span><input name="start_at_login" type="checkbox" checked></label>
+<label class="row"><span>本机端口</span><input name="service_port" type="number" min="1" max="65535" value="8897" required></label>
+<label class="row stack"><span>可选工作区路径</span><input name="workspace" type="text" placeholder="/path/to/workspace"></label>
+<div class="message" id="message"></div><button type="submit">保存并继续</button></form>
+<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');location.href='/'}catch(error){msg.textContent=error.message}}</script></body></html>"""
+
+
+def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:
+    return pathlib.Path(paths.install_root) / "state" / "service-action.json"
+
+
+def read_service_action(paths: vibe_memory_paths.RuntimePaths) -> dict[str, object]:
+    return vibe_memory_settings.read_service_action(paths)
+
+
+def write_service_action(paths: vibe_memory_paths.RuntimePaths, *, desired: bool) -> dict[str, object]:
+    return vibe_memory_settings.write_service_action(
+        paths,
+        desired_start_at_login=desired,
+        status="active" if desired else "bootout_pending",
+    )
+
+
+def _service_action_matches(paths: vibe_memory_paths.RuntimePaths, generation: str, desired: bool) -> bool:
+    value = read_service_action(paths)
+    return value.get("generation") == generation and value.get("desired_start_at_login") is desired
+
+
+def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths, generation: str) -> None:
+    action_path = service_action_path(paths)
+    if not _service_action_matches(paths, generation, False):
+        return
+    try:
+        vibe_memory_settings.vibe_memory_install.bootout_launch_agent(
+            vibe_memory_paths.for_home()
+        )
+    except Exception as error:  # Persist a retry-visible diagnostic.
+        if _service_action_matches(paths, generation, False):
+            value = read_service_action(paths)
+            value["error"] = str(error)[:500]
+            vibe_memory_settings.vibe_memory_install._atomic_write_private_json(action_path, value)
+    else:
+        if _service_action_matches(paths, generation, False):
+            action_path.unlink(missing_ok=True)
+
+
+def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths, generation: str) -> None:
+    try:
+        with vibe_memory_settings.lifecycle_lock(paths):
+            complete_scheduled_bootout(paths, generation)
+    except Exception as error:  # Never leak a background traceback.
+        try:
+            if _service_action_matches(paths, generation, False):
+                value = read_service_action(paths)
+                value["error"] = str(error)[:500]
+                vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), value)
+        except Exception:
+            return
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -143,9 +257,31 @@ def _skill_namespace(command: str, **values: object) -> argparse.Namespace:
 
 
 def _project_from(value: object) -> pathlib.Path:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError("project is required")
-    return pathlib.Path(value).expanduser()
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, str) and value.strip():
+        project = pathlib.Path(value).expanduser()
+    elif review.PROJECT_ROOT is not None:
+        project = pathlib.Path(review.PROJECT_ROOT).expanduser()
+    else:
+        raise ValueError("a registered project is required")
+    canonical_project = memory_project.normalize_project_root(project)
+    registered = {
+        memory_project.normalize_project_root(root)
+        for item in memory_project.registry().get("projects", [])
+        if isinstance(item, dict)
+        for root in [item.get("root")]
+        if isinstance(root, str) and root
+    }
+    if canonical_project not in registered:
+        raise ValueError(f"a registered project is required: {canonical_project}")
+    return project
+
+
+def _optional_project_from(value: object) -> pathlib.Path | None:
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    return _project_from(value) if isinstance(value, str) and value.strip() else None
 
 
 def _design_namespace(command: str, **values: object) -> argparse.Namespace:
@@ -171,10 +307,7 @@ def _design_namespace(command: str, **values: object) -> argparse.Namespace:
 
 def ui_design_get(path: str, query: dict[str, object]) -> dict:
     if path == "/api/ui-design/context":
-        raw_project = query.get("project") or str(review.PROJECT_ROOT)
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else ""
-        project = pathlib.Path(str(raw_project)).expanduser()
+        project = _project_from(query.get("project"))
         return {
             "project": str(project),
             "global_preferences": ui_design_preferences.load_global_preferences(),
@@ -182,10 +315,7 @@ def ui_design_get(path: str, query: dict[str, object]) -> dict:
             "effective_preferences": ui_design_preferences.effective_preferences(project),
         }
     if path in {"/api/ui-design/project-config", "/api/ui-design/packages"}:
-        raw_project = query.get("project") or str(review.PROJECT_ROOT)
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else ""
-        project = _project_from(raw_project)
+        project = _project_from(query.get("project"))
         if path == "/api/ui-design/packages":
             return ui_design_cli.dispatch(
                 _design_namespace(
@@ -204,11 +334,9 @@ def ui_design_get(path: str, query: dict[str, object]) -> dict:
             "audit": ui_design_gate.audit_history(project),
         }
     if path == "/api/ui-skills":
-        raw_project = query.get("project")
-        if isinstance(raw_project, list):
-            raw_project = raw_project[0] if raw_project else None
+        project = _optional_project_from(query.get("project"))
         scan = ui_design_cli.dispatch(
-            _skill_namespace("scan", project=str(raw_project) if raw_project else None)
+            _skill_namespace("scan", project=str(project) if project else None)
         )
         items = []
         for draft in ui_skill_registry.list_drafts():
@@ -244,16 +372,15 @@ def ui_design_post(path: str, body: dict) -> dict:
             json.dump(value, handle, ensure_ascii=False)
             handle.flush()
             command = "set-global" if path.endswith("/global") else "set-project"
+            project = _project_from(body.get("project")) if command == "set-project" else None
             args = argparse.Namespace(
                 command="ui-design",
                 ui_design_command="preferences",
                 preference_command=command,
                 json_file=handle.name,
-                project=body.get("project"),
+                project=str(project) if project else None,
                 idempotency_key=key,
             )
-            if command == "set-project" and not body.get("project"):
-                raise ValueError("project is required")
             return ui_design_cli.dispatch(args)
 
     if path.startswith("/api/ui-design/project-config/"):
@@ -338,9 +465,10 @@ def ui_design_post(path: str, body: dict) -> dict:
         )
 
     command = path.rsplit("/", 1)[-1].replace("request-revision", "request-revision")
+    project = _optional_project_from(body.get("project"))
     values = {
         "idempotency_key": key,
-        "project": body.get("project"),
+        "project": str(project) if project else None,
         "draft_id": body.get("draft_id"),
         "name": body.get("name"),
         "digest": body.get("digest"),
@@ -434,16 +562,70 @@ def switch_project(project_root: str) -> dict:
     return project_payload()
 
 
+def _registered_project_root(project_root: str) -> pathlib.Path | None:
+    """Return the canonical registered root, or ``None`` when unregistered.
+
+    This check is intentionally read-only.  In particular, project switching
+    must never promote an arbitrary path into the global project registry.
+    """
+    if not isinstance(project_root, str) or not project_root.strip():
+        return None
+    canonical = memory_project.normalize_project_root(project_root)
+    for item in memory_project.registry().get("projects", []):
+        if not isinstance(item, dict):
+            continue
+        value = item.get("root")
+        if isinstance(value, str) and value:
+            try:
+                if memory_project.normalize_project_root(value) == canonical:
+                    return canonical
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return None
+
+
+def switch_registered_project(project_root: str) -> dict:
+    """Switch only to an existing registry entry; never register implicitly."""
+    canonical = _registered_project_root(project_root)
+    if canonical is None:
+        requested = pathlib.Path(project_root).expanduser().resolve() if isinstance(project_root, str) else project_root
+        raise ValueError(f"project is not registered: {requested}")
+    return switch_project(str(canonical))
+
+
+def init_project_payload(project_root: str) -> dict:
+    """Initialize project files while preserving explicit registration policy."""
+    canonical = memory_project.normalize_project_root(project_root)
+    was_registered = _registered_project_root(str(canonical)) is not None
+    result = memory_project.init_project(str(canonical))
+    # ``memory_project.init_project`` refreshes an existing registry entry and
+    # selects it as current.  For a new/unregistered path, leave the current
+    # review project untouched and return the existing registry payload.
+    payload = switch_project(str(canonical)) if was_registered else project_payload()
+    return {"ok": True, "changes": result.get("changes", []), "projects": payload}
+
+
 def project_payload() -> dict:
     data = memory_project.list_projects()
-    current = str(review.PROJECT_ROOT)
-    if current and all(item.get("root") != current for item in data.get("projects", [])):
-        data = memory_project.register_project(current, make_current=True)
+    current = str(review.PROJECT_ROOT or "")
+    if current:
+        canonical_current = memory_project.normalize_project_root(current)
+        registered = {
+            item.get("root")
+            for item in data.get("projects", [])
+            if isinstance(item, dict) and isinstance(item.get("root"), str)
+        }
+        if str(canonical_current) in registered:
+            current = str(canonical_current)
+        else:
+            current = ""
     return {
-        "current_project": str(review.PROJECT_ROOT),
+        "current_project": current,
         "registry": data,
         "recommend_port": memory_project.recommend_port(),
-        "project": memory_project.project_entry(review.PROJECT_ROOT),
+        "project": memory_project.project_entry(pathlib.Path(current))
+        if current
+        else None,
     }
 
 
@@ -491,7 +673,7 @@ def split_memory_sections(text: str) -> list[dict]:
 
 
 def active_memory_sources() -> list[dict]:
-    return [
+    project_sources = [
         {
             "id": "project_long",
             "label": "项目长期记忆",
@@ -508,6 +690,8 @@ def active_memory_sources() -> list[dict]:
             "latest_first": True,
             "limit": 120,
         },
+    ]
+    personal_sources = [
         {
             "id": "personal_long",
             "label": "个人长期记忆",
@@ -525,6 +709,7 @@ def active_memory_sources() -> list[dict]:
             "limit": None,
         },
     ]
+    return project_sources + personal_sources if review.PROJECT_ROOT else personal_sources
 
 
 def active_memory_source(source_id: str) -> dict:
@@ -600,7 +785,7 @@ def page() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>记忆审批台</title>
+  <title>AI Coding 管理后台</title>
   <style>
     :root {
       color-scheme: dark;
@@ -761,7 +946,7 @@ def page() -> str:
       <div class="brand">
         <div class="brand-mark">忆</div>
         <div class="brand-copy">
-          <h1>记忆审批台</h1>
+          <h1>AI Coding 管理后台</h1>
           <div class="subtitle">跨项目记忆、审批和 Loop 初始化工作台</div>
         </div>
       </div>
@@ -813,7 +998,7 @@ def page() -> str:
         <button onclick="loadMemory()">刷新已生效记忆</button>
       </div>
       <div id="projectToolbar" class="project-toolbar">
-        <input id="projectPath" placeholder="输入本机项目仓库路径，例如 /Users/.../my_repo">
+        <input id="projectPath" placeholder="输入本机项目仓库路径，例如 ~/projects/my_repo">
         <input id="loopPort" placeholder="Loop staging 端口，留空用推荐值">
         <button onclick="registerProjectFromInput()">注册</button>
         <button onclick="initProjectFromInput()">初始化记忆</button>
@@ -1296,7 +1481,7 @@ function renderProjects(lastResult) {
     <div class="doc">
       <section class="doc-hero">
         <h2>项目管理</h2>
-        <p>记忆审核台代码是跨项目通用的，但每个仓库的项目长短期记忆独立存放在该仓库的 <code>codex/</code> 目录。切换当前项目后，后端会写入注册表，后续 API 直接读取所选项目，无需重启 8897。</p>
+        <p>AI Coding 管理后台代码是跨项目通用的，但每个仓库的项目长短期记忆独立存放在该仓库的 <code>codex/</code> 目录。切换当前项目后，后端会写入注册表，后续 API 直接读取所选项目，无需重启 8897。</p>
       </section>
       <section class="doc-section">
         <h3>初始化说明</h3>
@@ -1617,14 +1802,14 @@ function sourceFieldsMarkup() {
   if (uiSkillWizard.sourceType === 'local') {
     return `<div class="skill-field">
       <label for="uiSkillLocalPath">本地 Skill 目录绝对路径 *</label>
-      <input id="uiSkillLocalPath" value="${esc(fields.localPath)}" oninput="setUISkillWizardField('localPath', this.value)"${wizardErrorLink('localPath')} placeholder="/Users/.../my-ui-skill">
+      <input id="uiSkillLocalPath" value="${esc(fields.localPath)}" oninput="setUISkillWizardField('localPath', this.value)"${wizardErrorLink('localPath')} placeholder="~/skills/my-ui-skill">
       <div class="skill-field-help">目录内必须包含 SKILL.md；文件不会上传。</div>${wizardError('localPath')}
     </div>`;
   }
   if (uiSkillWizard.sourceType === 'zip') {
     return `<div class="skill-field">
       <label for="uiSkillZipPath">本地 ZIP 绝对路径 *</label>
-      <input id="uiSkillZipPath" value="${esc(fields.zipPath)}" oninput="setUISkillWizardField('zipPath', this.value)"${wizardErrorLink('zipPath')} placeholder="/Users/.../my-ui-skill.zip">
+      <input id="uiSkillZipPath" value="${esc(fields.zipPath)}" oninput="setUISkillWizardField('zipPath', this.value)"${wizardErrorLink('zipPath')} placeholder="~/skills/my-ui-skill.zip">
       <div class="skill-field-help">审核台读取本机 ZIP 并执行路径安全与体积校验；文件不会上传。</div>${wizardError('zipPath')}
     </div>`;
   }
@@ -1882,6 +2067,18 @@ async function uiSkillMutation(route, payload, dangerous, promptText) {
   return result;
 }
 
+function uiSkillProjectPayloadForDraft(draftId) {
+  const skill = (uiSkillState.items || []).find(item => item.id === draftId);
+  return skill && skill.scope && skill.scope.type === 'project' && projectState.current_project
+    ? {project: projectState.current_project} : {};
+}
+
+function uiSkillProjectPayloadForName(name) {
+  const skill = (uiSkillState.items || []).find(item => item.name === name);
+  return skill && skill.scope && skill.scope.type === 'project' && projectState.current_project
+    ? {project: projectState.current_project} : {};
+}
+
 async function handleUISkillAction(button) {
   const action = button.dataset.uiAction;
   const draft_id = button.dataset.id;
@@ -1889,15 +2086,15 @@ async function handleUISkillAction(button) {
   if (action === 'validate') await uiSkillMutation('validate', {draft_id}, false);
   if (action === 'request-revision') await uiSkillMutation('request-revision', {draft_id, reason: prompt('请输入修改要求') || '需要修改'}, false);
   if (action === 'reject') await uiSkillMutation('reject', {draft_id, reason: prompt('请输入拒绝原因') || ''}, true, '确认拒绝此 UI Skill 草稿？');
-  if (action === 'publish') await uiSkillMutation('publish', {draft_id, digest, project: projectState.current_project}, true, '确认原子发布到 Codex 与 Claude Code？');
+  if (action === 'publish') await uiSkillMutation('publish', {draft_id, digest, ...uiSkillProjectPayloadForDraft(draft_id)}, true, '确认原子发布到 Codex 与 Claude Code？');
   if (action === 'approve-publish') {
     if (!confirm('确认批准此摘要，并原子发布到 Codex 与 Claude Code？')) return;
     await api('/api/ui-skills/approve', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, confirmed: true, idempotency_key: idempotencyKey('skill-approve')})});
-    await api('/api/ui-skills/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, project: projectState.current_project, confirmed: true, idempotency_key: idempotencyKey('skill-publish')})});
+    await api('/api/ui-skills/publish', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({draft_id, digest, ...uiSkillProjectPayloadForDraft(draft_id), confirmed: true, idempotency_key: idempotencyKey('skill-publish')})});
     await loadUISkills();
   }
-  if (action === 'rollback') await uiSkillMutation('rollback', {name: button.dataset.name, version: button.dataset.version, project: projectState.current_project}, true, '确认将 Codex 与 Claude Code 同时回滚到此版本？');
-  if (action === 'disable') await uiSkillMutation('disable', {name: button.dataset.name, project: projectState.current_project}, true, '确认同时停用 Codex 与 Claude Code 中的此 Skill？');
+  if (action === 'rollback') await uiSkillMutation('rollback', {name: button.dataset.name, version: button.dataset.version, ...uiSkillProjectPayloadForName(button.dataset.name)}, true, '确认将 Codex 与 Claude Code 同时回滚到此版本？');
+  if (action === 'disable') await uiSkillMutation('disable', {name: button.dataset.name, ...uiSkillProjectPayloadForName(button.dataset.name)}, true, '确认同时停用 Codex 与 Claude Code 中的此 Skill？');
 }
 
 function renderMemoryStrategy() {
@@ -1918,7 +2115,7 @@ function renderMemoryStrategy() {
         <section class="doc-section">
           <h3>中心审核台</h3>
           <ul>
-            <li>代码仓库：<code>/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform</code></li>
+            <li>代码仓库：<code>&lt;repo-root&gt;</code></li>
             <li>本机地址：<code>http://127.0.0.1:8897/</code></li>
             <li>项目注册表：<code>~/.codex/memory_review/projects.json</code></li>
             <li>审核台只允许本机访问，负责查看候选、审批、编辑、删除、项目切换和初始化。</li>
@@ -2018,12 +2215,12 @@ function renderMemoryStrategy() {
       </section>
       <section class="doc-section">
         <h3>CLI 等价命令</h3>
-        <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py register /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py init-loop /path/to/repo --port 8082
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py upgrade-loop /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py list
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_project.py use /path/to/repo</pre>
+        <pre>python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py register /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py init /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py init-loop /path/to/repo --port 8082
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py upgrade-loop /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py list
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/memory_project.py use /path/to/repo</pre>
       </section>
     </div>
   `;
@@ -2195,22 +2392,22 @@ scripts/deploy_staging.sh</pre>
 
       <section class="doc-section">
         <h3>Worktree 常用命令</h3>
-        <pre>python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py start /path/to/repo \
+        <pre>python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py start /path/to/repo \
   --task &lt;slug&gt; --conversation &lt;conversation-id&gt;
 
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py status /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py finish /path/to/repo --task &lt;slug&gt;
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py status /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py finish /path/to/repo --task &lt;slug&gt;
 
 # 仅在用户明确批准合并主分支后：
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py release /path/to/repo \
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py release /path/to/repo \
   --task &lt;slug&gt; --approved --test-command "python3 -m pytest -q tests"
 
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py sync-canonical /path/to/repo
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py deploy-staging /path/to/repo \
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py sync-canonical /path/to/repo
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py deploy-staging /path/to/repo \
   --task &lt;slug&gt; --approved --command "./scripts/deploy_staging.sh" \
   --deployed-commit-command "./scripts/deployed_commit.sh"
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py verify /path/to/repo --task &lt;slug&gt;
-python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/worktree_flow.py cleanup /path/to/repo --task &lt;slug&gt; --approved</pre>
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py verify /path/to/repo --task &lt;slug&gt;
+python3 &lt;path-to-vibe_coding_manage_platform&gt;/scripts/worktree_flow.py cleanup /path/to/repo --task &lt;slug&gt; --approved</pre>
         <p>运行状态和锁保存在 <code>~/.codex/worktree_manager/</code>，不提交到项目仓库。清理只允许删除已经进入远端主分支且工作目录干净的本地 worktree；删除远端功能分支仍需单独授权。</p>
       </section>
 
@@ -2278,7 +2475,7 @@ python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/work
         <h3>noema_ai_box 当前配置</h3>
         <ul>
           <li>项目配置：<code>.loop/config.json</code></li>
-          <li>远程 staging：<code>root@8.210.155.175</code></li>
+          <li>远程 staging：<code>root@&lt;staging-host&gt;</code></li>
           <li>staging 端口：<code>8081</code></li>
           <li>staging 地址：<code>http://8.210.155.175:8081</code></li>
           <li>staging 数据库：<code>noema_ai_box_loop_staging</code></li>
@@ -2403,6 +2600,73 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         return
 
+    def _validate_request_metadata(self) -> tuple[str, int]:
+        if hasattr(self.headers, "get_all"):
+            host_values = self.headers.get_all("Host", [])
+        else:
+            host = self.headers.get("Host")
+            host_values = [] if host is None else [host]
+        if len(host_values) != 1:
+            raise ValueError("Host is invalid")
+        host = host_values[0]
+        if "#" in host or "?" in host:
+            raise ValueError("Host is invalid")
+        allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+        try:
+            parsed_host = urlparse(f"//{host}")
+            host_name = parsed_host.hostname
+            parsed_port = parsed_host.port
+        except ValueError as error:
+            raise ValueError("Host is invalid") from error
+        if (
+            parsed_host.username is not None
+            or parsed_host.password is not None
+            or parsed_host.netloc.endswith(":")
+            or parsed_host.path
+            or parsed_host.query
+            or parsed_host.fragment
+        ):
+            raise ValueError("Host is invalid")
+        host_port = PORT if parsed_port is None else parsed_port
+        if host_name not in allowed_hosts or host_port != PORT:
+            raise ValueError("Host must be loopback")
+        if "#" in self.path:
+            raise ValueError("Request target is invalid")
+        parsed_target = urlparse(self.path)
+        if parsed_target.scheme or parsed_target.netloc:
+            try:
+                target_port = parsed_target.port
+            except ValueError as error:
+                raise ValueError("Request target authority is invalid") from error
+            if (
+                parsed_target.scheme != "http"
+                or not parsed_target.netloc
+                or parsed_target.username is not None
+                or parsed_target.password is not None
+                or parsed_target.netloc.endswith(":")
+                or parsed_target.fragment
+            ):
+                raise ValueError("Request target authority is invalid")
+            authority_start = self.path.find("://") + 3
+            path_start = self.path.find("/", authority_start)
+            query_start = self.path.find("?", authority_start)
+            if query_start != -1 and (path_start == -1 or query_start < path_start):
+                raise ValueError("Request target authority is invalid")
+            target_port = 80 if target_port is None else target_port
+            if parsed_target.hostname != host_name or target_port != host_port:
+                raise ValueError("Request target authority must exactly match Host")
+        return host_name, host_port
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        try:
+            self._validate_request_metadata()
+        except ValueError:
+            self.send_error(400, "Invalid Host header")
+            return False
+        return True
+
     def send_json(self, value: object, status: int = 200) -> None:
         payload = json_bytes(value)
         self.send_response(status)
@@ -2412,7 +2676,30 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or 0)
+        host_name, host_port = self._validate_request_metadata()
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urlparse(origin)
+            try:
+                origin_port = parsed_origin.port or 80
+            except ValueError as error:
+                raise ValueError("Origin is invalid") from error
+            if (
+                parsed_origin.scheme != "http"
+                or parsed_origin.hostname != host_name
+                or origin_port != host_port
+            ):
+                raise ValueError("Origin must exactly match Host")
+        raw_length = self.headers.get("Content-Length", "0") or "0"
+        try:
+            length = int(raw_length)
+        except (TypeError, ValueError) as error:
+            raise ValueError("Content-Length must be an integer") from error
+        if not 0 <= length <= MAX_JSON_BODY:
+            raise ValueError("JSON body exceeds 64 KiB")
         if not length:
             return {}
         raw = self.rfile.read(length).decode("utf-8")
@@ -2428,7 +2715,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=ui_design_error_status(exc))
             return
         if parsed.path == "/health":
-            self.send_json({"ok": True, "url": review.REVIEW_URL})
+            self.send_json(health_payload())
+            return
+        if parsed.path == "/api/settings":
+            self.send_json(settings_payload())
             return
         if parsed.path == "/api/queue":
             self.send_json(review.load_queue(refresh=True))
@@ -2440,7 +2730,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(project_payload())
             return
         if parsed.path == "/":
-            payload = page().encode("utf-8")
+            force_first_run = parse_qs(parsed.query).get("first-run") == ["1"]
+            show_first_run = force_first_run or not bool(settings_payload()["first_run_complete"])
+            payload = (first_run_page() if show_first_run else page()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
@@ -2455,6 +2747,20 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path in UI_DESIGN_POST_ROUTES:
                 self.send_json(ui_design_post(parsed.path, self.read_json()))
                 return
+            if parsed.path == "/api/settings/first-run":
+                result = save_first_run_settings(self.read_json())
+                if result.get("bootout_after_response"):
+                    result["service_action"] = "bootout_scheduled"
+                    action_paths = vibe_memory_paths.for_home()
+                    generation = str(result["service_action_generation"])
+                self.send_json(result)
+                if result.get("bootout_after_response"):
+                    threading.Thread(
+                        target=scheduled_bootout_worker,
+                        args=(action_paths, generation),
+                        daemon=False,
+                    ).start()
+                return
             if parsed.path == "/api/projects/register":
                 body = self.read_json()
                 payload = switch_project(body.get("project_root", ""))
@@ -2462,14 +2768,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/projects/use":
                 body = self.read_json()
-                payload = switch_project(body.get("project_root", ""))
+                payload = switch_registered_project(body.get("project_root", ""))
                 self.send_json(payload)
                 return
             if parsed.path == "/api/projects/init":
                 body = self.read_json()
-                result = memory_project.init_project(body.get("project_root", ""))
-                payload = switch_project(result["project"]["root"])
-                self.send_json({"ok": True, "changes": result.get("changes", []), "projects": payload})
+                self.send_json(init_project_payload(body.get("project_root", "")))
                 return
             if parsed.path == "/api/projects/init-loop":
                 body = self.read_json()

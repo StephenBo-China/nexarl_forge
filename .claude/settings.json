@@ -1,9 +1,0 @@
-{
-  "hooks": {
-    "SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [{"type": "command", "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/shared_memory_hook.py\" session_start", "timeout": 10, "statusMessage": "Loading project memory"}]}],
-    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/shared_memory_hook.py\" user_prompt_submit", "timeout": 10, "statusMessage": "Recording project memory context"}]}],
-    "PreCompact": [{"matcher": "manual|auto", "hooks": [{"type": "command", "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/shared_memory_hook.py\" pre_compact", "timeout": 10, "statusMessage": "Preserving project memory"}]}],
-    "PostCompact": [{"matcher": "manual|auto", "hooks": [{"type": "command", "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/shared_memory_hook.py\" post_compact", "timeout": 10, "statusMessage": "Refreshing project memory"}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "/usr/bin/python3 \"$(git rev-parse --show-toplevel)/.claude/hooks/shared_memory_hook.py\" stop", "timeout": 10, "statusMessage": "Finalizing project memory checkpoint"}]}]
-  }
-}

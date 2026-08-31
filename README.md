@@ -1,641 +1,307 @@
-# Vibe Coding Manage Platform
+# AI Coding Management Console
 
-`vibe_coding_manage_platform` is a local management platform for Codex and
-Claude Code collaboration workflows. Its first built-in tool is the memory
-review console: a local-only web UI for reviewing, approving, editing, and
-rejecting project and personal memory candidates.
+中文使用说明：[AI Coding 管理后台中文指南](docs/README.zh-CN.md)
 
-The service is designed to be copied to another computer and used directly by
-Codex. It has no third-party Python dependencies; Python 3.10+ is enough.
+AI Coding Management Console is a local, approval-gated memory manager shared by Codex and
+Claude Code. It installs a versioned runtime, a stable `vibe-memory` command,
+universal user hooks, and a loopback-only management console. Moving or deleting
+the source clone after installation does not break the installed runtime.
 
-## 中文使用说明
+The first public release supports macOS (Apple Silicon and Intel) and requires
+Python 3.10+. It has no third-party Python dependencies. See the
+[Chinese user guide](docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md) for the complete
+Chinese walkthrough and the [release checklist](docs/RELEASE_CHECKLIST.md)
+before publishing a release candidate.
 
-完整的中文安装、操作、UI 设计审批、UI Skill 管理和故障排查说明，请参阅
-[记忆审核台中文版使用说明书](docs/MEMORY_REVIEW_USER_GUIDE.zh-CN.md)。
+## Install from a clone
 
-## What This Project Provides
-
-- A dark local web console at `http://127.0.0.1:8897/`.
-- Pending memory candidate review.
-- Active memory browsing, editing, and deletion.
-- Project registration and project switching.
-- New project memory initialization.
-- Optional Loop Engineering project initialization.
-- Personal long/short memory approval flow.
-- Project long memory approval flow.
-- Noise personal-memory candidate preview/rejection.
-- Built-in Loop Engineering usage documentation.
-- Multi-conversation worktree task registry and safe release CLI.
-- Repository-level release/staging locks and canonical workspace synchronization.
-- Remote-main, canonical-main, feature-ancestry, and deployment commit verification.
-- A CLI for terminal-based review and approval.
-
-## Directory Layout
-
-```text
-.
-├── README.md
-├── scripts/
-│   ├── memory_review.py
-│   ├── memory_project.py
-│   ├── memory_review_queue.py
-│   └── memory_review_server.py
-└── codex/                 # generated at runtime, ignored by git
-```
-
-Runtime files are generated under the target project's `codex/` directory:
-
-```text
-codex/memory_review_queue.json
-codex/memory_review_state.json
-codex/memory_review_server.log
-```
-
-These files may contain local candidate content or approval state and should not
-be committed.
-
-## Memory File Model
-
-The review console code lives in this repository. The project memory files are
-read from the target project root.
-
-By default, the target project root is the current working directory. You can
-override it with:
+Use a normal Terminal. Replace the example repository URL if you are installing
+from a fork:
 
 ```bash
-export MEMORY_REVIEW_PROJECT_ROOT=/path/to/project
+git clone https://gitee.com/StephenBo_China/vibe_coding_manage_platform.git
+cd vibe_coding_manage_platform
+./install.sh
 ```
 
-The review console reads these project memory files relative to the target
-project root:
-
-```text
-codex/codex_long_memory.md
-codex/codex_short_memory.md
-codex/memory_proposals.md
-```
-
-It also reads personal memory files from the current user home directory:
-
-```text
-~/.codex/personal_memory/long.md
-~/.codex/personal_memory/short.md
-~/.codex/personal_memory/proposals.md
-```
-
-Approved personal memories are written only after explicit approval. Candidate
-personal memories should remain in `~/.codex/personal_memory/proposals.md` until
-the user approves them.
-
-## Project Registry
-
-The memory review console is cross-project. It stores the list of known projects
-and the current project in:
-
-```text
-~/.codex/memory_review/projects.json
-```
-
-Each registered project keeps its own project memory files under that project
-root. Switching projects in the web UI updates the registry and reloads the
-backend project root without restarting the service.
-
-## Initialize A New Project
-
-Register a project:
+To enable both Codex and Claude Code hooks during installation:
 
 ```bash
-python3 scripts/memory_project.py register /path/to/repo
+./install.sh --with-claude-hooks
 ```
 
-Initialize project memory and Codex/Claude hooks:
+The installer verifies macOS and Python 3.10+, copies an immutable release to
+`~/Library/Application Support/VibeMemory/`, creates
+`~/.local/bin/vibe-memory`, structurally merges manager-owned user hooks,
+installs `~/Library/LaunchAgents/com.noema.vibe-memory.plist`, starts the local
+service, and runs `vibe-memory doctor`. Unrelated hooks are preserved and
+changed managed files receive timestamped backups.
+
+If `vibe-memory` is not found in zsh, add `~/.local/bin` to `PATH` and reload
+the shell configuration:
 
 ```bash
-python3 scripts/memory_project.py init /path/to/repo
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
+source "$HOME/.zshrc"
 ```
 
-This creates missing files only. Existing files are reported as `existing` and
-are not overwritten.
+## Complete first run
 
-Initialize a new Loop Engineering × Superpowers project. This creates schema 3,
-the complete method contract, standard artifact directories, and the managed
-completion validator:
+Open the healthy local service:
 
 ```bash
-python3 scripts/memory_project.py init-loop /path/to/repo --port 8082
+vibe-memory open
 ```
 
-Preview an existing Loop project upgrade without writing files:
+On first run, choose:
+
+- Codex hooks and, optionally, Claude Code hooks;
+- automatic candidate checks;
+- personal short-memory retention days;
+- whether the LaunchAgent starts at login;
+- the loopback service port (default `8897`);
+- an optional workspace to register.
+
+Formal personal long memory, personal short memory, and project long memory
+always require explicit approval; first-run settings cannot disable that rule.
+After installing or repairing hooks, close existing clients and start a fresh
+Codex or Claude Code session so the client reloads and trusts the new user-hook
+configuration.
+
+If you disable login startup, the LaunchAgent remains stopped after first run.
+Start it only for the current login session, without changing that preference:
 
 ```bash
-python3 scripts/memory_project.py preview-loop-upgrade /path/to/repo
+vibe-memory start && vibe-memory open
 ```
 
-Explicitly upgrade an existing Loop project after reviewing the preview. The
-upgrade preserves project-specific staging, database, OSS, port, remote path,
-verification commands, production guardrails, and unknown extension fields:
+The manual plist sets both `RunAtLoad=false` and `KeepAlive=false`, so it does
+not start at the next login and does not automatically relaunch after exit.
+If login startup is enabled, `vibe-memory start` preserves both lifecycle keys
+as true. In either mode it starts the current session without changing the
+saved preference.
+
+## Register and initialize a workspace
+
+A workspace may be a code repository or any other directory. Registration and
+initialization are deliberately separate:
 
 ```bash
-python3 scripts/memory_project.py upgrade-loop /path/to/repo
+vibe-memory project register "/path/to/workspace"
+vibe-memory project init "/path/to/workspace"
+vibe-memory project list
 ```
 
-Upgrade the central manager's marked memory-rule blocks and the two existing
-Codex/Claude memory hooks together. Changed managed files are preserved as
-timestamped `.bak.*` audit backups; no separate Superpowers hook is added:
+`project register` adds the canonical path to the global registry. `project
+init` creates missing project memory and managed instruction files only; it
+does not install project-local hooks. Universal Codex and Claude Code user
+hooks remain the single event entry point.
+
+For a registered cwd, the deepest registered parent is selected and both
+project and personal memory policy are supplied. An unregistered cwd is
+personal-only: it can produce a personal candidate, but no project candidate or
+project files are created.
+
+## Preview and apply legacy migration
+
+Register every target first. Preview is read-only; apply requires the explicit
+approval flag and an explicit registered root:
 
 ```bash
-python3 scripts/memory_project.py upgrade-memory /path/to/repo
+vibe-memory migrate preview --project-root "/path/to/workspace"
+vibe-memory migrate apply --approved --project-root "/path/to/workspace"
+vibe-memory doctor
 ```
 
-Initialization and upgrade do not install plugins, call external models, deploy
-staging, merge main, or access production. Codex and Claude Code use their own
-official Superpowers plugins. Loop remains the lifecycle authority for
-worktrees, branches, staging, evaluation, release, main merge, and production.
+Migration validates existing memory, projects, design preferences, UI design
+approval data, UI Skills, Loop configuration, and policy data. It removes only
+recognized legacy project-hook entries, preserves unrelated client config, and
+writes timestamped backups plus an audit result. A partial or failed result is
+non-zero; inspect the reported root, changed paths, backup paths, and failed
+control-plane areas before retrying. Always inspect both the preview JSON and
+its exit status: any project `error`, invalid preflight, or non-clean preview
+returns non-zero even though the complete diagnostic JSON is still printed.
 
-## Candidate Quality Policy
+## Memory behavior and governance
 
-- The active Codex or Claude Code conversation model distills candidates from
-  context it already has; hooks do not call another model API.
-- Hooks create local reminders and context packets only. They never copy raw
-  prompts into long-memory candidate files.
-- Personal candidates must be distilled cross-project habits, preferences,
-  thinking styles, collaboration patterns, or user-profile facts.
-- Project long-memory candidates are summarized by the active agent as durable
-  Markdown facts before review.
-- Project short memory stores a bounded prompt summary instead of the complete
-  raw prompt.
-- Detected personal noise can be quarantined and marked rejected while the
-  original proposal file remains untouched:
+The shared hooks write event metadata and a policy reminder only. They do not
+copy raw prompt text, summarize a prompt, call a model API, or manufacture a
+candidate. The active Codex or Claude Code model uses conversation context to
+distill personal long, personal short, project long, or project short
+candidates/working summaries, then submits only the distilled content.
+
+- Personal candidates contain reusable development habits, collaboration or
+  workflow preferences, thinking style, or stable user-profile facts.
+- Project candidates contain durable architecture, deployment, product,
+  technical-constraint, or project-workflow facts.
+- Project short memory is a model-distilled working summary, not captured
+  prompt text.
+- Raw conversations, one-off tasks, screenshots, URLs, local paths, uncertain
+  guesses, credentials, tokens, passwords, verification codes, and cloud
+  secrets are excluded.
+- Equivalent candidates are deduplicated; conflicts never overwrite active
+  memory automatically.
+- Personal long/short and project long candidates remain pending until the user
+  reviews the exact content and approves it. Rejection, editing, and deletion
+  remain explicit audited actions.
+
+The same storage, policy, approval state, and project registry are shared by
+Codex and Claude Code. Candidate provenance records which active model proposed
+the distilled content.
+
+## Review console
+
+`vibe-memory open` opens the loopback-only console. Its complete control plane
+includes:
+
+- **pending**: inspect, edit, approve, reject, defer, reset, and quarantine
+  memory candidates;
+- **active**: browse, search, edit, and delete active project/personal memory;
+- **projects**: register, switch, initialize, inspect, and upgrade workspaces;
+- **design preferences**: edit global defaults and project overrides and view
+  the effective merged value and provenance;
+- **UI design approval**: configure paths and `design_package` or
+  `project_global` hard-gate mode, review packages, approve a package/baseline,
+  request revision, reject, invalidate, and relock;
+- **UI Skills**: import or bootstrap, inspect source/license/scripts/diff,
+  validate, request revision, approve, publish to Codex and Claude Code,
+  disable, scan, and rollback immutable versions;
+- **Loop**: initialize or upgrade Loop × Superpowers and read worktree,
+  staging, evaluation, release, and production-approval guidance;
+- **policy**: inspect approval rules, scope routing, candidate categories,
+  precedence, privacy exclusions, audit, backup, and recovery behavior.
+
+The service binds only to `127.0.0.1`; do not expose it to the public internet.
+
+### UI Design Control Plane operator notes
+
+Managed publication defaults to `CODEX_UI_SKILLS_DIR=~/.codex/skills` and
+`CLAUDE_UI_SKILLS_DIR=~/.claude/skills`; tests must redirect both to disposable
+directories. The default `design_package` mode and optional `project_global`
+mode both require reviewed digests. Use `request-revision` instead of editing
+an approved immutable package, and treat every mutation as an idempotency-keyed
+operation. Changing managed paths resets `hard_gate_enabled`; re-enable it only
+after isolated hook smoke tests pass. A Real-client smoke test is a separate,
+explicitly approved check using fresh clients and a disposable project—it is
+never substituted for deterministic tests.
+
+## Update, rollback, and repair
+
+Updates come from an already reviewed local clone:
 
 ```bash
-python3 scripts/memory_review.py reject-noise-personal --apply
+cd "/path/to/local/clone"
+git pull --ff-only
+vibe-memory update --source-root "/path/to/local/clone"
+vibe-memory doctor
 ```
 
-If `--port` is omitted, the tool recommends the next available port based on
-registered projects. The web UI always asks the user to confirm the port before
-writing `.loop/config.json`.
-
-List registered projects:
+Update installs and validates a new release before switching the `current`
+runtime. It preserves data and keeps the previous release. If the updated
+runtime fails its smoke checks, inspect `vibe-memory doctor` and roll back:
 
 ```bash
-python3 scripts/memory_project.py list
+vibe-memory rollback
+vibe-memory doctor
 ```
 
-Switch the current project:
+Rollback switches managed program/configuration state; it does not discard
+memory created after the update. For drifted runtime assets, the LaunchAgent,
+or both hook clients, use:
 
 ```bash
-python3 scripts/memory_project.py use /path/to/repo
+vibe-memory repair
+vibe-memory hooks status
+vibe-memory hooks repair
+vibe-memory doctor
 ```
 
-## Start The Service
+`repair` recreates manager-owned runtime assets and restarts the LaunchAgent.
+`hooks repair` changes only recognized managed entries, preserves unrelated
+hooks, and runs hook smoke tests. Start a fresh Codex or Claude Code session
+after either command.
 
-For `noema_ai_box`, start the service from this repository and point it at the
-target project:
+## Uninstall safely
+
+The default uninstall removes the versioned runtime, CLI launcher, LaunchAgent,
+and manager-owned hook entries, but retains all user data:
 
 ```bash
-scripts/start_memory_review.sh /Users/stephenbo/Noema/Projects/noema_ai_box
+vibe-memory uninstall
 ```
 
-Equivalent explicit command:
+Retained data includes personal/project memory, proposals and review history,
+the project registry, design preferences, UI design approval/audit data, UI
+Skills and deployments, Loop configuration/worktree state, logs, and backups.
+Removing data requires both an explicit deletion approval and every exact
+managed target; review the paths before running it:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT=/Users/stephenbo/Noema/Projects/noema_ai_box \
-  python3 scripts/memory_review_queue.py ensure-server
+vibe-memory uninstall --remove-data --approved-data-deletion \
+  --data-path "$HOME/.codex/memory_review/projects.json"
 ```
 
-From another project directory, you can also run:
-
-```bash
-/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/start_memory_review.sh "$(pwd)"
-```
-
-Open:
-
-```text
-http://127.0.0.1:8897/
-```
-
-Health check:
-
-```bash
-curl -s http://127.0.0.1:8897/health
-```
-
-Foreground mode for debugging a specific project:
-
-```bash
-MEMORY_REVIEW_PROJECT_ROOT=/path/to/project python3 scripts/memory_review.py serve
-```
-
-or:
-
-```bash
-python3 scripts/memory_review_server.py
-```
-
-## CLI Usage
-
-List pending candidates for a target project:
-
-```bash
-MEMORY_REVIEW_PROJECT_ROOT=/path/to/project python3 scripts/memory_review.py list
-```
-
-Show a candidate:
-
-```bash
-python3 scripts/memory_review.py show M-YYYYMMDD-HHMMSS
-```
-
-Approve a project long-memory candidate:
-
-```bash
-python3 scripts/memory_review.py approve P-xxxxxxxxxxxx --target project_long
-```
-
-Approve a personal long-memory candidate:
-
-```bash
-python3 scripts/memory_review.py approve M-YYYYMMDD-HHMMSS --target personal_long
-```
-
-Approve a personal short-memory candidate:
-
-```bash
-python3 scripts/memory_review.py approve M-YYYYMMDD-HHMMSS --target personal_short
-```
-
-Reject a candidate:
-
-```bash
-python3 scripts/memory_review.py reject M-YYYYMMDD-HHMMSS
-```
-
-Defer a candidate:
-
-```bash
-python3 scripts/memory_review.py defer M-YYYYMMDD-HHMMSS
-```
-
-Preview obvious noisy personal candidates:
-
-```bash
-python3 scripts/memory_review.py reject-noise-personal
-```
-
-Reject obvious noisy personal candidates:
-
-```bash
-python3 scripts/memory_review.py reject-noise-personal --apply
-```
-
-### Bootstrap Managed UI Design Skills
-
-Create reviewable, validated drafts for the manager workflow and the two
-initial UI design skills:
-
-```bash
-python3 scripts/memory_review.py ui-skill bootstrap ui-design-workflow \
-  --idempotency-key bootstrap-ui-design-workflow-001
-
-python3 scripts/memory_review.py ui-skill bootstrap frontend-design \
-  --revision b29e7cf65e5cb78a5ac33d582270551bc74a14eb \
-  --idempotency-key bootstrap-frontend-design-001
-
-python3 scripts/memory_review.py ui-skill bootstrap ui-ux-pro-max \
-  --release v2.11.0 \
-  --revision 6142b073958df645d0fb27e682428e69599386dc \
-  --cli-version 2.11.0 \
-  --expected-npm-shasum 2ff4d811cf1dded593b9d1f37bad65ffa80cb87c \
-  --idempotency-key bootstrap-ui-ux-pro-max-001
-```
-
-Bootstrap never approves or publishes a skill. Each draft remains visible in
-the review console until the user explicitly approves and publishes it. The UI
-UX Pro Max bootstrap needs normal network and sandbox approval to inspect npm
-metadata and run its pinned generator. Generation happens in temporary
-directories; publication later copies the approved Codex or Claude variant and
-does not invoke `npx`.
-
-## UI Design Control Plane
-
-The `UI 设计审批`, `设计偏好`, and `UI Skills` console tabs form one shared
-control plane for Codex and Claude Code. For Web, App, and mini-program work,
-agents may research, read code, and create design artifacts before approval,
-but the managed `PreToolUse` hook blocks writes to formal frontend paths. Pure
-backend and non-visual work bypasses this gate.
-
-### Storage, backup, and recovery
-
-Global manager state lives below `UI_DESIGN_HOME` (default
-`~/.codex/ui_design`): global preferences, immutable Skill drafts and versions,
-deployment reports, discovery state, audit records, and idempotency results.
-Each project owns its gate state below `codex/ui_design/`:
-
-```text
-codex/ui_design/config.json
-codex/ui_design/preferences.json
-codex/ui_design/active-skills.json
-codex/ui_design/approvals.json
-codex/ui_design/audit.jsonl
-codex/ui_design/effective-context.json
-codex/ui_design/design-packages/<task-id>/
-```
-
-Managed installs target `CODEX_UI_SKILLS_DIR` and `CLAUDE_UI_SKILLS_DIR`
-(defaults `~/.codex/skills` and `~/.claude/skills`). Tests should always point
-all three environment variables to disposable directories. Atomic writes and
-two-target publication use staging directories; upgrades preserve changed
-managed hooks as timestamped `.bak.*` files. To recover, disable the hard gate,
-inspect `audit.jsonl` and deployment reports, restore the relevant backup, then
-run the hook smoke test before re-enabling. Never delete an unmanaged Skill as
-part of recovery.
-
-### Preferences and gate modes
-
-Global preferences are a complete schema inherited by every project. Project
-overrides use `inherit`, `replace`, `append`, or `clear`; the console shows the
-effective value and source of every field.
-
-Projects choose one approval mode:
-
-- `design_package` (default): approval is bound to one task, package digest,
-  version, and declared file patterns. A changed design document invalidates
-  the approval; undeclared frontend paths remain blocked.
-- `project_global`: a designated baseline design package unlocks all configured
-  formal frontend paths until explicit relock, mode change, or baseline digest
-  change. Switching modes always relocks.
-
-Changing path configuration sets `hard_gate_enabled` to false and resets both
-hook smoke-test results. Enabling the hard gate requires non-empty formal and
-design-artifact paths, explicit confirmation, and passing isolated smoke tests
-for both installed hooks. Generated and test-artifact path lists remain
-separate from formal frontend paths.
-
-```bash
-python3 scripts/memory_review.py ui-design project-config show --project /path/to/repo
-python3 scripts/memory_review.py ui-design project-config set-paths \
-  --project /path/to/repo --json-file /tmp/ui-paths.json \
-  --idempotency-key paths-001
-python3 scripts/memory_review.py ui-design project-config set-mode \
-  --project /path/to/repo --mode design_package --confirmed \
-  --idempotency-key mode-001
-python3 scripts/memory_review.py ui-design project-config enable-hard-gate \
-  --project /path/to/repo --confirmed --idempotency-key gate-001
-python3 scripts/memory_review.py ui-design project-config relock \
-  --project /path/to/repo --confirmed --idempotency-key relock-001
-```
-
-### Design-package lifecycle
-
-A package manifest declares pages, components, design files, and allowed formal
-frontend patterns. `design-brief.md`, `interaction-spec.md`, and
-`responsive-spec.md` are required. Approvals bind the normalized manifest and
-all declared file bytes to one SHA-256 digest.
-
-```bash
-python3 scripts/memory_review.py ui-design package create \
-  --project /path/to/repo --manifest /tmp/design-package.json \
-  --idempotency-key package-create-001
-python3 scripts/memory_review.py ui-design package list --project /path/to/repo
-python3 scripts/memory_review.py ui-design package approve \
-  --project /path/to/repo --task checkout-redesign --digest <sha256> \
-  --confirmed --idempotency-key package-approve-001
-python3 scripts/memory_review.py ui-design package request-revision \
-  --project /path/to/repo --task checkout-redesign \
-  --reason "Add touch error states" \
-  --idempotency-key package-request-revision-001
-python3 scripts/memory_review.py ui-design package invalidate \
-  --project /path/to/repo --task checkout-redesign --reason "Scope changed" \
-  --confirmed --idempotency-key package-invalidate-001
-```
-
-Use `package revise` with a reviewed replacement manifest. In
-`project_global` mode, set `project_global_baseline_task` in the reviewed
-project config and use `ui-design baseline approve` with `--confirmed`. Reject,
-invalidate, mode-change, and hard-gate actions require explicit confirmation.
-
-### UI Skill intake and publication
-
-The manager accepts editor text, a local directory, a ZIP archive, or a pinned
-GitHub repository/path/revision. Imported code is staged and statically
-validated; package scripts are reported but never executed. An agent-created UI
-Skill therefore appears as a visible draft in the console, where the user can
-inspect `SKILL.md`, license, scripts, digest, and diff before approval.
-
-The normal workflow is import → validate → approve → atomic publish to both
-agents. Use `request-revision` to return a draft, `rollback` to restore an
-approved immutable version on both targets, and `disable` to remove the managed
-version from both targets transactionally. Bootstrap creates reviewable drafts
-for `ui-design-workflow`, pinned `frontend-design`, and pinned UI UX Pro Max; it
-does not approve or publish them. Discovery is read-only: unmanaged, ignored,
-conflicting, or drifted Skill directories are reported without modification.
-
-Every mutation requires a unique `--idempotency-key`. Retrying the exact same
-operation returns the recorded result; reusing the key with different arguments
-returns a conflict. Digest conflicts must be resolved by reviewing the current
-content and approving its new digest, never by bypassing the check.
-
-### Hook trust and client boundaries
-
-The project initializer installs dependency-free manager-owned hooks for both
-clients and merges their configuration without replacing unrelated hooks.
-After hook or Skill changes, start fresh Codex and Claude Code sessions so each
-client reloads its configuration. Keep `hard_gate_enabled` false if either
-client fails the block contract.
-
-#### Real-client smoke test
-
-A Real-client smoke test is intentionally separate from deterministic tests. It
-requires explicit user approval before writing real home Skill directories or
-starting real clients. Publish the three approved Skills to both clients, start
-fresh sessions, compare visible names and versions, then use a disposable
-project to prove that design-artifact writes are allowed and formal frontend
-writes are denied before approval. Record the exact hook payload and decision;
-do not enable the real hard gate when either client behaves differently.
-
-The control plane never authorizes a main/master merge, production deployment,
-or write to real Codex/Claude Skill directories by itself. Those remain separate
-user approval boundaries. Prepared forward-test prompts are stored under
-`docs/superpowers/forward-tests/` and must not be dispatched to subagents or
-real clients without explicit authorization.
-
-## How To Associate Codex With This Project
-
-On another computer, clone this repository and tell Codex:
-
-```text
-Use /path/to/vibe_coding_manage_platform as my local memory review and vibe
-coding management platform. Start the memory review console with:
-python3 scripts/memory_review_queue.py ensure-server
-```
-
-Recommended Codex instruction:
-
-```text
-When I ask to review memories, open http://127.0.0.1:8897/ from the
-vibe_coding_manage_platform repository. Use this platform to review project and
-personal memory candidates. Do not write approved personal memory directly;
-only approve exact candidates after I confirm them.
-```
-
-If a project has Codex hooks, point the hook command to this repository's
-scripts or copy these scripts into the project. A typical project hook can run:
-
-```bash
-python3 /path/to/vibe_coding_manage_platform/scripts/memory_review_queue.py ensure-server
-```
-
-## How To Use With Another Project
-
-There are two common modes.
-
-### Mode 1: Run Review From This Platform Repo
-
-Use this repository as the management console. The console will read:
-
-- project memory files in the target project under `codex/`
-- personal memory files under `~/.codex/personal_memory/`
-
-This is the preferred mode. It keeps all memory review console code in this
-repository while each project keeps its own project memory data.
-
-### Mode 2: Legacy Per-Project Script Copy
-
-Older projects may still have copies of the three scripts in their own
-`scripts/` directory:
-
-```text
-scripts/memory_review.py
-scripts/memory_review_queue.py
-scripts/memory_review_server.py
-```
-
-Prefer replacing those hooks with a call to this central repository:
-
-```bash
-MEMORY_REVIEW_PROJECT_ROOT=/path/to/project \
-  python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_review_queue.py ensure-server
-```
-
-Each project still owns its own project memory files:
-
-```text
-codex/codex_long_memory.md
-codex/codex_short_memory.md
-codex/memory_proposals.md
-```
-
-## Personal Memory Governance
-
-Personal memory is approval-gated.
-
-Automatic personal-memory candidates should only describe the user as a worker
-and collaborator:
-
-- development habits
-- thinking style
-- collaboration preferences
-- workflow preferences
-- cross-project user profile
-
-Do not create personal-memory candidates from:
-
-- raw conversation transcripts
-- PRDs
-- screenshots
-- hook payloads
-- system prompts
-- ambient suggestions
-- one-off project task content
-- secrets, tokens, API keys, verification codes, RDS/OSS credentials
-
-## Loop Engineering Documentation
-
-The web console includes a `Loop 说明` tab. It documents:
-
-- how to start loop development
-- worktree-first multi-conversation development
-- how Codex and Claude Code divide work
-- how to use Playwright-based Claude evaluation
-- loop branch naming
-- staging deployment rules
-- stop conditions
-- common commands and examples
-
-## Worktree Development
-
-The original repository is the canonical workspace. Keep it on the configured
-main branch as a mirror of remote main; perform feature work in external
-worktrees. The required mapping is:
-
-```text
-one task or loop feature = one conversation = one worktree = one branch
-```
-
-Feature development may run concurrently. Main integration, main push,
-canonical synchronization, and shared staging deployment are serialized with
-repository locks. Main integration happens in a temporary release worktree
-based on the latest remote main branch, not in a dirty canonical workspace.
-
-After an approved merge, canonical synchronization uses `ff-only`. Dirty paths
-that overlap incoming paths block synchronization. The workflow never performs
-an automatic stash, reset, force push, checkout overwrite, or deletion of user
-files. Final completion requires remote main, canonical main, and deployment
-commits to match, and the feature commit to be an ancestor of main.
-
-Use the central CLI:
-
-```bash
-python3 scripts/worktree_flow.py start /path/to/repo \
-  --task feature-name --conversation conversation-id
-python3 scripts/worktree_flow.py status /path/to/repo
-python3 scripts/worktree_flow.py finish /path/to/repo --task feature-name
-
-# Only after explicit user approval to merge main:
-python3 scripts/worktree_flow.py release /path/to/repo \
-  --task feature-name --approved \
-  --test-command "python3 -m pytest -q tests"
-
-python3 scripts/worktree_flow.py sync-canonical /path/to/repo
-python3 scripts/worktree_flow.py deploy-staging /path/to/repo \
-  --task feature-name --approved \
-  --command "./scripts/deploy_staging.sh" \
-  --deployed-commit-command "./scripts/deployed_commit.sh"
-python3 scripts/worktree_flow.py verify /path/to/repo --task feature-name
-python3 scripts/worktree_flow.py cleanup /path/to/repo \
-  --task feature-name --approved
-```
-
-The complete lifecycle, safety rules, state model, and completion report are in
-[`docs/worktree_loop_workflow.md`](docs/worktree_loop_workflow.md).
-
-## Port And Security
-
-The service binds only to:
-
-```text
-127.0.0.1:8897
-```
-
-It is intended for local machine use only. Do not expose it directly to the
-public internet.
+Each `--data-path` must be an allowlisted exact managed regular file; it cannot be a directory
+or symlink. All targets are validated before the service is
+stopped or any hook/runtime asset is changed. Project data is never inferred
+for deletion. Omitting `--remove-data` is the recommended, recoverable uninstall.
 
 ## Troubleshooting
 
-If the service does not start:
+Start with machine-readable diagnostics:
 
 ```bash
-lsof -nP -iTCP:8897 -sTCP:LISTEN
+vibe-memory status
+vibe-memory doctor --json
+vibe-memory hooks status
 ```
 
-If another process is using the port, stop it or change `REVIEW_PORT` in
-`scripts/memory_review_queue.py`.
+- **Service or LaunchAgent unavailable:** if login startup is disabled, run
+  `vibe-memory start && vibe-memory open`. Otherwise run `vibe-memory repair`,
+  then `vibe-memory doctor`. Check
+  `~/Library/Logs/VibeMemory/` and the LaunchAgent status if it remains down.
+- **Port conflict:** stop the unexpected listener or reinstall/repair with a
+  free loopback port. `vibe-memory open` refuses an unhealthy or wrong service.
+- **Hook drift:** run `vibe-memory hooks repair`, then launch fresh clients.
+- **Claude hooks missing:** rerun `./install.sh --with-claude-hooks` from a
+  reviewed clone, or enable Claude Code in first run and repair.
+- **A registered project is not selected:** use the canonical directory path,
+  inspect `vibe-memory project list`, and register the correct parent.
+- **Migration is partial:** restore only from the reported timestamped backup,
+  correct the named control-plane area, preview again, then reapply with
+  `--approved`.
+- **Fresh client does not run hooks:** fully quit and restart that client;
+  approve/trust its user configuration when prompted. An already-running
+  session does not prove the installed hook was loaded.
 
-If browser access fails under a sandboxed Codex session, run the service from a
-normal terminal:
+## Developer-only source workflow
+
+The installed commands above are the supported end-user flow. Maintainers may
+run source-tree Python modules and test servers while developing this
+repository, but those direct commands are not the installed flow and must not
+be copied into user hooks. Run the release gate before publishing:
+
+Legacy control-plane maintenance still exposes the source-only operations
+`init-loop`, `preview-loop-upgrade`, `upgrade-loop`, and `upgrade-memory` in
+`scripts/memory_project.py`. They are retained for the installed console's Loop
+and project-upgrade backend; they are not a replacement for clone/install or
+the universal user hooks.
 
 ```bash
-cd /path/to/vibe_coding_manage_platform
-python3 scripts/memory_review.py serve
+python3 -m unittest discover -s tests -v
+python3 scripts/verify_release.py --tree .
+python3 scripts/public_release_check.py --tree .
 ```
+
+The gate has 13 checks: manifest, Python syntax, full unit tests, real Darwin
+installed-runtime E2E, public tree, LaunchAgent plist, loopback binding,
+permissions, Codex hook, Claude hook, complete control plane, rollback, and
+uninstall. Release evidence and independent Claude Code evaluation are covered
+by [docs/RELEASE_CHECKLIST.md](docs/RELEASE_CHECKLIST.md).
+
+## Security and license
+
+Vibe Memory is local-only, calls no external model API, and stores no
+credentials in its runtime configuration. Before publication, scan both the
+candidate tree and Git history. See [SECURITY.md](SECURITY.md) and
+[LICENSE](LICENSE).

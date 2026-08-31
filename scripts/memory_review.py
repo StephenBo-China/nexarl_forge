@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     propose_parser.add_argument("--title", required=True)
     propose_parser.add_argument("--summary", required=True)
     propose_parser.add_argument("--source-event", default="agent_summary")
+    propose_parser.add_argument(
+        "--source-agent",
+        choices=["codex", "claude-code", "unknown"],
+        default="unknown",
+    )
+    propose_parser.add_argument("--policy-version", type=int, default=1)
 
     noise_parser = sub.add_parser(
         "reject-noise-personal",
@@ -129,6 +135,8 @@ def main() -> int:
             args.title,
             args.summary,
             args.source_event,
+            source_agent=args.source_agent,
+            policy_version=args.policy_version,
         )
         print(json.dumps(value, ensure_ascii=False))
         return 0

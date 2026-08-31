@@ -10,33 +10,108 @@ explicit user action from the CLI or local review server.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
+import fcntl
 import hashlib
 import json
 import os
 import pathlib
 import re
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from typing import Any
 
 import memory_project
+from loop_superpowers import atomic_write_text
+from ui_design_store import atomic_write_json, exclusive_lock
 
 APP_ROOT = pathlib.Path(__file__).resolve().parents[1]
-PROJECT_ROOT = pathlib.Path(
-    os.environ.get("MEMORY_REVIEW_PROJECT_ROOT", str(memory_project.current_project(APP_ROOT)))
-).expanduser().resolve()
-ROOT = PROJECT_ROOT
-CODEX_DIR = PROJECT_ROOT / "codex"
+PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
+_PROJECT_ROOT_VALUE = os.environ.get("MEMORY_REVIEW_PROJECT_ROOT")
+
+
+def _registered_project_root(value: str | None) -> pathlib.Path | None:
+    """Return an explicitly requested root only when it is registered.
+
+    Hooks may pass ``MEMORY_REVIEW_PROJECT_ROOT`` for a workspace.  Treating
+    that value as authoritative would let an unregistered directory create a
+    project proposal/state tree.  Resolve the registry independently and fail
+    closed on malformed or inaccessible registry data.
+    """
+    if not value:
+        return None
+    try:
+        candidate = pathlib.Path(value).expanduser().resolve()
+        if not candidate.is_dir():
+            return None
+        projects = memory_project.registry().get("projects", [])
+        if not isinstance(projects, list):
+            return None
+        for entry in projects:
+            raw_root = entry.get("root") if isinstance(entry, dict) else None
+            if not isinstance(raw_root, str) or not raw_root:
+                continue
+            try:
+                if pathlib.Path(raw_root).expanduser().resolve() == candidate:
+                    return candidate
+            except (OSError, RuntimeError, ValueError):
+                continue
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+    return None
+
+
+PROJECT_ROOT = (
+    _registered_project_root(_PROJECT_ROOT_VALUE)
+    if _PROJECT_ROOT_VALUE
+    else memory_project.current_project()
+)
+ROOT = PROJECT_ROOT or APP_ROOT
+CODEX_DIR = PROJECT_ROOT / "codex" if PROJECT_ROOT else PERSONAL_DIR
 PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"
 PROJECT_LONG = CODEX_DIR / "codex_long_memory.md"
 PROJECT_QUEUE = CODEX_DIR / "memory_review_queue.json"
 PROJECT_STATE = CODEX_DIR / "memory_review_state.json"
+QUEUE_LOCK_FILENAME = "memory_review_queue.json.lock"
+SOURCE_EVENT_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}\Z")
+RESERVED_CANDIDATE_METADATA_KEYS = {
+    "approval_rule",
+    "approved_path",
+    "approved_target",
+    "candidate_id",
+    "category",
+    "content_digest",
+    "created",
+    "decided_at",
+    "equivalence",
+    "identity",
+    "memory_id",
+    "policy_version",
+    "quarantine_path",
+    "reason",
+    "risk_flags",
+    "scope",
+    "source_agent",
+    "source_agents",
+    "source_event",
+    "source_path",
+    "status",
+    "target",
+}
+RESERVED_CANDIDATE_METADATA_LINE = re.compile(
+    r"^(?:-\s*)?(?:"
+    + "|".join(re.escape(key) for key in sorted(RESERVED_CANDIDATE_METADATA_KEYS))
+    + r")\s*:",
+    flags=re.IGNORECASE,
+)
+CANDIDATE_HEADING_LINE = re.compile(r"^\s*###(?:\s|$)", flags=re.MULTILINE)
 
-PERSONAL_DIR = pathlib.Path.home() / ".codex" / "personal_memory"
 PERSONAL_PROPOSALS = PERSONAL_DIR / "proposals.md"
 PERSONAL_LONG = PERSONAL_DIR / "long.md"
 PERSONAL_SHORT = PERSONAL_DIR / "short.md"
@@ -86,6 +161,108 @@ def now() -> str:
     return _dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def _queue_lock_name(name: str) -> str:
+    if not name or pathlib.PurePath(name).name != name or name in {".", ".."}:
+        raise ValueError("unsafe queue lock")
+    return name
+
+
+def _queue_lock_stat(
+    *, path: pathlib.Path | None, directory_fd: int | None, name: str
+) -> os.stat_result | None:
+    try:
+        if path is not None:
+            return os.stat(path, follow_symlinks=False)
+        assert directory_fd is not None
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+@contextlib.contextmanager
+def queue_lock(
+    path: pathlib.Path | None = None,
+    *,
+    directory_fd: int | None = None,
+    name: str = QUEUE_LOCK_FILENAME,
+    timeout: float = 10.0,
+    deadline: float | None = None,
+    poll_interval: float = 0.02,
+):
+    """Lock the persistent queue-lock inode from a path or pinned directory fd."""
+    if (path is None) == (directory_fd is None):
+        raise ValueError("queue lock requires exactly one location")
+    name = _queue_lock_name(name)
+    if path is not None:
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+    timeout_deadline = time.monotonic() + max(timeout, 0.0)
+    lock_deadline = (
+        timeout_deadline if deadline is None else min(timeout_deadline, deadline)
+    )
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    descriptor = -1
+    while True:
+        try:
+            if path is not None:
+                descriptor = os.open(path, flags, 0o600)
+            else:
+                assert directory_fd is not None
+                descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except OSError as error:
+            raise ValueError("unsafe queue lock") from error
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            os.close(descriptor)
+            descriptor = -1
+            raise ValueError("unsafe queue lock")
+        os.fchmod(descriptor, 0o600)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                linked = _queue_lock_stat(
+                    path=path, directory_fd=directory_fd, name=name
+                )
+                if linked is None or (
+                    linked.st_dev,
+                    linked.st_ino,
+                ) != (opened.st_dev, opened.st_ino):
+                    os.close(descriptor)
+                    descriptor = -1
+                    break
+                remaining = lock_deadline - time.monotonic()
+                if remaining <= 0:
+                    os.close(descriptor)
+                    descriptor = -1
+                    raise TimeoutError("timed out waiting for queue lock") from None
+                time.sleep(min(max(poll_interval, 0.001), remaining))
+        if descriptor < 0:
+            continue
+        linked = _queue_lock_stat(path=path, directory_fd=directory_fd, name=name)
+        if linked is None or (linked.st_dev, linked.st_ino) != (
+            opened.st_dev,
+            opened.st_ino,
+        ):
+            os.close(descriptor)
+            descriptor = -1
+            if time.monotonic() >= lock_deadline:
+                raise TimeoutError("timed out waiting for queue lock")
+            continue
+        break
+
+    try:
+        yield
+    finally:
+        os.close(descriptor)
+
+
 def read_text(path: pathlib.Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -94,11 +271,7 @@ def read_text(path: pathlib.Path) -> str:
 
 
 def write_json(path: pathlib.Path, value: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_json(path, value)
 
 
 def read_json(path: pathlib.Path, default: Any) -> Any:
@@ -127,8 +300,116 @@ def split_heading_sections(text: str) -> list[tuple[str, str]]:
 
 
 def metadata_value(body: str, key: str) -> str:
-    match = re.search(rf"^{re.escape(key)}:\s*(.+)$", body, flags=re.MULTILINE)
-    return match.group(1).strip() if match else ""
+    match = re.search(rf"^(?:-\s*)?{re.escape(key)}:\s*(.+)$", body, flags=re.MULTILINE)
+    return match.group(1).strip().strip("`") if match else ""
+
+
+def candidate_provenance(body: str) -> tuple[str, list[str], int]:
+    source_agent = metadata_value(body, "source_agent") or "unknown"
+    if source_agent not in {"codex", "claude-code", "unknown"}:
+        source_agent = "unknown"
+    source_agents = {
+        value.strip()
+        for value in metadata_value(body, "source_agents").split(",")
+        if value.strip() in {"codex", "claude-code", "unknown"}
+    }
+    source_agents.add(source_agent)
+    raw_policy_version = metadata_value(body, "policy_version") or "1"
+    try:
+        policy_version = int(raw_policy_version)
+    except ValueError:
+        policy_version = 1
+    if policy_version <= 0:
+        policy_version = 1
+    return source_agent, sorted(source_agents), policy_version
+
+
+def without_candidate_metadata(body: str) -> str:
+    return re.sub(
+        r"^(?:-\s*)?(?:candidate_id|source_event|source_agent|source_agents|policy_version|identity|equivalence|category):\s*.+$",
+        "",
+        body,
+        flags=re.MULTILINE,
+    ).strip()
+
+
+def write_proposals_atomically(path: pathlib.Path, content: str) -> None:
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    atomic_write_text(path, content, mode=mode)
+
+
+def merge_candidate_source_agent(
+    text: str, equivalence: str, source_agent: str, scope: str
+) -> tuple[str, str, list[str]] | None:
+    headings = list(re.finditer(r"^### .+$", text, flags=re.MULTILINE))
+    for index, heading_match in enumerate(headings):
+        body_start = heading_match.end()
+        body_end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        body = text[body_start:body_end]
+        original_heading = heading_match.group(0).strip()
+        original_body = body
+        original_id = (
+            metadata_value(original_body, "memory_id")
+            or metadata_value(original_body, "candidate_id")
+            or stable_id("P", PROJECT_PROPOSALS, original_heading, original_body.strip())
+        )
+        if scope == "personal" and (metadata_value(body, "status") or "pending") != "pending":
+            continue
+        stored_identity, stored_equivalence, _, _, _ = candidate_keys_from_section(
+            scope, heading_match.group(0).strip(), body
+        )
+        if stored_equivalence != equivalence:
+            continue
+        _, source_agents, _ = candidate_provenance(body)
+        merged_agents = sorted({*source_agents, source_agent})
+        prefix = "- " if scope == "project" else ""
+        additions: list[str] = []
+        if scope == "project" and not metadata_value(body, "candidate_id"):
+            additions.append(f"- candidate_id: `{original_id}`")
+        if not metadata_value(body, "source_agent"):
+            additions.append(
+                f"{prefix}source_agent: " + ("`unknown`" if prefix else "unknown")
+            )
+        if not metadata_value(body, "identity") and stored_identity:
+            additions.append(
+                f"{prefix}identity: "
+                + (f"`{stored_identity}`" if prefix else stored_identity)
+            )
+        if not metadata_value(body, "equivalence"):
+            additions.append(
+                f"{prefix}equivalence: "
+                + (f"`{stored_equivalence}`" if prefix else stored_equivalence)
+            )
+        if additions:
+            source_event_line = re.search(
+                r"^(?:-\s*)?source_event:\s*.+$", body, flags=re.MULTILINE
+            )
+            insertion = source_event_line.end() if source_event_line else 0
+            body = body[:insertion] + "\n" + "\n".join(additions) + body[insertion:]
+        if merged_agents != source_agents or not metadata_value(body, "source_agents"):
+            value = ",".join(merged_agents)
+            rendered = f"{prefix}source_agents: " + (f"`{value}`" if prefix else value)
+            if re.search(r"^(?:-\s*)?source_agents:\s*.+$", body, flags=re.MULTILINE):
+                body = re.sub(
+                    r"^(?:-\s*)?source_agents:\s*.+$",
+                    rendered,
+                    body,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+            else:
+                source_line = re.search(
+                    r"^(?:-\s*)?source_agent:\s*.+$", body, flags=re.MULTILINE
+                )
+                if source_line is None:
+                    raise ValueError("candidate provenance is missing source_agent")
+                body = body[: source_line.end()] + "\n" + rendered + body[source_line.end() :]
+        updated = text[:body_start] + body + text[body_end:]
+        return updated, original_id, merged_agents
+    return None
 
 
 def first_fenced_text(body: str) -> str:
@@ -147,8 +428,103 @@ def normalize_memory(text: str) -> str:
     return re.sub(r"\W+", "", text.lower())
 
 
+def candidate_identity(
+    scope: str, target: str, category: str, title: str, summary: str
+) -> str:
+    value = json.dumps(
+        [scope, target, category, normalize_memory(title), normalize_memory(summary)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def candidate_equivalence(scope: str, target: str, category: str, summary: str) -> str:
+    value = json.dumps(
+        [scope, target, category, normalize_memory(summary)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def candidate_content_parts(content: str) -> tuple[str, str, str]:
+    title_match = re.search(r"\*\*标题：(.*?)\*\*", content, flags=re.S)
+    category_match = re.search(r"\*\*分类：(.*?)\*\*", content, flags=re.S)
+    title = title_match.group(1).strip() if title_match else ""
+    category_label = category_match.group(1).strip() if category_match else ""
+    if category_match:
+        summary = content[category_match.end() :].strip()
+    elif title_match:
+        summary = content[title_match.end() :].strip()
+    else:
+        summary = content.strip()
+    return title, category_label, summary
+
+
+def category_key(scope: str, value: str) -> str:
+    if value in AGENT_CATEGORIES[scope]:
+        return value
+    for key, label in AGENT_CATEGORIES[scope].items():
+        if value == label:
+            return key
+    return ""
+
+
+def candidate_keys_from_section(
+    scope: str, heading: str, body: str
+) -> tuple[str, str, str, str, str]:
+    target = metadata_value(body, "target") or ("long" if scope == "project" else "")
+    content = first_fenced_text(body) if scope == "personal" else without_candidate_metadata(body)
+    content_title, content_category, summary = candidate_content_parts(content)
+    category = metadata_value(body, "category") or category_key(scope, content_category)
+    title = content_title
+    if not title and scope == "project":
+        heading_text = heading.removeprefix("### ").strip()
+        title = heading_text.split(" - ", 1)[1] if " - " in heading_text else heading_text
+    identity = metadata_value(body, "identity")
+    equivalence = metadata_value(body, "equivalence")
+    if not identity and target and category and title and summary:
+        identity = candidate_identity(scope, target, category, title, summary)
+    if not equivalence and target and category and summary:
+        equivalence = candidate_equivalence(scope, target, category, summary)
+    return identity, equivalence, category, title, summary
+
+
+def approved_contains_equivalent(
+    text: str, scope: str, category: str, summary: str
+) -> bool:
+    sections = split_heading_sections(text)
+    bodies = [body for _, body in sections] if sections else [text]
+    expected_summary = normalize_memory(summary)
+    for body in bodies:
+        _, category_label, approved_summary = candidate_content_parts(body)
+        if (
+            category_key(scope, category_label) == category
+            and normalize_memory(approved_summary) == expected_summary
+        ):
+            return True
+    return False
+
+
 def risk_flags(text: str) -> list[str]:
     return sorted(name for name, pattern in SENSITIVE_PATTERNS.items() if pattern.search(text))
+
+
+def validate_candidate_text(title: str, summary: str, source_event: str) -> None:
+    """Reject candidate prose that can escape or spoof trusted Markdown metadata."""
+    if not isinstance(source_event, str) or not SOURCE_EVENT_PATTERN.fullmatch(source_event):
+        raise ValueError("source_event must be a safe metadata identifier")
+    if "```" in title or "```" in summary:
+        raise ValueError("candidate title/summary cannot contain fenced Markdown")
+    for value in (title, summary):
+        if CANDIDATE_HEADING_LINE.search(value):
+            raise ValueError("candidate title/summary cannot contain candidate heading lines")
+        if any(
+            RESERVED_CANDIDATE_METADATA_LINE.match(line)
+            for line in re.split(r"[\r\n]", value)
+        ):
+            raise ValueError("candidate title/summary cannot contain reserved metadata lines")
 
 
 def is_noise_personal_candidate(item: dict[str, Any]) -> bool:
@@ -185,7 +561,11 @@ def is_project_checkpoint(heading: str, body: str) -> bool:
     )
 
 
-def state_map() -> dict[str, Any]:
+def state_lock_path() -> pathlib.Path:
+    return PROJECT_STATE.with_suffix(PROJECT_STATE.suffix + ".lock")
+
+
+def _state_map_unlocked() -> dict[str, Any]:
     state = read_json(PROJECT_STATE, {"items": {}, "last_reminder_at": ""})
     if not isinstance(state, dict):
         state = {"items": {}, "last_reminder_at": ""}
@@ -196,13 +576,41 @@ def state_map() -> dict[str, Any]:
     return state
 
 
-def parse_project_candidates() -> list[dict[str, Any]]:
-    text = read_text(PROJECT_PROPOSALS)
+def state_map() -> dict[str, Any]:
+    with exclusive_lock(state_lock_path()):
+        return _state_map_unlocked()
+
+
+def mutate_state(
+    mutation: Callable[[dict[str, Any]], bool],
+) -> tuple[dict[str, Any], bool]:
+    """Apply one state read-modify-write transaction under the shared lock."""
+    with exclusive_lock(state_lock_path()):
+        state = _state_map_unlocked()
+        changed = mutation(state)
+        if changed:
+            write_json(PROJECT_STATE, state)
+        return state, changed
+
+
+def parse_project_candidates(
+    text: str | None = None,
+    source_path: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
+    source_path = PROJECT_PROPOSALS if source_path is None else source_path
+    text = read_text(source_path) if text is None else text
     items: list[dict[str, Any]] = []
     for heading, body in split_heading_sections(text):
-        candidate_id = stable_id("P", PROJECT_PROPOSALS, heading, body)
+        candidate_id = metadata_value(body, "candidate_id") or stable_id(
+            "P", source_path, heading, body
+        )
         created = heading.removeprefix("### ").split(" - ", 1)[0].strip()
-        content = body.strip()
+        source_event = metadata_value(body, "source_event")
+        source_agent, source_agents, policy_version = candidate_provenance(body)
+        identity, equivalence, category, _, _ = candidate_keys_from_section(
+            "project", heading, body
+        )
+        content = without_candidate_metadata(body)
         checkpoint = is_project_checkpoint(heading, content)
         items.append(
             {
@@ -212,7 +620,14 @@ def parse_project_candidates() -> list[dict[str, Any]]:
                 "review_kind": "checkpoint" if checkpoint else "memory",
                 "actionable": not checkpoint,
                 "source": "project_proposals",
-                "source_path": str(PROJECT_PROPOSALS),
+                "source_event": source_event,
+                "source_agent": source_agent,
+                "source_agents": source_agents,
+                "policy_version": policy_version,
+                "identity": identity,
+                "equivalence": equivalence,
+                "category": category,
+                "source_path": str(source_path),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
                 "summary": short_summary(content),
@@ -223,8 +638,12 @@ def parse_project_candidates() -> list[dict[str, Any]]:
     return items
 
 
-def parse_personal_candidates() -> list[dict[str, Any]]:
-    text = read_text(PERSONAL_PROPOSALS)
+def parse_personal_candidates(
+    text: str | None = None,
+    source_path: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
+    source_path = PERSONAL_PROPOSALS if source_path is None else source_path
+    text = read_text(source_path) if text is None else text
     items: list[dict[str, Any]] = []
     for heading, body in split_heading_sections(text):
         memory_id = metadata_value(body, "memory_id")
@@ -238,6 +657,10 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
         target = metadata_value(body, "target") or "unsure"
         created = metadata_value(body, "created") or heading.removeprefix("### ").strip()
         source_event = metadata_value(body, "source_event")
+        source_agent, source_agents, policy_version = candidate_provenance(body)
+        identity, equivalence, category, _, _ = candidate_keys_from_section(
+            "personal", heading, body
+        )
         content = first_fenced_text(body)
         items.append(
             {
@@ -248,7 +671,13 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
                 "actionable": True,
                 "source": "personal_proposals",
                 "source_event": source_event,
-                "source_path": str(PERSONAL_PROPOSALS),
+                "source_agent": source_agent,
+                "source_agents": source_agents,
+                "policy_version": policy_version,
+                "identity": identity,
+                "equivalence": equivalence,
+                "category": category,
+                "source_path": str(source_path),
                 "created_at": created,
                 "title": heading.removeprefix("### ").strip(),
                 "summary": short_summary(content),
@@ -259,22 +688,51 @@ def parse_personal_candidates() -> list[dict[str, Any]]:
     return items
 
 
-def build_queue() -> dict[str, Any]:
-    state = state_map()
+def build_queue_from_documents(
+    project_text: str,
+    personal_text: str,
+    state: dict[str, Any],
+    *,
+    project_source_path: pathlib.Path,
+    personal_source_path: pathlib.Path,
+) -> dict[str, Any]:
+    """Build queue data from caller-pinned documents without writing files."""
+    items = parse_project_candidates(
+        project_text, project_source_path
+    ) + parse_personal_candidates(personal_text, personal_source_path)
+    return _build_queue_from_items(items, state)
+
+
+def _build_queue_from_items(
+    items: list[dict[str, Any]], state: dict[str, Any]
+) -> dict[str, Any]:
     decisions = state.get("items", {})
-    items = parse_project_candidates() + parse_personal_candidates()
+    if not isinstance(decisions, dict):
+        decisions = {}
     for item in items:
         decision = decisions.get(item["id"], {})
+        if not isinstance(decision, dict):
+            decision = {}
         item["status"] = decision.get("status", "pending")
         item["decision"] = decision
-    queue = {
+    return {
         "generated_at": now(),
         "review_url": REVIEW_URL,
         "items": items,
         "counts": count_items(items),
     }
-    write_json(PROJECT_QUEUE, queue)
-    return queue
+
+
+def build_queue() -> dict[str, Any]:
+    queue_lock_path = PROJECT_QUEUE.with_suffix(PROJECT_QUEUE.suffix + ".lock")
+    with queue_lock(path=queue_lock_path):
+        queue = _build_queue_from_items(
+            (parse_project_candidates() if PROJECT_ROOT else [])
+            + parse_personal_candidates(),
+            state_map(),
+        )
+        write_json(PROJECT_QUEUE, queue)
+        return queue
 
 
 def create_agent_candidate(
@@ -284,53 +742,124 @@ def create_agent_candidate(
     title: str,
     summary: str,
     source_event: str = "agent_summary",
+    *,
+    source_agent: str = "unknown",
+    policy_version: int = 1,
 ) -> dict[str, Any]:
     """Persist a candidate already distilled by the active Codex/Claude model."""
+    validate_candidate_text(title, summary, source_event)
     title = re.sub(r"\s+", " ", title).strip()[:100]
     summary = summary.strip()
     if scope not in {"personal", "project"}:
         raise ValueError("scope must be personal or project")
+    if scope == "project" and PROJECT_ROOT is None:
+        raise ValueError("project candidates require a registered current project")
     if target not in {"long", "short"}:
         raise ValueError("target must be long or short")
     if scope == "project" and target != "long":
         raise ValueError("project candidates must target long memory")
     if category not in AGENT_CATEGORIES[scope]:
         raise ValueError("unsupported candidate category")
+    if source_agent not in {"codex", "claude-code", "unknown"}:
+        raise ValueError("source_agent must be codex, claude-code, or unknown")
+    if (
+        not isinstance(policy_version, int)
+        or isinstance(policy_version, bool)
+        or policy_version <= 0
+    ):
+        raise ValueError("policy_version must be a positive integer")
     if not title or len(summary) < 12 or len(summary) > 1200:
         raise ValueError("candidate title/summary length is invalid")
-    if risk_flags(summary):
+    if risk_flags(f"{title}\n{summary}"):
         raise ValueError("candidate contains sensitive material")
-    needle = normalize_memory(summary)
-    sources = [read_text(PERSONAL_PROPOSALS), read_text(PERSONAL_LONG), read_text(PERSONAL_SHORT)]
-    if scope == "project":
-        sources = [read_text(PROJECT_PROPOSALS), read_text(PROJECT_LONG)]
-    if needle and any(needle in normalize_memory(text) for text in sources):
-        return {"created": False, "reason": "duplicate"}
-
-    created = now()
     markdown = f"**标题：{title}**\n\n**分类：{AGENT_CATEGORIES[scope][category]}**\n\n{summary}"
-    if scope == "personal":
-        existing = read_text(PERSONAL_PROPOSALS)
-        stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
-        candidate_id = f"M-{stamp}"
-        suffix = 2
-        while candidate_id in existing:
-            candidate_id = f"M-{stamp}-{suffix}"
-            suffix += 1
-        with PERSONAL_PROPOSALS.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n### {candidate_id}\n\n")
-            handle.write(f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n")
-            handle.write(f"created: {created}\nsource_event: {source_event}\n")
-            handle.write(f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n")
-            handle.write("approval_rule: Promote only after explicit user approval of this exact content.\n")
-    else:
-        candidate_id = stable_id("P", PROJECT_PROPOSALS, title, summary)
-        with PROJECT_PROPOSALS.open("a", encoding="utf-8") as handle:
-            handle.write(f"\n### {created} - {title}\n\n")
-            handle.write(f"**分类：{category}**\n\n{summary}\n\n")
-            handle.write(f"- source_event: `{source_event}`\n")
+    identity = candidate_identity(scope, target, category, title, summary)
+    equivalence = candidate_equivalence(scope, target, category, summary)
+    proposals = PERSONAL_PROPOSALS if scope == "personal" else PROJECT_PROPOSALS
+    proposal_lock = proposals.with_suffix(proposals.suffix + ".lock")
+    result: dict[str, Any]
+    with exclusive_lock(proposal_lock):
+        existing = read_text(proposals)
+        merged = merge_candidate_source_agent(
+            existing, equivalence, source_agent, scope
+        )
+        if merged is not None:
+            updated, candidate_id, source_agents = merged
+            if updated != existing:
+                write_proposals_atomically(proposals, updated)
+            result = {
+                "created": False,
+                "reason": "duplicate",
+                "id": candidate_id,
+                "source_agents": source_agents,
+            }
+        else:
+            if scope == "personal":
+                approved_path = PERSONAL_LONG if target == "long" else PERSONAL_SHORT
+            else:
+                approved_path = PROJECT_LONG
+            approved = read_text(approved_path)
+            if approved_contains_equivalent(approved, scope, category, summary):
+                result = {"created": False, "reason": "duplicate"}
+            else:
+                created = now()
+                source_agents = sorted({source_agent})
+                rendered_agents = ",".join(source_agents)
+                if scope == "personal":
+                    stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+                    candidate_id = f"M-{stamp}"
+                    suffix = 2
+                    while candidate_id in existing:
+                        candidate_id = f"M-{stamp}-{suffix}"
+                        suffix += 1
+                    body = (
+                        f"memory_id: {candidate_id}\nstatus: pending\ntarget: {target}\n"
+                        f"created: {created}\nsource_event: {source_event}\n"
+                        f"source_agent: {source_agent}\nsource_agents: {rendered_agents}\n"
+                        f"policy_version: {policy_version}\nidentity: {identity}\n"
+                        f"equivalence: {equivalence}\n"
+                        f"category: {category}\n\ncandidate:\n\n```text\n{markdown}\n```\n\n"
+                        "approval_rule: Promote only after explicit user approval of this exact content."
+                    )
+                    section = f"\n### {candidate_id}\n\n{body}\n"
+                else:
+                    heading = f"### {created} - {title}"
+                    body_without_id = (
+                        f"{markdown}\n\n"
+                        f"- source_event: `{source_event}`\n"
+                        f"- source_agent: `{source_agent}`\n"
+                        f"- source_agents: `{rendered_agents}`\n"
+                        f"- policy_version: `{policy_version}`\n"
+                        f"- identity: `{identity}`\n"
+                        f"- equivalence: `{equivalence}`\n"
+                        f"- category: `{category}`"
+                    )
+                    candidate_id = stable_id(
+                        "P", PROJECT_PROPOSALS, heading, body_without_id
+                    )
+                    body = (
+                        f"{markdown}\n\n"
+                        f"- candidate_id: `{candidate_id}`\n"
+                        f"- source_event: `{source_event}`\n"
+                        f"- source_agent: `{source_agent}`\n"
+                        f"- source_agents: `{rendered_agents}`\n"
+                        f"- policy_version: `{policy_version}`\n"
+                        f"- identity: `{identity}`\n"
+                        f"- equivalence: `{equivalence}`\n"
+                        f"- category: `{category}`"
+                    )
+                    section = f"\n{heading}\n\n{body}\n"
+                write_proposals_atomically(proposals, existing + section)
+                result = {
+                    "created": True,
+                    "id": candidate_id,
+                    "scope": scope,
+                    "target": target,
+                    "content": markdown,
+                    "source_agents": source_agents,
+                }
     build_queue()
-    return {"created": True, "id": candidate_id, "scope": scope, "target": target, "content": markdown}
+    return result
 
 
 def count_items(items: list[dict[str, Any]]) -> dict[str, int]:
@@ -384,23 +913,62 @@ def memory_title(item: dict[str, Any], content: str) -> str:
     return summary[:64] or item.get("id", "Approved memory")
 
 
-def append_official_memory(path: pathlib.Path, item: dict[str, Any], content: str) -> None:
+def append_official_memory(
+    path: pathlib.Path,
+    item: dict[str, Any],
+    content: str,
+    *,
+    managed_short: bool = False,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     title = memory_title(item, content)
     date = _dt.datetime.now().astimezone().date().isoformat()
-    entry = f"\n### {date} - {title}\n\n{content.strip()}\n"
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(entry)
+    if managed_short:
+        import vibe_memory_settings
+        entry = "\n" + vibe_memory_settings.render_managed_short_envelope(
+            f"{date} - {title}", content
+        )
+    else:
+        entry = f"\n### {date} - {title}\n\n{content.strip()}\n"
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    atomic_write_text(path, read_text(path) + entry, mode=mode)
+
+
+def official_contains_content_digest(
+    official_text: str, content: str, content_digest: str
+) -> bool:
+    """Recognize an exact approved body so reset/reapprove stays idempotent."""
+    canonical_content = content.strip()
+    if hashlib.sha256(canonical_content.encode("utf-8")).hexdigest() != content_digest:
+        return False
+    return f"\n\n{canonical_content}\n" in official_text
 
 
 def decision_target_path(target: str) -> pathlib.Path:
     if target == "project_long":
+        if PROJECT_ROOT is None:
+            raise ValueError("project approval requires a registered current project")
         return PROJECT_LONG
     if target == "personal_long":
         return PERSONAL_LONG
     if target == "personal_short":
         return PERSONAL_SHORT
     raise ValueError(f"Unsupported approval target: {target}")
+
+
+def validate_approval_target(item: dict[str, Any], target: str) -> None:
+    if not isinstance(target, str):
+        raise ValueError("approval target must be a string")
+    scope = item.get("scope")
+    if scope == "personal" and target not in {"personal_long", "personal_short"}:
+        raise ValueError("personal candidates must target personal memory")
+    if scope == "project" and target != "project_long":
+        raise ValueError("project candidates must target project memory")
+    if scope not in {"personal", "project"}:
+        raise ValueError("candidate has unsupported memory scope")
 
 
 def approve(candidate_id: str, target: str | None = None, content: str | None = None) -> dict[str, Any]:
@@ -412,28 +980,87 @@ def approve(candidate_id: str, target: str | None = None, content: str | None = 
             target = "personal_short"
         else:
             target = "personal_long"
+    validate_approval_target(item, target)
     approved_content = (content if content is not None else item.get("content", "")).strip()
     if not approved_content:
         raise ValueError("Cannot approve empty memory content")
+    if risk_flags(f"{item.get('title', '')}\n{approved_content}"):
+        raise ValueError("Cannot approve candidate containing sensitive material")
     destination = decision_target_path(target)
-    append_official_memory(destination, item, approved_content)
-    record_decision(
-        candidate_id,
-        {
-            "status": "approved",
-            "approved_target": target,
-            "approved_path": str(destination),
-            "decided_at": now(),
-            "risk_flags": item.get("risk_flags", []),
-        },
-    )
+    content_digest = hashlib.sha256(approved_content.encode("utf-8")).hexdigest()
+    decision = {
+        "status": "approved",
+        "approved_target": target,
+        "approved_path": str(destination),
+        "decided_at": now(),
+        "content_digest": content_digest,
+        "risk_flags": item.get("risk_flags", []),
+        "source_agent": item.get("source_agent", "unknown"),
+        "source_agents": item.get("source_agents", [item.get("source_agent", "unknown")]),
+        "policy_version": item.get("policy_version", 1),
+        "identity": item.get("identity", ""),
+        "equivalence": item.get("equivalence", ""),
+    }
+    target_lock = destination.with_suffix(destination.suffix + ".lock")
+    # Lock order is stable: project state first, then the actual official target.
+    # In particular, personal target locks are global across all project roots.
+    with exclusive_lock(state_lock_path()):
+        with exclusive_lock(target_lock):
+            state = _state_map_unlocked()
+            existing_decision = state["items"].get(candidate_id)
+            if existing_decision:
+                exact_retry = (
+                    existing_decision.get("status") == "approved"
+                    and existing_decision.get("approved_target") == target
+                    and existing_decision.get("approved_path") == str(destination)
+                    and existing_decision.get("content_digest") == content_digest
+                )
+                if not exact_retry:
+                    raise ValueError(f"decision conflict for candidate {candidate_id}")
+            else:
+                previous_official = read_text(destination)
+                try:
+                    previous_mode = stat.S_IMODE(destination.stat().st_mode)
+                except FileNotFoundError:
+                    previous_mode = 0o644
+                already_official = official_contains_content_digest(
+                    previous_official, approved_content, content_digest
+                )
+                if not already_official:
+                    append_official_memory(
+                        destination,
+                        item,
+                        approved_content,
+                        managed_short=target == "personal_short",
+                    )
+                state["items"][candidate_id] = decision
+                try:
+                    write_json(PROJECT_STATE, state)
+                except BaseException:
+                    if not already_official:
+                        atomic_write_text(destination, previous_official, mode=previous_mode)
+                    raise
+    build_queue()
     return find_item(candidate_id)
 
 
 def record_decision(candidate_id: str, decision: dict[str, Any]) -> None:
-    state = state_map()
-    state["items"][candidate_id] = decision
-    write_json(PROJECT_STATE, state)
+    def update(state: dict[str, Any]) -> bool:
+        existing = state["items"].get(candidate_id)
+        if existing:
+            comparable_existing = {
+                key: value for key, value in existing.items() if key != "decided_at"
+            }
+            comparable_new = {
+                key: value for key, value in decision.items() if key != "decided_at"
+            }
+            if comparable_existing != comparable_new:
+                raise ValueError(f"decision conflict for candidate {candidate_id}")
+            return False
+        state["items"][candidate_id] = decision
+        return True
+
+    mutate_state(update)
     build_queue()
 
 
@@ -446,9 +1073,13 @@ def defer(candidate_id: str) -> None:
 
 
 def reset(candidate_id: str) -> None:
-    state = state_map()
-    state.get("items", {}).pop(candidate_id, None)
-    write_json(PROJECT_STATE, state)
+    def update(state: dict[str, Any]) -> bool:
+        if candidate_id in state.get("items", {}):
+            state["items"].pop(candidate_id)
+            return True
+        return False
+
+    mutate_state(update)
     build_queue()
 
 
@@ -494,11 +1125,14 @@ def start_review_service_if_needed() -> bool:
     log_path = CODEX_DIR / "memory_review_server.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    env["MEMORY_REVIEW_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    if PROJECT_ROOT is not None:
+        env["MEMORY_REVIEW_PROJECT_ROOT"] = str(PROJECT_ROOT)
+    else:
+        env.pop("MEMORY_REVIEW_PROJECT_ROOT", None)
     with log_path.open("ab") as log_handle:
         subprocess.Popen(
             [sys.executable, str(server_script)],
-            cwd=str(PROJECT_ROOT),
+            cwd=str(PROJECT_ROOT or APP_ROOT),
             stdout=log_handle,
             stderr=log_handle,
             stdin=subprocess.DEVNULL,
@@ -530,9 +1164,11 @@ def should_remind(queue: dict[str, Any], force: bool = False) -> bool:
 
 
 def mark_reminded() -> None:
-    state = state_map()
-    state["last_reminder_at"] = now()
-    write_json(PROJECT_STATE, state)
+    def update(state: dict[str, Any]) -> bool:
+        state["last_reminder_at"] = now()
+        return True
+
+    mutate_state(update)
 
 
 def review_summary(queue: dict[str, Any]) -> str:
@@ -541,7 +1177,7 @@ def review_summary(queue: dict[str, Any]) -> str:
         f"pending={counts.get('pending', 0)}, "
         f"project={counts.get('project_pending', 0)}, "
         f"personal={counts.get('personal_pending', 0)}, "
-        f"project_root={PROJECT_ROOT}, "
+        f"project_root={PROJECT_ROOT or ''}, "
         f"url={REVIEW_URL}"
     )
 

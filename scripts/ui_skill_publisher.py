@@ -64,8 +64,17 @@ def _canonical_root(value: pathlib.Path | str) -> pathlib.Path:
     return pathlib.Path(value).expanduser().resolve()
 
 
-def _is_project_target(path: pathlib.Path) -> bool:
-    return path.parent.name == "skills" and path.parent.parent.name in {".agents", ".claude"}
+def _reject_symlink_ancestors(path: pathlib.Path, stop_at: pathlib.Path) -> None:
+    stop_at = pathlib.Path(stop_at)
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink():
+            raise ScopeConflict(f"publication path contains a symlink ancestor: {candidate}")
+        if candidate == stop_at:
+            return
+
+
+def _canonical_target_roots(targets: dict[str, pathlib.Path]) -> dict[str, pathlib.Path]:
+    return {agent: _canonical_root(path.parent) for agent, path in targets.items()}
 
 
 def validate_publication_scope(
@@ -82,9 +91,7 @@ def validate_publication_scope(
     """
     scope = approved.get("scope")
     if not isinstance(scope, dict) or "type" not in scope:
-        # Keep compatibility with low-level callers that supply a package
-        # record rather than a registry-approved draft.
-        return
+        raise ScopeConflict("approved publication is missing a valid scope")
     scope_type = scope.get("type")
     if scope_type == "project":
         recorded_root = scope.get("root")
@@ -102,10 +109,17 @@ def validate_publication_scope(
                 raise ScopeConflict(
                     f"publication target is outside approved project scope for {agent}: {target}"
                 )
+            _reject_symlink_ancestors(pathlib.Path(target), approved_root)
         return
     if scope_type == "global":
-        if project_root is not None or any(_is_project_target(pathlib.Path(path)) for path in targets.values()):
+        if project_root is not None:
             raise ScopeConflict("global approval cannot publish into a project")
+        expected = resolve_targets({"type": "global"})
+        actual_roots = _canonical_target_roots(targets)
+        for agent, root in actual_roots.items():
+            if agent not in expected or root != _canonical_root(expected[agent]):
+                raise ScopeConflict(f"global publication target root is not configured: {root}")
+            _reject_symlink_ancestors(pathlib.Path(targets[agent]), pathlib.Path(expected[agent]))
         return
     if scope_type == "personal":
         raise ScopeConflict("personal approval cannot publish as a project UI skill")
@@ -293,6 +307,10 @@ def _run_transaction(
     order = _ordered_agents(targets)
     lock_path = store.ui_design_home() / "deployments.lock"
     with store.exclusive_lock(lock_path, timeout=30):
+        if approved is not None:
+            # Repeat authorization and path checks while holding the same lock
+            # used for target/state writes to close validation races.
+            validate_publication_scope(approved, targets, project_root=project_root)
         try:
             for agent in order:
                 target = targets[agent]
@@ -452,6 +470,7 @@ def rollback(
     targets: dict[str, pathlib.Path],
     expected_target_digests: dict[str, str | None],
     idempotency_key: str,
+    project_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     return _run_transaction(
         operation="rollback",
@@ -462,6 +481,8 @@ def rollback(
         expected_target_digests=expected_target_digests,
         idempotency_key=idempotency_key,
         replace=os.replace,
+        approved=approved_version,
+        project_root=project_root,
         variants=approved_version.get("source", {}).get("variants"),
         record_metadata=approved_version,
     )
@@ -473,6 +494,8 @@ def disable(
     targets: dict[str, pathlib.Path],
     expected_target_digests: dict[str, str | None],
     idempotency_key: str,
+    approved: dict[str, Any] | None = None,
+    project_root: pathlib.Path | None = None,
 ) -> dict[str, Any]:
     return _run_transaction(
         operation="disable",
@@ -483,4 +506,6 @@ def disable(
         expected_target_digests=expected_target_digests,
         idempotency_key=idempotency_key,
         replace=os.replace,
+        approved=approved,
+        project_root=project_root,
     )

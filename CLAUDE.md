@@ -18,8 +18,8 @@ If `.loop/config.json` exists, also load:
 - `codex/codex_long_memory.md`
 - `codex/codex_context_packet.md`
 - `codex/shared_memory_context_packet.md`
-- `/Users/stephenbo/.codex/personal_memory/long.md`
-- `/Users/stephenbo/.codex/personal_memory/short.md`
+- `~/.codex/personal_memory/long.md`
+- `~/.codex/personal_memory/short.md`
 
 Read project short memory selectively from `codex/codex_short_memory.md`; do
 not load the entire file by default.
@@ -55,7 +55,7 @@ pending and approved memory before writing.
 Write a distilled candidate with:
 
 ```bash
-MEMORY_REVIEW_PROJECT_ROOT=/Users/stephenbo/Noema/Projects/vibe_coding_manage_platform python3 /Users/stephenbo/Noema/Projects/vibe_coding_manage_platform/scripts/memory_review.py propose \
+MEMORY_REVIEW_PROJECT_ROOT=$(pwd) python3 scripts/memory_review.py propose \
   --scope personal|project --target long|short --category CATEGORY \
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```
