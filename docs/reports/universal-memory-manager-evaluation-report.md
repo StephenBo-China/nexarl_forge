@@ -1,4 +1,4 @@
-# Universal Local Memory Manager — 评测报告
+# AI Coding 管理后台 — 评测报告
 
 ## Independent Claude Code evaluation
 

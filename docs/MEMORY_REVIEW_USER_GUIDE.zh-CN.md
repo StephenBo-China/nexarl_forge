@@ -1,6 +1,6 @@
-# Vibe Memory 中文使用说明
+# AI Coding 管理后台中文使用说明
 
-Vibe Memory 是 Codex 与 Claude Code 共用的本地记忆管理器。它把个人/项目
+AI Coding 管理后台是 Codex 与 Claude Code 共用的本地记忆管理器。它把个人/项目
 记忆、候选审批、项目路由、UI 设计治理、UI Skills 与 Loop 工作流集中在一个
 仅监听本机回环地址的审核台中。
 
@@ -12,7 +12,7 @@ Vibe Memory 是 Codex 与 Claude Code 共用的本地记忆管理器。它把个
 在普通 Terminal 中执行；如使用 fork，请替换仓库 URL：
 
 ```bash
-git clone https://github.com/noema-ai/vibe_coding_manage_platform.git
+git clone https://gitee.com/StephenBo_China/vibe_coding_manage_platform.git
 cd vibe_coding_manage_platform
 ./install.sh
 ```

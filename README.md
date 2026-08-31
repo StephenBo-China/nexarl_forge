@@ -1,8 +1,10 @@
-# Vibe Memory
+# AI Coding Management Console
 
-Vibe Memory is a local, approval-gated memory manager shared by Codex and
+中文使用说明：[AI Coding 管理后台中文指南](docs/README.zh-CN.md)
+
+AI Coding Management Console is a local, approval-gated memory manager shared by Codex and
 Claude Code. It installs a versioned runtime, a stable `vibe-memory` command,
-universal user hooks, and a loopback-only review console. Moving or deleting
+universal user hooks, and a loopback-only management console. Moving or deleting
 the source clone after installation does not break the installed runtime.
 
 The first public release supports macOS (Apple Silicon and Intel) and requires
@@ -17,7 +19,7 @@ Use a normal Terminal. Replace the example repository URL if you are installing
 from a fork:
 
 ```bash
-git clone https://github.com/noema-ai/vibe_coding_manage_platform.git
+git clone https://gitee.com/StephenBo_China/vibe_coding_manage_platform.git
 cd vibe_coding_manage_platform
 ./install.sh
 ```

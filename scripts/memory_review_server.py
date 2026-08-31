@@ -73,7 +73,7 @@ def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
 def first_run_page() -> str:
     return """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>设置 Vibe Memory</title><style>
+<title>设置 AI Coding 管理后台</title><style>
 :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:#171717;color:#ececec}body{margin:0;display:grid;min-height:100vh;place-items:center}.wizard{width:min(680px,calc(100vw - 32px));background:#202020;border:1px solid #333;border-radius:12px;padding:28px;box-shadow:0 18px 60px #0006}h1{font-size:24px;margin:0 0 8px}p{color:#aaa;line-height:1.6}.row{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #303030}.stack{display:grid;gap:8px}.radios{display:flex;gap:14px;flex-wrap:wrap}input[type=text],input[type=number]{background:#2b2b2b;border:1px solid #444;border-radius:7px;color:#fff;padding:9px;width:min(380px,70vw)}button{margin-top:18px;background:#eee;border:0;border-radius:8px;color:#171717;font-weight:650;padding:11px 16px}.message{min-height:20px;color:#8ab4ff}</style></head>
 <body><form class="wizard" id="first-run"><h1>首次运行设置</h1><p>配置本机客户端与保留策略。工作区必须手动输入一个已存在的目录；浏览器无法打开原生目录选择器。</p>
 <label class="row"><span>Codex hooks</span><input name="codex_hooks" type="checkbox" checked></label>
@@ -785,7 +785,7 @@ def page() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>记忆审批台</title>
+  <title>AI Coding 管理后台</title>
   <style>
     :root {
       color-scheme: dark;
@@ -946,7 +946,7 @@ def page() -> str:
       <div class="brand">
         <div class="brand-mark">忆</div>
         <div class="brand-copy">
-          <h1>记忆审批台</h1>
+          <h1>AI Coding 管理后台</h1>
           <div class="subtitle">跨项目记忆、审批和 Loop 初始化工作台</div>
         </div>
       </div>
@@ -1481,7 +1481,7 @@ function renderProjects(lastResult) {
     <div class="doc">
       <section class="doc-hero">
         <h2>项目管理</h2>
-        <p>记忆审核台代码是跨项目通用的，但每个仓库的项目长短期记忆独立存放在该仓库的 <code>codex/</code> 目录。切换当前项目后，后端会写入注册表，后续 API 直接读取所选项目，无需重启 8897。</p>
+        <p>AI Coding 管理后台代码是跨项目通用的，但每个仓库的项目长短期记忆独立存放在该仓库的 <code>codex/</code> 目录。切换当前项目后，后端会写入注册表，后续 API 直接读取所选项目，无需重启 8897。</p>
       </section>
       <section class="doc-section">
         <h3>初始化说明</h3>
