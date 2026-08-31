@@ -1187,6 +1187,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 "PROJECT_STATE": temp / "state.json",
                 "CODEX_DIR": temp / "codex",
             }
+            paths["PROJECT_ROOT"] = temp
             paths["PROJECT_PROPOSALS"].write_text("# Project Proposals\n", encoding="utf-8")
             with mock.patch.multiple(review, **paths):
                 result = review.create_agent_candidate(
@@ -1373,6 +1374,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 "PROJECT_STATE": state_path,
                 "CODEX_DIR": temp / "codex",
             }
+            paths["PROJECT_ROOT"] = temp
             with mock.patch.multiple(review, **paths):
                 before = review.build_queue()["items"][0]
                 result = review.create_agent_candidate(
@@ -1785,6 +1787,7 @@ class MemoryReviewQualityTest(unittest.TestCase):
                 review.PROJECT_QUEUE = queue_path
                 review.PROJECT_STATE = temp / "state.json"
                 review.CODEX_DIR = temp / "codex"
+                review.PROJECT_ROOT = temp
                 review.build_queue = synchronized_build_queue
                 review.write_json = ordered_write_json
                 review.parse_project_candidates = synchronized_parse_project
