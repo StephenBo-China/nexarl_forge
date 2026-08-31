@@ -1073,7 +1073,7 @@ def hook_command(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Vibe Memory shared runtime CLI")
+    parser = argparse.ArgumentParser(description="Nexarl Forge shared human–AI coding workspace CLI")
     subcommands = parser.add_subparsers(dest="command", required=True)
     hook = subcommands.add_parser("hook", help="Route a Codex or Claude Code hook")
     hook.add_argument("--agent", choices=("codex", "claude-code"), required=True)

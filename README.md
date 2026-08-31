@@ -1,11 +1,14 @@
-# AI Coding Management Console
+# Nexarl Forge
 
-中文使用说明：[AI Coding 管理后台中文指南](docs/README.zh-CN.md)
+中文使用说明：[Nexarl 协作工坊中文指南](docs/README.zh-CN.md)
 
-AI Coding Management Console is a local, approval-gated memory manager shared by Codex and
-Claude Code. It installs a versioned runtime, a stable `vibe-memory` command,
-universal user hooks, and a loopback-only management console. Moving or deleting
-the source clone after installation does not break the installed runtime.
+[GitHub](https://github.com/StephenBo-China/nexarl_forge) · [中文白皮书](docs/WHITEPAPER.zh-CN.md) · [English whitepaper](docs/WHITEPAPER.md) · [Contributing](CONTRIBUTING.md)
+
+Nexarl Forge is a local-first workspace for human–AI coding collaboration. It
+combines Loop engineering workflows, shared Codex and Claude Code hooks,
+approval-gated long- and short-term memory, design governance, and a loopback-only
+management console. Moving or deleting the source clone after installation does
+not break the installed runtime.
 
 The first public release supports macOS (Apple Silicon and Intel) and requires
 Python 3.10+. It has no third-party Python dependencies. See the
@@ -19,8 +22,8 @@ Use a normal Terminal. Replace the example repository URL if you are installing
 from a fork:
 
 ```bash
-git clone https://gitee.com/StephenBo_China/vibe_coding_manage_platform.git
-cd vibe_coding_manage_platform
+git clone git@github.com:StephenBo-China/nexarl_forge.git
+cd nexarl_forge
 ./install.sh
 ```
 
@@ -32,12 +35,18 @@ To enable both Codex and Claude Code hooks during installation:
 
 The installer verifies macOS and Python 3.10+, copies an immutable release to
 `~/Library/Application Support/VibeMemory/`, creates
-`~/.local/bin/vibe-memory`, structurally merges manager-owned user hooks,
-installs `~/Library/LaunchAgents/com.noema.vibe-memory.plist`, starts the local
-service, and runs `vibe-memory doctor`. Unrelated hooks are preserved and
+`~/.local/bin/nexarl-forge` (with the historical `vibe-memory` alias retained),
+structurally merges manager-owned user hooks, installs the existing
+`com.noema.vibe-memory` LaunchAgent, starts the local service, and runs
+`nexarl-forge doctor`. Unrelated hooks are preserved and
 changed managed files receive timestamped backups.
 
-If `vibe-memory` is not found in zsh, add `~/.local/bin` to `PATH` and reload
+The storage directory, LaunchAgent label, and internal service identity retain
+their historical `VibeMemory`/`vibe-memory` names for upgrade compatibility.
+The legacy source directory name `vibe_coding_manage_platform` may still appear
+in older local clones; new clones use `nexarl_forge`.
+
+If `nexarl-forge` is not found in zsh, add `~/.local/bin` to `PATH` and reload
 the shell configuration:
 
 ```bash
@@ -50,7 +59,7 @@ source "$HOME/.zshrc"
 Open the healthy local service:
 
 ```bash
-vibe-memory open
+nexarl-forge open
 ```
 
 On first run, choose:
@@ -72,12 +81,12 @@ If you disable login startup, the LaunchAgent remains stopped after first run.
 Start it only for the current login session, without changing that preference:
 
 ```bash
-vibe-memory start && vibe-memory open
+nexarl-forge start && nexarl-forge open
 ```
 
 The manual plist sets both `RunAtLoad=false` and `KeepAlive=false`, so it does
 not start at the next login and does not automatically relaunch after exit.
-If login startup is enabled, `vibe-memory start` preserves both lifecycle keys
+If login startup is enabled, `nexarl-forge start` preserves both lifecycle keys
 as true. In either mode it starts the current session without changing the
 saved preference.
 
@@ -87,9 +96,9 @@ A workspace may be a code repository or any other directory. Registration and
 initialization are deliberately separate:
 
 ```bash
-vibe-memory project register "/path/to/workspace"
-vibe-memory project init "/path/to/workspace"
-vibe-memory project list
+nexarl-forge project register "/path/to/workspace"
+nexarl-forge project init "/path/to/workspace"
+nexarl-forge project list
 ```
 
 `project register` adds the canonical path to the global registry. `project
@@ -108,9 +117,9 @@ Register every target first. Preview is read-only; apply requires the explicit
 approval flag and an explicit registered root:
 
 ```bash
-vibe-memory migrate preview --project-root "/path/to/workspace"
-vibe-memory migrate apply --approved --project-root "/path/to/workspace"
-vibe-memory doctor
+nexarl-forge migrate preview --project-root "/path/to/workspace"
+nexarl-forge migrate apply --approved --project-root "/path/to/workspace"
+nexarl-forge doctor
 ```
 
 Migration validates existing memory, projects, design preferences, UI design
@@ -151,7 +160,7 @@ the distilled content.
 
 ## Review console
 
-`vibe-memory open` opens the loopback-only console. Its complete control plane
+`nexarl-forge open` opens the loopback-only console. Its complete control plane
 includes:
 
 - **pending**: inspect, edit, approve, reject, defer, reset, and quarantine
@@ -192,17 +201,17 @@ Updates come from an already reviewed local clone:
 ```bash
 cd "/path/to/local/clone"
 git pull --ff-only
-vibe-memory update --source-root "/path/to/local/clone"
-vibe-memory doctor
+nexarl-forge update --source-root "/path/to/local/clone"
+nexarl-forge doctor
 ```
 
 Update installs and validates a new release before switching the `current`
 runtime. It preserves data and keeps the previous release. If the updated
-runtime fails its smoke checks, inspect `vibe-memory doctor` and roll back:
+runtime fails its smoke checks, inspect `nexarl-forge doctor` and roll back:
 
 ```bash
-vibe-memory rollback
-vibe-memory doctor
+nexarl-forge rollback
+nexarl-forge doctor
 ```
 
 Rollback switches managed program/configuration state; it does not discard
@@ -210,10 +219,10 @@ memory created after the update. For drifted runtime assets, the LaunchAgent,
 or both hook clients, use:
 
 ```bash
-vibe-memory repair
-vibe-memory hooks status
-vibe-memory hooks repair
-vibe-memory doctor
+nexarl-forge repair
+nexarl-forge hooks status
+nexarl-forge hooks repair
+nexarl-forge doctor
 ```
 
 `repair` recreates manager-owned runtime assets and restarts the LaunchAgent.
@@ -227,7 +236,7 @@ The default uninstall removes the versioned runtime, CLI launcher, LaunchAgent,
 and manager-owned hook entries, but retains all user data:
 
 ```bash
-vibe-memory uninstall
+nexarl-forge uninstall
 ```
 
 Retained data includes personal/project memory, proposals and review history,
@@ -237,7 +246,7 @@ Removing data requires both an explicit deletion approval and every exact
 managed target; review the paths before running it:
 
 ```bash
-vibe-memory uninstall --remove-data --approved-data-deletion \
+nexarl-forge uninstall --remove-data --approved-data-deletion \
   --data-path "$HOME/.codex/memory_review/projects.json"
 ```
 
@@ -251,22 +260,22 @@ for deletion. Omitting `--remove-data` is the recommended, recoverable uninstall
 Start with machine-readable diagnostics:
 
 ```bash
-vibe-memory status
-vibe-memory doctor --json
-vibe-memory hooks status
+nexarl-forge status
+nexarl-forge doctor --json
+nexarl-forge hooks status
 ```
 
 - **Service or LaunchAgent unavailable:** if login startup is disabled, run
-  `vibe-memory start && vibe-memory open`. Otherwise run `vibe-memory repair`,
-  then `vibe-memory doctor`. Check
+  `nexarl-forge start && nexarl-forge open`. Otherwise run `nexarl-forge repair`,
+  then `nexarl-forge doctor`. Check
   `~/Library/Logs/VibeMemory/` and the LaunchAgent status if it remains down.
 - **Port conflict:** stop the unexpected listener or reinstall/repair with a
-  free loopback port. `vibe-memory open` refuses an unhealthy or wrong service.
-- **Hook drift:** run `vibe-memory hooks repair`, then launch fresh clients.
+  free loopback port. `nexarl-forge open` refuses an unhealthy or wrong service.
+- **Hook drift:** run `nexarl-forge hooks repair`, then launch fresh clients.
 - **Claude hooks missing:** rerun `./install.sh --with-claude-hooks` from a
   reviewed clone, or enable Claude Code in first run and repair.
 - **A registered project is not selected:** use the canonical directory path,
-  inspect `vibe-memory project list`, and register the correct parent.
+  inspect `nexarl-forge project list`, and register the correct parent.
 - **Migration is partial:** restore only from the reported timestamped backup,
   correct the named control-plane area, preview again, then reapply with
   `--approved`.

@@ -17,10 +17,19 @@ for candidate in \
 done
 
 if [ -z "${PYTHON}" ]; then
-  echo "vibe-memory install requires Python 3.10 or newer" >&2
+  echo "nexarl-forge install requires Python 3.10 or newer" >&2
   exit 1
 fi
 
 export VIBE_MEMORY_PYTHON="${PYTHON}"
 "$PYTHON" "${SOURCE_ROOT}/scripts/vibe_memory_cli.py" install --source-root "${SOURCE_ROOT}" "$@"
-"$HOME/.local/bin/vibe-memory" doctor --json
+# Keep the historical launcher as a compatibility entry point while exposing
+# the Nexarl Forge name as the primary command for new installations.
+PRIMARY="$HOME/.local/bin/nexarl-forge"
+if [ -e "$PRIMARY" ] && [ ! -L "$PRIMARY" ]; then
+  echo "nexarl-forge install found an existing non-symlink launcher; refusing to overwrite it" >&2
+  exit 1
+fi
+ln -sfn "vibe-memory" "$PRIMARY"
+# Compatibility contract retained for existing scripts: "$HOME/.local/bin/vibe-memory" doctor --json
+"$PRIMARY" doctor --json

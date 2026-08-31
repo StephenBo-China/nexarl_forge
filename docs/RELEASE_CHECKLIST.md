@@ -10,16 +10,16 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
   run `git clone`, `cd vibe_coding_manage_platform`, and `./install.sh`.
 - [ ] Repeat the clean path with `./install.sh --with-claude-hooks`; preserve
   unrelated pre-existing client hooks.
-- [ ] Run `vibe-memory open` and complete every first-run choice: clients,
+- [ ] Run `nexarl-forge open` and complete every first-run choice: clients,
   candidate checks, retention, login startup, port, and optional workspace.
 - [ ] In fresh Codex and Claude Code sessions, approve/trust the installed user
   configuration and prove the managed hooks—not source-tree shortcuts—run.
-- [ ] Run `vibe-memory project register "/path/to/workspace"`, then
-  `vibe-memory project init "/path/to/workspace"`; prove init creates no project
+- [ ] Run `nexarl-forge project register "/path/to/workspace"`, then
+  `nexarl-forge project init "/path/to/workspace"`; prove init creates no project
   hooks and an unregistered cwd remains personal-only.
-- [ ] Run `vibe-memory migrate preview --project-root "/path/to/workspace"`,
+- [ ] Run `nexarl-forge migrate preview --project-root "/path/to/workspace"`,
   require clean JSON and zero preview exit status, then run
-  `vibe-memory migrate apply --approved --project-root "/path/to/workspace"` on a
+  `nexarl-forge migrate apply --approved --project-root "/path/to/workspace"` on a
   registered legacy fixture; audit backups and changed paths.
 - [ ] Exercise pending/active memory, projects, design preferences, UI design
   approval, UI Skills, Loop, and policy in the installed review console.
@@ -27,23 +27,23 @@ sanitized artifact paths. Never invent evidence or reuse an earlier run.
   call no model API, and manufacture no candidate. Verify the active client
   model distills personal/project/short candidates and approval gates formal
   memory.
-- [ ] Run `vibe-memory doctor` and require all runtime, hooks, service, data,
+- [ ] Run `nexarl-forge doctor` and require all runtime, hooks, service, data,
   and control-plane areas healthy.
 - [ ] From a reviewed clone run
-  `vibe-memory update --source-root "/path/to/local/clone"`, then test
-  `vibe-memory rollback` without losing post-update data.
-- [ ] Run `vibe-memory repair`, `vibe-memory hooks status`, and
-  `vibe-memory hooks repair`; verify LaunchAgent recovery and fresh-client
+  `nexarl-forge update --source-root "/path/to/local/clone"`, then test
+  `nexarl-forge rollback` without losing post-update data.
+- [ ] Run `nexarl-forge repair`, `nexarl-forge hooks status`, and
+  `nexarl-forge hooks repair`; verify LaunchAgent recovery and fresh-client
   restart behavior.
 - [ ] With login startup disabled, run
-  `vibe-memory start && vibe-memory open`; prove it recreates a manual
+  `nexarl-forge start && nexarl-forge open`; prove it recreates a manual
   plist with both `RunAtLoad=false` and `KeepAlive=false`, starts a healthy
   current service, does not change the persisted preference, and has no
   simulated next-login auto-start or automatic relaunch semantics.
-- [ ] With login startup enabled, run `vibe-memory start`; prove the persisted
+- [ ] With login startup enabled, run `nexarl-forge start`; prove the persisted
   plist keeps both `RunAtLoad=true` and `KeepAlive=true`, the current service
   becomes healthy, and the saved preference remains enabled.
-- [ ] Run `vibe-memory uninstall`; prove runtime, launcher, LaunchAgent, and
+- [ ] Run `nexarl-forge uninstall`; prove runtime, launcher, LaunchAgent, and
   managed hooks are removed while memories, review/audit state, projects,
   design state, UI Skills, Loop state, logs, and backups remain.
 - [ ] Separately verify data deletion is refused unless `--remove-data`,

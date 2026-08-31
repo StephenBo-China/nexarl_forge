@@ -1,4 +1,4 @@
-# AI Coding 管理后台 — 代码改动报告
+# Nexarl 协作工坊 — 代码改动报告
 
 ## Scope
 

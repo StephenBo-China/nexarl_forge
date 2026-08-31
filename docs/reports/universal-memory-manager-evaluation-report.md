@@ -1,4 +1,4 @@
-# AI Coding 管理后台 — 评测报告
+# Nexarl 协作工坊 — 评测报告
 
 ## Independent Claude Code evaluation
 

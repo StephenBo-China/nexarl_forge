@@ -1,6 +1,8 @@
-# AI Coding 管理后台中文使用说明
+# Nexarl 协作工坊中文使用说明
 
-AI Coding 管理后台是 Codex 与 Claude Code 共用的本地记忆管理器。它把个人/项目
+> 新安装使用 `nexarl-forge`；已有安装的 `vibe-memory` 命令仍可继续使用。
+
+Nexarl 协作工坊是 Codex 与 Claude Code 共用的本地记忆管理器。它把个人/项目
 记忆、候选审批、项目路由、UI 设计治理、UI Skills 与 Loop 工作流集中在一个
 仅监听本机回环地址的审核台中。
 
@@ -12,8 +14,8 @@ AI Coding 管理后台是 Codex 与 Claude Code 共用的本地记忆管理器�
 在普通 Terminal 中执行；如使用 fork，请替换仓库 URL：
 
 ```bash
-git clone https://gitee.com/StephenBo_China/vibe_coding_manage_platform.git
-cd vibe_coding_manage_platform
+git clone git@github.com:StephenBo-China/nexarl_forge.git
+cd nexarl_forge
 ./install.sh
 ```
 
@@ -25,11 +27,11 @@ cd vibe_coding_manage_platform
 
 安装器会检查 macOS 和 Python 3.10+，将版本化运行时复制到
 `~/Library/Application Support/VibeMemory/`，创建稳定命令
-`~/.local/bin/vibe-memory`，结构化合并用户级 hooks，安装并启动
+`~/.local/bin/nexarl-forge`，结构化合并用户级 hooks，安装并启动
 LaunchAgent `com.noema.vibe-memory`，最后运行 doctor。无关 hooks 不会被覆盖；
 受管文件变化前会创建带时间戳备份。安装完成后可移动或删除源码 clone。
 
-若 zsh 新终端找不到 `vibe-memory`，执行：
+若 zsh 新终端找不到 `nexarl-forge`，执行：
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"
@@ -39,7 +41,7 @@ source "$HOME/.zshrc"
 ## 2. 首次运行选项
 
 ```bash
-vibe-memory open
+nexarl-forge open
 ```
 
 首次运行页可选择：Codex hooks、Claude Code hooks、自动候选检查、个人短期
@@ -55,12 +57,12 @@ session，让客户端重新加载并信任用户级配置。旧会话继续可�
 会话，且不会改变该持久偏好：
 
 ```bash
-vibe-memory start && vibe-memory open
+nexarl-forge start && nexarl-forge open
 ```
 
 手动 plist 同时使用 `RunAtLoad=false` 和 `KeepAlive=false`，因此下次登录不会
 自动启动，进程退出后也不会自动重启。
-若登录启动本来已启用，`vibe-memory start` 会保持两个键均为 true；两种模式都
+若登录启动本来已启用，`nexarl-forge start` 会保持两个键均为 true；两种模式都
 只启动当前会话，不改写已保存的偏好。
 
 ## 3. 注册与初始化项目边界
@@ -68,9 +70,9 @@ vibe-memory start && vibe-memory open
 workspace 可以是代码仓库，也可以是普通目录：
 
 ```bash
-vibe-memory project register "/path/to/workspace"
-vibe-memory project init "/path/to/workspace"
-vibe-memory project list
+nexarl-forge project register "/path/to/workspace"
+nexarl-forge project init "/path/to/workspace"
+nexarl-forge project list
 ```
 
 - `register` 只把规范化路径写入全局项目注册表并选中项目。
@@ -84,7 +86,7 @@ vibe-memory project list
 注销项目只移除注册与受管说明，不删除项目记忆：
 
 ```bash
-vibe-memory project unregister "/path/to/workspace"
+nexarl-forge project unregister "/path/to/workspace"
 ```
 
 ## 4. 旧安装迁移：先预览，再批准
@@ -93,9 +95,9 @@ vibe-memory project unregister "/path/to/workspace"
 项目根：
 
 ```bash
-vibe-memory migrate preview --project-root "/path/to/workspace"
-vibe-memory migrate apply --approved --project-root "/path/to/workspace"
-vibe-memory doctor
+nexarl-forge migrate preview --project-root "/path/to/workspace"
+nexarl-forge migrate apply --approved --project-root "/path/to/workspace"
+nexarl-forge doctor
 ```
 
 预览/迁移检查项目与个人记忆、候选与审核状态、项目注册表、design
@@ -134,7 +136,7 @@ project long 候选或 project short 工作摘要，然后通过统一候选接�
 
 ## 7. 审核台全部功能
 
-运行 `vibe-memory open` 后可使用以下页面：
+运行 `nexarl-forge open` 后可使用以下页面：
 
 1. **pending**：查看、搜索、编辑、批准、驳回、延期、重置候选；噪声候选可
    隔离并标记拒绝，同时保留原始提案以供审计。
@@ -193,10 +195,10 @@ Loop 期间不得合并 master 或部署 production。主分支合并和正式�
 ## 11. 日常检查与 doctor
 
 ```bash
-vibe-memory status
-vibe-memory doctor
-vibe-memory doctor --json
-vibe-memory hooks status
+nexarl-forge status
+nexarl-forge doctor
+nexarl-forge doctor --json
+nexarl-forge hooks status
 ```
 
 doctor 检查 runtime、Python、Codex/Claude hooks、service、data 与完整 control
@@ -210,16 +212,16 @@ plane。全部健康时各区域为 `ok/current/healthy/ready`，命令返回 0�
 ```bash
 cd "/path/to/local/clone"
 git pull --ff-only
-vibe-memory update --source-root "/path/to/local/clone"
-vibe-memory doctor
+nexarl-forge update --source-root "/path/to/local/clone"
+nexarl-forge doctor
 ```
 
 update 先安装和验证新版本，再原子切换 `current`，同时保留旧版本与全部数据。
 如果更新后的 smoke test 或 doctor 失败：
 
 ```bash
-vibe-memory rollback
-vibe-memory doctor
+nexarl-forge rollback
+nexarl-forge doctor
 ```
 
 rollback 只切换程序和受管配置，不回退更新后产生的记忆。若没有可回退版本，
@@ -228,10 +230,10 @@ rollback 只切换程序和受管配置，不回退更新后产生的记忆。�
 ## 13. Repair、Hooks 与 LaunchAgent
 
 ```bash
-vibe-memory repair
-vibe-memory hooks status
-vibe-memory hooks repair
-vibe-memory doctor
+nexarl-forge repair
+nexarl-forge hooks status
+nexarl-forge hooks repair
+nexarl-forge doctor
 ```
 
 `repair` 恢复版本化 runtime、launcher、配置与 LaunchAgent，并重启服务；
@@ -244,7 +246,7 @@ vibe-memory doctor
 默认卸载保留数据，是推荐的可恢复方式：
 
 ```bash
-vibe-memory uninstall
+nexarl-forge uninstall
 ```
 
 它移除 runtime、stable launcher、LaunchAgent 和受管 hooks，但保留个人/项目
@@ -255,7 +257,7 @@ backups。
 删除数据必须同时给出删除开关、二次批准和每个精确路径：
 
 ```bash
-vibe-memory uninstall --remove-data --approved-data-deletion \
+nexarl-forge uninstall --remove-data --approved-data-deletion \
   --data-path "$HOME/.codex/memory_review/projects.json"
 ```
 
@@ -265,10 +267,10 @@ vibe-memory uninstall --remove-data --approved-data-deletion \
 
 ## 15. 服务与 LaunchAgent 故障排查
 
-1. `vibe-memory doctor --json` 查看是 runtime、service、hook 还是 control plane。
-2. 若关闭登录启动，先运行 `vibe-memory start && vibe-memory open`；否则运行
-   `vibe-memory repair` 修复受管安装并重新加载 LaunchAgent。
-3. `vibe-memory hooks status` 检查两个客户端；需要时运行 hooks repair。
+1. `nexarl-forge doctor --json` 查看是 runtime、service、hook 还是 control plane。
+2. 若关闭登录启动，先运行 `nexarl-forge start && nexarl-forge open`；否则运行
+   `nexarl-forge repair` 修复受管安装并重新加载 LaunchAgent。
+3. `nexarl-forge hooks status` 检查两个客户端；需要时运行 hooks repair。
 4. 若端口被占用，停止错误监听者或使用空闲回环端口重新安装/修复；`open` 会
    拒绝连接身份或版本不匹配的服务。
 5. 查看 `~/Library/Logs/VibeMemory/`，但不要把含私有内容的日志发布到仓库。
@@ -278,7 +280,7 @@ vibe-memory uninstall --remove-data --approved-data-deletion \
 
 ## 16. 开发者源码流程（非安装用户主路径）
 
-终端用户应使用上面的 `vibe-memory` 命令。维护者可从源码运行 Python 测试和
+终端用户应使用上面的 `nexarl-forge` 命令。维护者可从源码运行 Python 测试和
 开发服务器，但 direct Python/start script 不是 installed flow，也不得写入用户
 hooks。发布前执行：
 
@@ -296,8 +298,8 @@ Claude hook、control plane、rollback、uninstall。完整发布流程见
 ## 17. 命令帮助
 
 ```bash
-vibe-memory --help
-vibe-memory project --help
-vibe-memory migrate --help
-vibe-memory hooks --help
+nexarl-forge --help
+nexarl-forge project --help
+nexarl-forge migrate --help
+nexarl-forge hooks --help
 ```

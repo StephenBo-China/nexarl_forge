@@ -1,4 +1,4 @@
-# AI Coding 管理后台 — 功能报告
+# Nexarl 协作工坊 — 功能报告
 
 ## Tested implementation
 
@@ -8,7 +8,7 @@
 
 ## Delivered capabilities
 
-- Clone-to-local macOS installer with persisted Python 3.10+ and stable `vibe-memory` launcher.
+- Clone-to-local macOS installer with persisted Python 3.10+ and stable `nexarl-forge` launcher.
 - Shared Codex and Claude Code user hooks with fail-open degraded responses, idempotency, safe queueing, and personal/project context routing.
 - Registered-project boundary: registered cwd writes project memory; unregistered cwd produces personal candidates only. Project initialization and registration are separate, while already-registered init remains compatible.
 - Approval-gated personal long/short memory and project long memory, retention, candidate deduplication, provenance, and scope-safe approvals.
