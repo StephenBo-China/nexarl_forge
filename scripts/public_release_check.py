@@ -16,6 +16,8 @@ import vibe_memory_install
 _ROOT_FILES = (*vibe_memory_install._REQUIRED_FILES, *vibe_memory_install._OPTIONAL_FILES)
 _RELEASE_DIRECTORIES = vibe_memory_install._REQUIRED_DIRECTORIES
 _LOCAL_CLIENT_RUNTIME_CONFIGS = frozenset({".codex/hooks.json", ".claude/settings.json"})
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("personal_path", re.compile(r"/U" + r"sers/")),
     (
@@ -184,17 +186,9 @@ def _release_asset_safety_violation(
     return None
 
 
-def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
-    try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        return [
-            {
-                "path": _display_path(path, root),
-                "pattern": "unreadable",
-                "match": type(error).__name__,
-            }
-        ]
+def _scan_content(
+    text: str, path: pathlib.Path, root: pathlib.Path
+) -> list[dict[str, str]]:
     violations: list[dict[str, str]] = []
     for name, pattern in _PATTERNS:
         match = pattern.search(text)
@@ -213,6 +207,42 @@ def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
     return violations
 
 
+def _scan_text(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return [
+            {
+                "path": _display_path(path, root),
+                "pattern": "unreadable",
+                "match": type(error).__name__,
+            }
+        ]
+    return _scan_content(text, path, root)
+
+
+def _scan_png(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        return [
+            {
+                "path": _display_path(path, root),
+                "pattern": "unreadable",
+                "match": type(error).__name__,
+            }
+        ]
+    if not content.startswith(_PNG_SIGNATURE) or not content.endswith(_PNG_IEND):
+        return [
+            {
+                "path": _display_path(path, root),
+                "pattern": "invalid_binary_asset",
+                "match": "invalid PNG signature or trailer",
+            }
+        ]
+    return _scan_content(content.decode("utf-8", errors="ignore"), path, root)
+
+
 def _scan_client_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
     if path.is_symlink():
         return [
@@ -229,6 +259,8 @@ def _scan_release_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str
     safety_violation = _release_asset_safety_violation(path, root)
     if safety_violation:
         return [safety_violation]
+    if path.suffix.lower() == ".png":
+        return _scan_png(path, root)
     return _scan_text(path, root)
 
 

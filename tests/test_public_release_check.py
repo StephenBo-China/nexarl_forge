@@ -21,6 +21,44 @@ import vibe_memory_install
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def test_scan_tree_accepts_valid_png_release_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image = root / "docs" / "community" / "qr.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(violations, [])
+
+    def test_scan_tree_scans_plaintext_png_metadata_for_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            image = root / "docs" / "community" / "qr.png"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b'token = "example-secret-value"'
+                b"\x00\x00\x00\x00IEND\xaeB`\x82"
+            )
+
+            violations = public_release_check.scan_tree(root)
+
+        self.assertEqual(
+            violations,
+            [
+                {
+                    "path": "docs/community/qr.png",
+                    "pattern": "credential_assignment",
+                    "match": "[redacted]",
+                }
+            ],
+        )
+
     def test_scanner_release_candidates_match_installer_file_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
