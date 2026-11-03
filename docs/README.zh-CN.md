@@ -18,6 +18,8 @@ Loop 工作流和迁移/恢复操作集中到一个仅监听本机的后台中�
 
 请勿在社区发布 API Key、Token、密码、私有源码、个人记忆文件或未脱敏日志。安全漏洞请按 [SECURITY.md](../SECURITY.md) 的方式私下报告。
 
+Linux / WSL 源码运行请参阅 [本地配置说明](WSL_LOCAL_SETUP.zh-CN.md)，该入口不包含完整安装器移植。
+
 ## 快速开始
 
 ```bash

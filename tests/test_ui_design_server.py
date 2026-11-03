@@ -244,6 +244,7 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(rejected_status, 400)
         self.assertIn("formal_memory_requires_approval", rejected["error"])
 
+    @mock.patch.object(server.sys, "platform", "darwin")
     def test_first_run_saves_choices_reconciles_and_registers_only_explicit_workspace(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "settings-home")
         workspace = self.temp / "chosen-workspace"
@@ -279,6 +280,7 @@ class UIDesignServerTest(unittest.TestCase):
         persisted = vibe_memory_settings.load_settings(paths)
         self.assertEqual(persisted, payload["settings"])
 
+    @mock.patch.object(server.sys, "platform", "darwin")
     def test_first_run_without_workspace_never_registers_application_clone(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "settings-home")
         with mock.patch.object(

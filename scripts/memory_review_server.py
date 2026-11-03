@@ -9,6 +9,7 @@ import importlib
 import os
 import pathlib
 import re
+import sys
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -62,6 +63,13 @@ def settings_payload() -> dict[str, object]:
 
 def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
     paths = vibe_memory_paths.for_home()
+    if sys.platform == "linux":
+        import vibe_memory_linux
+        return vibe_memory_linux.apply_first_run(
+            paths, body,
+            manager_source_root=pathlib.Path(__file__).resolve().parents[1],
+            register_workspace=memory_project.register_project,
+        )
     return vibe_memory_settings.apply_first_run(
         paths,
         body,
@@ -71,11 +79,11 @@ def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
 
 
 def first_run_page() -> str:
-    return """<!doctype html>
+    page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>设置 AI Coding 管理后台</title><style>
 :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:#171717;color:#ececec}body{margin:0;display:grid;min-height:100vh;place-items:center}.wizard{width:min(680px,calc(100vw - 32px));background:#202020;border:1px solid #333;border-radius:12px;padding:28px;box-shadow:0 18px 60px #0006}h1{font-size:24px;margin:0 0 8px}p{color:#aaa;line-height:1.6}.row{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #303030}.stack{display:grid;gap:8px}.radios{display:flex;gap:14px;flex-wrap:wrap}input[type=text],input[type=number]{background:#2b2b2b;border:1px solid #444;border-radius:7px;color:#fff;padding:9px;width:min(380px,70vw)}button{margin-top:18px;background:#eee;border:0;border-radius:8px;color:#171717;font-weight:650;padding:11px 16px}.message{min-height:20px;color:#8ab4ff}</style></head>
-<body><form class="wizard" id="first-run"><h1>首次运行设置</h1><p>配置本机客户端与保留策略。工作区必须手动输入一个已存在的目录；浏览器无法打开原生目录选择器。</p>
+<body><form class="wizard" id="first-run" method="post" action="/api/settings/first-run"><h1>首次运行设置</h1><p>配置本机客户端与保留策略。工作区必须手动输入一个已存在的目录；浏览器无法打开原生目录选择器。</p>
 <label class="row"><span>Codex hooks</span><input name="codex_hooks" type="checkbox" checked></label>
 <label class="row"><span>Claude Code hooks</span><input name="claude_hooks" type="checkbox"></label>
 <label class="row"><span>自动候选检查</span><input name="automatic_candidate_checks" type="checkbox" checked></label>
@@ -84,7 +92,25 @@ def first_run_page() -> str:
 <label class="row"><span>本机端口</span><input name="service_port" type="number" min="1" max="65535" value="8897" required></label>
 <label class="row stack"><span>可选工作区路径</span><input name="workspace" type="text" placeholder="/path/to/workspace"></label>
 <div class="message" id="message"></div><button type="submit">保存并继续</button></form>
-<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');location.href='/'}catch(error){msg.textContent=error.message}}</script></body></html>"""
+<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');const target='http://127.0.0.1:'+data.settings.service_port+'/';if(data.linux_restart_required){msg.textContent='设置已保存，服务正在切换端口…';setTimeout(()=>{location.href=target},1500)}else{location.href=target}}catch(error){msg.textContent=error.message}});</script></body></html>"""
+
+    current = settings_payload()
+    for field, key in (("codex_hooks", "codex_hooks_enabled"),
+                       ("claude_hooks", "claude_hooks_enabled"),
+                       ("automatic_candidate_checks", "automatic_candidate_checks"),
+                       ("start_at_login", "start_at_login")):
+        checked = " checked" if current[key] else ""
+        page = re.sub(r'(name="' + field + r'" type="checkbox")(?: checked)?',
+                      lambda match: match[1] + checked, page)
+    for days in (0, 14, 30):
+        page = page.replace('value="' + str(days) + '" checked', 'value="' + str(days) + '"')
+    chosen = 'value="' + str(current["personal_short_retention_days"]) + '"'
+    page = page.replace(chosen, chosen + ' checked', 1)
+    page = page.replace('value="8897" required', 'value="' + str(current["service_port"]) + '" required')
+    if sys.platform == "linux":
+        page = page.replace("登录时启动", "WSL 用户会话启动时运行")
+        page = page.replace("配置本机客户端与保留策略。", "配置客户端与保留策略。后台使用 systemd 管理，自动启动不会主动启动 Windows 中的 WSL。")
+    return page
 
 
 def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:
@@ -2759,6 +2785,10 @@ class Handler(BaseHTTPRequestHandler):
                     action_paths = vibe_memory_paths.for_home()
                     generation = str(result["service_action_generation"])
                 self.send_json(result)
+                if result.get("linux_restart_required"):
+                    import vibe_memory_linux
+                    self.wfile.flush()
+                    threading.Thread(target=vibe_memory_linux.restart_service, daemon=True).start()
                 if result.get("bootout_after_response"):
                     threading.Thread(
                         target=scheduled_bootout_worker,
