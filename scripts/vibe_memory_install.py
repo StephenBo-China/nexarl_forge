@@ -21,6 +21,7 @@ from typing import Any, Callable, NoReturn
 import urllib.error
 import urllib.request
 import uuid
+import runtime_platform
 from xml.sax.saxutils import escape
 
 from vibe_memory_paths import RuntimePaths
@@ -2082,6 +2083,11 @@ def install_launcher(
 def _read_runtime_config_document(paths: RuntimePaths) -> dict[str, object]:
     """Read a runtime config from a regular file without following symlinks."""
     target = pathlib.Path(paths.install_root) / "config.json"
+    if runtime_platform.IS_WINDOWS:
+        value = json.loads(runtime_platform.read_regular(target).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("runtime config must contain an object")
+        return value
     _validate_install_ancestor_chain(target.parent)
     canonical_parent = _canonical_install_path(target.parent)
     parent_fd = os.open(canonical_parent, _DIRECTORY_OPEN_FLAGS)
@@ -2258,6 +2264,9 @@ def install_state_path(paths: RuntimePaths) -> pathlib.Path:
 
 
 def _atomic_write_private_json(path: pathlib.Path, value: dict[str, Any]) -> None:
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.atomic_write(path, (json.dumps(value, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+        return
     content = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
     parent = pathlib.Path(path.parent)
     _validate_install_ancestor_chain(parent)

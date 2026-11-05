@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import os
+import sys
 import pathlib
 from typing import Any
 
@@ -20,10 +22,38 @@ class RuntimePaths:
     launch_agent: pathlib.Path
 
 
-def for_home(home: pathlib.Path | None = None) -> RuntimePaths:
+def for_home(
+    home: pathlib.Path | None = None,
+    *,
+    platform: str | None = None,
+    local_appdata: pathlib.Path | None = None,
+    roaming_appdata: pathlib.Path | None = None,
+) -> RuntimePaths:
     """Return Vibe Memory runtime paths rooted at *home* or the current home."""
     resolved_home = pathlib.Path.home() if home is None else pathlib.Path(home)
     codex_home = resolved_home / ".codex"
+    if (platform or sys.platform) == "win32":
+        # Explicit homes are isolated fixtures/portable profiles. Never combine
+        # their memory files with the actual user's installation or startup.
+        local = pathlib.Path(local_appdata or (
+            os.environ.get("LOCALAPPDATA", resolved_home / "AppData/Local")
+            if home is None else resolved_home / "AppData/Local"
+        ))
+        roaming = pathlib.Path(roaming_appdata or (
+            os.environ.get("APPDATA", resolved_home / "AppData/Roaming")
+            if home is None else resolved_home / "AppData/Roaming"
+        ))
+        install_root = local / "NexarlForge"
+        return RuntimePaths(
+            personal_memory=codex_home / "personal_memory",
+            project_registry=codex_home / "memory_review/projects.json",
+            install_root=install_root,
+            ui_design_home=codex_home / "ui_design",
+            worktree_manager=codex_home / "worktree_manager",
+            worktree_root=resolved_home / "Projects/worktrees",
+            launcher=install_root / "bin/nexarl-forge.cmd",
+            launch_agent=roaming / "Microsoft/Windows/Start Menu/Programs/Startup/NexarlForge.cmd",
+        )
     return RuntimePaths(
         personal_memory=codex_home / "personal_memory",
         project_registry=codex_home / "memory_review" / "projects.json",

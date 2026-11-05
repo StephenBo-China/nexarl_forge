@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
-import fcntl
+import runtime_platform
+if not runtime_platform.IS_WINDOWS:
+    import fcntl
 import hashlib
 import json
 import os
@@ -193,6 +195,13 @@ def queue_lock(
     if (path is None) == (directory_fd is None):
         raise ValueError("queue lock requires exactly one location")
     name = _queue_lock_name(name)
+    if runtime_platform.IS_WINDOWS:
+        if path is None:
+            raise ValueError("Windows queue locks require an explicit path")
+        remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
+        with runtime_platform.file_lock(path, timeout=max(0, remaining)):
+            yield
+        return
     if path is not None:
         path = pathlib.Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)

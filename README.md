@@ -1,5 +1,7 @@
 # Nexarl Forge
 
+Windows 原生适配（开发分支）：[Windows 安装与使用](docs/WINDOWS_NATIVE.zh-CN.md)。仅需 Windows Python 3.10+ 与 Git，不依赖 WSL、PowerShell 或计划任务。
+
 中文使用说明：[Nexarl 协作工坊中文指南](docs/README.zh-CN.md)
 
 [GitHub](https://github.com/StephenBo-China/nexarl_forge) · [中文白皮书](docs/WHITEPAPER.zh-CN.md) · [English whitepaper](docs/WHITEPAPER.md) · [Contributing](CONTRIBUTING.md)

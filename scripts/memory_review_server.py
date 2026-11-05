@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import importlib
 import os
@@ -23,6 +24,17 @@ import ui_skill_publisher
 import ui_skill_registry
 import vibe_memory_paths
 import vibe_memory_settings
+
+@contextlib.contextmanager
+def _reopenable_temporary_file(*args, **kwargs):
+    # Python 3.10 compatible: Windows forbids reopening delete-on-close files.
+    handle = tempfile.NamedTemporaryFile(*args, **kwargs, delete=False)
+    try:
+        yield handle
+    finally:
+        handle.close()
+        pathlib.Path(handle.name).unlink(missing_ok=True)
+
 
 MAX_JSON_BODY = 64 * 1024
 
@@ -113,9 +125,11 @@ def complete_scheduled_bootout(paths: vibe_memory_paths.RuntimePaths, generation
     if not _service_action_matches(paths, generation, False):
         return
     try:
-        vibe_memory_settings.vibe_memory_install.bootout_launch_agent(
-            vibe_memory_paths.for_home()
-        )
+        if os.name == "nt":
+            import windows_service
+            windows_service.stop(paths)
+        else:
+            vibe_memory_settings.vibe_memory_install.bootout_launch_agent(paths)
     except Exception as error:  # Persist a retry-visible diagnostic.
         if _service_action_matches(paths, generation, False):
             value = read_service_action(paths)
@@ -138,6 +152,18 @@ def scheduled_bootout_worker(paths: vibe_memory_paths.RuntimePaths, generation: 
                 vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), value)
         except Exception:
             return
+
+
+def native_restart_worker(paths):
+    try:
+        import windows_service
+        import windows_runtime
+        windows_service.stop(paths)
+        windows_service.start(paths, port=windows_runtime.config(paths)["port"])
+    except Exception as error:
+        action = read_service_action(paths)
+        action["error"] = str(error)[:500]
+        vibe_memory_settings.vibe_memory_install._atomic_write_private_json(service_action_path(paths), action)
 
 
 UI_DESIGN_GET_ROUTES = {
@@ -368,7 +394,7 @@ def ui_design_post(path: str, body: dict) -> dict:
         value = body.get("value")
         if not isinstance(value, dict):
             raise ValueError("value must be an object")
-        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as handle:
+        with _reopenable_temporary_file("w", suffix=".json", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False)
             handle.flush()
             command = "set-global" if path.endswith("/global") else "set-project"
@@ -390,7 +416,7 @@ def ui_design_post(path: str, body: dict) -> dict:
             paths = body.get("paths")
             if not isinstance(paths, dict):
                 raise ValueError("paths must be an object")
-            with tempfile.NamedTemporaryFile(
+            with _reopenable_temporary_file(
                 "w", suffix=".json", encoding="utf-8"
             ) as handle:
                 json.dump(paths, handle, ensure_ascii=False)
@@ -422,7 +448,7 @@ def ui_design_post(path: str, body: dict) -> dict:
             manifest = body.get("manifest")
             if not isinstance(manifest, dict):
                 raise ValueError("manifest must be an object")
-            with tempfile.NamedTemporaryFile(
+            with _reopenable_temporary_file(
                 "w", suffix=".json", encoding="utf-8"
             ) as handle:
                 json.dump(manifest, handle, ensure_ascii=False)
@@ -504,7 +530,7 @@ def ui_design_post(path: str, body: dict) -> dict:
             files = source.get("files")
             if not isinstance(files, dict):
                 raise ValueError("editor source files must be an object")
-            with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as handle:
+            with _reopenable_temporary_file("w", suffix=".json", encoding="utf-8") as handle:
                 json.dump(files, handle, ensure_ascii=False)
                 handle.flush()
                 values["editor_json"] = handle.name
@@ -2759,6 +2785,9 @@ class Handler(BaseHTTPRequestHandler):
                     action_paths = vibe_memory_paths.for_home()
                     generation = str(result["service_action_generation"])
                 self.send_json(result)
+                if os.name == "nt" and result.get("restart_after_response"):
+                    threading.Thread(target=native_restart_worker,
+                        args=(vibe_memory_paths.for_home(),), daemon=False).start()
                 if result.get("bootout_after_response"):
                     threading.Thread(
                         target=scheduled_bootout_worker,

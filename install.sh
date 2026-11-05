@@ -2,6 +2,21 @@
 set -euo pipefail
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Git Bash uses the same native Windows Python installation path as CMD.
+case "${OSTYPE:-}" in
+  msys*|cygwin*)
+    WINDOWS_SOURCE="$(cygpath -w "$SOURCE_ROOT")"
+    if command -v py >/dev/null 2>&1; then
+      exec py -3 "$WINDOWS_SOURCE/scripts/vibe_memory_cli.py" install --source-root "$WINDOWS_SOURCE" "$@"
+    fi
+    if command -v python >/dev/null 2>&1; then
+      exec python "$WINDOWS_SOURCE/scripts/vibe_memory_cli.py" install --source-root "$WINDOWS_SOURCE" "$@"
+    fi
+    echo "Nexarl Forge requires Windows Python 3.10+ and Git." >&2
+    exit 1
+    ;;
+esac
+
 PYTHON=""
 for candidate in \
   "${VIBE_MEMORY_PYTHON:-}" \

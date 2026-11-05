@@ -25,6 +25,8 @@ import shlex
 import stat
 import sys
 import tempfile
+import subprocess
+import runtime_platform
 from typing import Any, NoReturn
 
 from ui_design_store import exclusive_lock
@@ -98,6 +100,19 @@ def command(runtime: str | pathlib.Path, agent: str, event: str) -> str:
     """Return a shell-safe managed hook command for one supported event."""
     _validate_agent_event(agent, event)
     launcher = pathlib.Path(os.path.abspath(os.path.expanduser(os.fspath(runtime))))
+    if runtime_platform.IS_WINDOWS:
+        install_root = launcher.parent.parent
+        interpreter = sys.executable
+        config = install_root / "config.json"
+        if config.exists():
+            value = json.loads(runtime_platform.read_regular(config).decode("utf-8"))
+            interpreter = value["python_executable"]
+            if not isinstance(interpreter, str) or not pathlib.Path(interpreter).is_absolute():
+                raise ValueError("invalid Windows hook interpreter")
+        return subprocess.list2cmdline([
+            interpreter, str(install_root / "current/scripts/vibe_memory_cli.py"),
+            "hook", "--agent", agent, "--event", event,
+        ])
     escaped = (
         str(launcher)
         .replace("\\", "\\\\")
@@ -142,6 +157,11 @@ def _is_managed_handler(
         or not isinstance(handler.get("command"), str)
     ):
         return False
+    if runtime_platform.IS_WINDOWS:
+        return any(
+            handler["command"] == command(_launcher_path(runtime), agent, event)
+            for agent in AGENTS for event in EVENTS
+        )
     try:
         tokens = shlex.split(handler["command"], comments=False, posix=True)
     except ValueError:
@@ -296,6 +316,8 @@ def _parse_document_bytes(target: pathlib.Path, raw: bytes) -> dict[str, Any]:
 
 
 def _reject_symlink(target: pathlib.Path) -> None:
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(target)
     if target.is_symlink():
         raise ConfigSymlinkError(f"hook configuration path must not be a symlink: {target}")
 
@@ -331,6 +353,9 @@ def _write_all(descriptor: int, content: bytes) -> None:
 
 
 def _fsync_directory(path: pathlib.Path) -> None:
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.sync_directory(path)
+        return
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
     descriptor = os.open(path, flags)
     try:
@@ -403,7 +428,7 @@ def _create_artifact_exclusive(
             suffix += 1
             continue
         try:
-            os.fchmod(descriptor, mode)
+            runtime_platform.set_file_mode(descriptor, mode)
             _write_all(descriptor, content)
             os.fsync(descriptor)
         except Exception:
@@ -451,7 +476,8 @@ def _open_source_descriptor(target: pathlib.Path) -> int | None:
     _reject_symlink(target)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        return os.open(target, flags)
+        return (runtime_platform.open_shared_read(target)
+                if runtime_platform.IS_WINDOWS else os.open(target, flags))
     except FileNotFoundError:
         return None
 
@@ -653,7 +679,7 @@ def _restore_external_bytes(
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(external_content)
             handle.flush()
-            os.fchmod(handle.fileno(), mode)
+            runtime_platform.set_file_mode(handle.fileno(), mode)
             os.fsync(handle.fileno())
         if not _path_matches(target, manager_identity, manager_content):
             return False
@@ -718,6 +744,7 @@ def write_with_backup(
         held_descriptor is None
         and expected_source is not _NO_SOURCE_CHECK
         and expected_source is not None
+        and not runtime_platform.IS_WINDOWS
     ):
         held_descriptor = _open_source_descriptor(target)
         owns_descriptor = True
@@ -745,7 +772,7 @@ def write_with_backup(
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
-            os.fchmod(handle.fileno(), existing_mode)
+            runtime_platform.set_file_mode(handle.fileno(), existing_mode)
             os.fsync(handle.fileno())
             manager_identity = _identity(os.fstat(handle.fileno()))
         current_source = _source_bytes(target)
@@ -1073,6 +1100,7 @@ def repair(
     runtime: str | pathlib.Path,
     *,
     _include_commit_snapshot: bool = False,
+    _expected_source: object = _NO_SOURCE_CHECK,
 ) -> dict[str, Any]:
     """Create or repair one document and describe its resulting backup, if any."""
     target = pathlib.Path(path)
@@ -1088,6 +1116,14 @@ def repair(
                 if source_descriptor is not None
                 else None
             )
+            if runtime_platform.IS_WINDOWS and source_descriptor is not None:
+                # Windows replacement may reject an open destination even with
+                # shared-delete handles (e.g. filesystem filters). Preserve the
+                # existing userspace CAS fallback and close before replacement.
+                os.close(source_descriptor)
+                source_descriptor = None
+            if _expected_source is not _NO_SOURCE_CHECK and source != _expected_source:
+                raise ConcurrentConfigChange(f"hook source changed before transaction: {target}")
             existed = source is not None
             current = _parse_document_bytes(target, source) if existed else {"hooks": {}}
             expected = merge_document(current, agent, runtime)
@@ -1119,11 +1155,14 @@ def uninstall(
     runtime: str | pathlib.Path | None = None,
     *,
     _include_commit_snapshot: bool = False,
+    _expected_source: object = _NO_SOURCE_CHECK,
 ) -> dict[str, Any]:
     """Remove Vibe Memory managed hook entries while preserving custom handlers."""
     target = pathlib.Path(path)
     _reject_symlink(target)
     if not target.exists():
+        if _expected_source is not _NO_SOURCE_CHECK and _expected_source is not None:
+            raise ConcurrentConfigChange(f"hook source changed before transaction: {target}")
         return {
             "changed": False,
             "path": str(target),
@@ -1143,6 +1182,11 @@ def uninstall(
             }
         try:
             source = _descriptor_bytes(source_descriptor)
+            if _expected_source is not _NO_SOURCE_CHECK and source != _expected_source:
+                raise ConcurrentConfigChange(f"hook source changed before transaction: {target}")
+            if runtime_platform.IS_WINDOWS and source_descriptor is not None:
+                os.close(source_descriptor)
+                source_descriptor = None
             current = _parse_document_bytes(target, source)
             updated = remove_managed_entries(current, runtime)
             if current == updated:
@@ -1162,4 +1206,5 @@ def uninstall(
             result["status"] = "updated" if result["changed"] else "current"
             return result
         finally:
-            os.close(source_descriptor)
+            if source_descriptor is not None:
+                os.close(source_descriptor)

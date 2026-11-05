@@ -1075,6 +1075,7 @@ def hook_command(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Nexarl Forge shared human–AI coding workspace CLI")
+    parser.add_argument("--project-root", dest="memory_project_root", default=None, help="Registered project used for memory operations")
     subcommands = parser.add_subparsers(dest="command", required=True)
     hook = subcommands.add_parser("hook", help="Route a Codex or Claude Code hook")
     hook.add_argument("--agent", choices=("codex", "claude-code"), required=True)
@@ -1148,6 +1149,11 @@ def build_parser() -> argparse.ArgumentParser:
     start = subcommands.add_parser("start", help="Start the service for this login session")
     start.set_defaults(command_handler=start_command)
 
+    if sys.platform == "win32":
+        for action in ("stop", "restart"):
+            native = subcommands.add_parser(action)
+            native.set_defaults(command_handler=start_command)
+
     uninstall = subcommands.add_parser("uninstall", help="Remove the managed runtime")
     uninstall.add_argument("--remove-data", action="store_true")
     uninstall.add_argument("--approved-data-deletion", action="store_true")
@@ -1163,10 +1169,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if sys.platform == "win32":
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
     args = build_parser().parse_args(argv)
+    if args.memory_project_root is not None:
+        os.environ["MEMORY_REVIEW_PROJECT_ROOT"] = str(pathlib.Path(args.memory_project_root).absolute())
+        importlib.reload(memory_review_queue)
     if args.command == "hook":
         return args.command_handler(args)
     try:
+        if sys.platform == "win32" and args.command in {"install", "update", "rollback", "repair", "start", "stop", "restart", "status", "doctor", "open", "uninstall", "hooks"}:
+            import windows_runtime
+            value = windows_runtime.dispatch(args, vibe_memory_paths.for_home())
+            _json(value)
+            if args.command == "doctor":
+                return 0 if all(item.get("ok", False) for item in value.values()) else 1
+            return 0
         return args.command_handler(args)
     except LifecycleError as error:
         print(f"{args.command} failed: {error}", file=sys.stderr)

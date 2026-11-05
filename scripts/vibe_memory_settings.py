@@ -11,6 +11,7 @@ import re
 import stat
 import tempfile
 import uuid
+import runtime_platform
 from contextlib import contextmanager
 from collections.abc import Callable
 from typing import Mapping
@@ -72,6 +73,11 @@ class FirstRunTransactionError(RuntimeError):
 
 @contextmanager
 def lifecycle_lock(paths: RuntimePaths):
+    if os.name == "nt":
+        import runtime_platform
+        with runtime_platform.file_lock(pathlib.Path(paths.install_root) / ".windows-lifecycle.lock"):
+            yield
+        return
     lock_path = pathlib.Path(paths.install_root) / ".lifecycle.vibe-memory.lock"
     lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with exclusive_lock(lock_path):
@@ -312,13 +318,16 @@ def render_managed_short_envelope(
 
 
 def _atomic_write_text(path: pathlib.Path, content: str, mode: int) -> None:
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.atomic_write(path, content.encode("utf-8"), mode)
+        return
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     temporary = pathlib.Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(content)
             handle.flush()
-            os.fchmod(handle.fileno(), mode)
+            runtime_platform.set_file_mode(handle.fileno(), mode)
             os.fsync(handle.fileno())
         os.replace(temporary, path)
         directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -344,10 +353,13 @@ def _backup_source(path: pathlib.Path, content: bytes, mode: int) -> pathlib.Pat
             continue
         try:
             _write_all(descriptor, content)
-            os.fchmod(descriptor, mode)
+            runtime_platform.set_file_mode(descriptor, mode)
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
+        if runtime_platform.IS_WINDOWS:
+            runtime_platform.sync_directory(path.parent)
+            return backup
         directory_fd = os.open(
             path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         )
@@ -447,6 +459,9 @@ def prune_personal_short(
     if any(token in source for token in marker_tokens):
         raise ValueError("malformed managed short envelope")
 
+    # Legacy Markdown is text, unlike byte-length/digest envelopes above.
+    # Windows editors commonly save CRLF; normalize only the legacy parse.
+    text = text.replace("\r\n", "\n")
     changed = False
     def retain_or_remove(match: re.Match[str]) -> str:
         nonlocal changed
@@ -514,6 +529,9 @@ def apply_first_run(
     register_workspace: Callable[[str], dict[str, object]],
 ) -> dict[str, object]:
     """Apply first-run choices as one rollback-capable lifecycle transaction."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_runtime
+        return windows_runtime.apply_first_run(paths, request, manager_source_root=manager_source_root, register_workspace=register_workspace)
     normalized = normalize_first_run_request(
         paths, request, manager_source_root=manager_source_root
     )

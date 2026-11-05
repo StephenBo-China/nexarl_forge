@@ -84,6 +84,7 @@ def run(
         args,
         cwd=str(cwd) if cwd else None,
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
         check=False,
@@ -95,13 +96,37 @@ def run(
 
 
 def run_user_command(command: str, cwd: pathlib.Path) -> subprocess.CompletedProcess[str]:
-    args = shlex.split(command)
+    if os.name == "nt":
+        # CommandLineToArgvW preserves Windows backslashes and quoted paths.
+        import ctypes
+        from ctypes import wintypes
+        if not command.strip():
+            raise WorkflowError("empty command is not allowed")
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        count = ctypes.c_int()
+        pointer = shell32.CommandLineToArgvW(command, ctypes.byref(count))
+        if not pointer:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            args = [pointer[index] for index in range(count.value)]
+        finally:
+            kernel32.LocalFree(pointer)
+        if args and args[0] in {"python", "python3"}:
+            args[0] = sys.executable
+    else:
+        args = shlex.split(command)
     if not args:
         raise WorkflowError("empty command is not allowed")
     result = subprocess.run(
         args,
         cwd=str(cwd),
         text=True,
+        encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
@@ -113,7 +138,7 @@ def run_user_command(command: str, cwd: pathlib.Path) -> subprocess.CompletedPro
 
 
 def git(root: pathlib.Path, *args: str, check: bool = True) -> str:
-    return run(["git", "-C", str(root), *args], check=check).stdout.strip()
+    return run(["git", "-c", "core.quotepath=false", "-C", str(root), *args], check=check).stdout.strip()
 
 
 def canonical_root(value: str | pathlib.Path) -> pathlib.Path:

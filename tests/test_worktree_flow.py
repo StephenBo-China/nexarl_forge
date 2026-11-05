@@ -131,7 +131,7 @@ class WorktreeFlowTest(unittest.TestCase):
             (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
         )
         config["worktree"]["finish_validation_commands"] = [
-            "test -f finish-ready.txt"
+            subprocess.list2cmdline([sys.executable, "-c", "from pathlib import Path; raise SystemExit(not Path('finish-ready.txt').is_file())"])
         ]
         config_path.write_text(json.dumps(config), encoding="utf-8")
         (feature / "feature.txt").write_text("feature\n", encoding="utf-8")
@@ -159,7 +159,7 @@ class WorktreeFlowTest(unittest.TestCase):
             (self.repo / ".loop" / "config.json").read_text(encoding="utf-8")
         )
         config["verification"]["commands"] = [
-            "test -f feature-verification-enabled.txt"
+            subprocess.list2cmdline([sys.executable, "-c", "from pathlib import Path; raise SystemExit(not Path('feature-verification-enabled.txt').is_file())"])
         ]
         config_path.write_text(json.dumps(config), encoding="utf-8")
         (feature / "feature-verification-enabled.txt").write_text(

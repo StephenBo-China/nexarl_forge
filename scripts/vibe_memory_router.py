@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
+import runtime_platform
+if not runtime_platform.IS_WINDOWS:
+    import fcntl
 import hashlib
 import json
 import math
@@ -79,7 +81,7 @@ def _candidate_cli_parts(paths: Any | None = None) -> list[str]:
         launcher = pathlib.Path(runtime_paths.launcher)
     except TypeError:
         launcher = pathlib.Path("")
-    if launcher.is_file() and os.access(launcher, os.X_OK):
+    if not runtime_platform.IS_WINDOWS and launcher.is_file() and os.access(launcher, os.X_OK):
         return [str(launcher)]
     config = pathlib.Path(runtime_paths.install_root) / "config.json"
     try:
@@ -139,6 +141,11 @@ class IdempotencyStore:
 
     @contextlib.contextmanager
     def _locked(self):
+        if runtime_platform.IS_WINDOWS:
+            runtime_platform.validate_path(self.path)
+            with runtime_platform.file_lock(self.lock_path):
+                yield
+            return
         parent = self.path.parent
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if parent.is_symlink() or not parent.is_dir():
@@ -239,6 +246,8 @@ class IdempotencyStore:
 
     @staticmethod
     def _pid_is_alive(value: object) -> bool:
+        if runtime_platform.IS_WINDOWS:
+            return runtime_platform.pid_is_alive(value)
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             return False
         try:
@@ -294,11 +303,11 @@ def build_context(
         )
         project_category_line = f"\n- Project categories: {', '.join(PROJECT_CATEGORIES)}."
         approval_scope += " and project long memory"
-        command_parts = [
-            "env",
-            f"MEMORY_REVIEW_PROJECT_ROOT={root}",
-            *command_parts,
-        ]
+        command_parts = (
+            [*command_parts, "--project-root", str(root)]
+            if runtime_platform.IS_WINDOWS else
+            ["env", f"MEMORY_REVIEW_PROJECT_ROOT={root}", *command_parts]
+        )
     required_lines = "\n".join(f"- `{_markdown_escape(path)}`" for path in required)
     personal_categories = ", ".join(PERSONAL_CATEGORIES)
     command_parts.extend(
@@ -323,7 +332,8 @@ def build_context(
             "1",
         ]
     )
-    command = " ".join(shlex.quote(part) for part in command_parts)
+    command = (subprocess.list2cmdline(command_parts) if runtime_platform.IS_WINDOWS
+               else " ".join(shlex.quote(part) for part in command_parts))
     candidate_reminder = ""
     if automatic_candidate_checks:
         candidate_reminder = f"""- The active conversation model may create at most two distilled candidates.
@@ -399,6 +409,13 @@ def _validate_name(name: str) -> None:
 
 
 def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
+    if isinstance(directory_fd, pathlib.Path):
+        _validate_name(name)
+        target = runtime_platform.validate_path(directory_fd / name)
+        try:
+            return target.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            return None
     _validate_name(name)
     try:
         return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -408,6 +425,15 @@ def _stat_at(directory_fd: int, name: str) -> os.stat_result | None:
 
 @contextlib.contextmanager
 def _open_codex_dir(project_root: pathlib.Path):
+    if runtime_platform.IS_WINDOWS:
+        root = runtime_platform.validate_path(project_root)
+        if not root.is_dir():
+            raise ValueError("project root must be a directory")
+        directory = runtime_platform.validate_path(root / "codex")
+        directory.mkdir(exist_ok=True)
+        runtime_platform.validate_path(directory)
+        yield directory
+        return
     root = pathlib.Path(project_root).resolve()
     root_fd = os.open(root, _directory_open_flags())
     codex_fd = -1
@@ -455,6 +481,18 @@ def _read_bounded_regular(
     max_bytes: int = MAX_QUEUE_INPUT_BYTES,
     deadline: float | None = None,
 ) -> str | None:
+    if isinstance(directory_fd, pathlib.Path):
+        if name is None:
+            raise ValueError("missing queue input name")
+        _validate_name(name)
+        path, directory_fd = directory_fd / name, None
+    if runtime_platform.IS_WINDOWS and path is not None:
+        if deadline is not None:
+            _check_queue_deadline(deadline)
+        try:
+            return runtime_platform.read_regular(path, max_bytes).decode("utf-8")
+        except FileNotFoundError:
+            return None
     if (path is None) == (directory_fd is None):
         raise ValueError("queue input requires exactly one location")
     if directory_fd is not None:
@@ -522,9 +560,16 @@ def _refresh_review_queue(
         raise TimeoutError("queue refresh deadline exceeded")
     project_root = pathlib.Path(project_root).resolve()
     with _open_codex_dir(project_root) as codex_fd:
-        command = _queue_worker_command(codex_fd, project_root, timeout_seconds)
+        command = (
+            [sys.executable, str(pathlib.Path(__file__).with_name("windows_queue_worker.py")), str(project_root)]
+            if runtime_platform.IS_WINDOWS
+            else _queue_worker_command(codex_fd, project_root, timeout_seconds)
+        )
         environment = os.environ.copy()
         environment["HOME"] = str(pathlib.Path.home())
+        if runtime_platform.IS_WINDOWS:
+            environment["USERPROFILE"] = str(pathlib.Path.home())
+            environment["MEMORY_REVIEW_PROJECT_ROOT"] = str(project_root)
         with tempfile.TemporaryFile() as output:
             process = subprocess.Popen(
                 command,
@@ -533,7 +578,7 @@ def _refresh_review_queue(
                 stderr=subprocess.DEVNULL,
                 env=environment,
                 close_fds=True,
-                pass_fds=(codex_fd,),
+                **({} if runtime_platform.IS_WINDOWS else {"pass_fds": (codex_fd,)}),
             )
             try:
                 process.communicate(timeout=timeout_seconds)
@@ -641,6 +686,11 @@ def _refresh_review_queue_on_fd(
 
 @contextlib.contextmanager
 def _advisory_lock_at(directory_fd: int, name: str):
+    if isinstance(directory_fd, pathlib.Path):
+        _validate_name(name)
+        with runtime_platform.file_lock(directory_fd / name):
+            yield
+        return
     _validate_name(name)
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
@@ -667,6 +717,9 @@ def _atomic_write_at(
     mode: int = 0o644,
 ) -> None:
     _validate_name(name)
+    if isinstance(directory_fd, pathlib.Path):
+        runtime_platform.atomic_write(directory_fd / name, content.encode("utf-8"), mode)
+        return
     target = _stat_at(directory_fd, name)
     if target is not None and stat.S_ISLNK(target.st_mode):
         raise ValueError("unsafe packet path")
@@ -736,6 +789,10 @@ def _restore_at(directory_fd: int, name: str, content: object) -> None:
 
 
 def _unlink_at(directory_fd: int, name: str) -> None:
+    if isinstance(directory_fd, pathlib.Path):
+        _validate_name(name)
+        runtime_platform.validate_path(directory_fd / name).unlink(missing_ok=True)
+        return
     target = _stat_at(directory_fd, name)
     if target is None:
         return

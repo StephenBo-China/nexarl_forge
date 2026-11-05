@@ -11,7 +11,9 @@ import stat
 import tempfile
 import datetime as _dt
 import contextlib
-import fcntl
+import runtime_platform
+if not runtime_platform.IS_WINDOWS:
+    import fcntl
 import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -99,6 +101,9 @@ def safe_tree_digest(
     max_file_bytes: int = _MAX_PACKAGE_FILE_BYTES,
 ) -> str:
     """Hash a package with the canonical tree protocol using descriptor-relative reads."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_migration
+        return windows_migration.safe_tree_digest(root, max_files=max_files, max_total_bytes=max_total_bytes, max_file_bytes=max_file_bytes)
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     root_fd = os.open(root, flags)
     try:
@@ -881,6 +886,10 @@ def preview_legacy_hooks(
     project_roots: list[pathlib.Path], *, paths: RuntimePaths | None = None
 ) -> list[dict[str, Any]]:
     """Return a read-only legacy project memory-hook migration preview."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_migration
+        selected = _selected_registered_roots(project_roots, paths or memory_project.RUNTIME_PATHS)
+        return [windows_migration.preview(root) for root in selected]
     runtime_paths = paths or memory_project.RUNTIME_PATHS
     results: list[dict[str, Any]] = []
     for root in _selected_registered_roots(project_roots, runtime_paths):
@@ -893,6 +902,11 @@ def apply_legacy_hooks(
     project_roots: list[pathlib.Path], *, paths: RuntimePaths | None = None
 ) -> dict[str, Any]:
     """Remove old per-project memory hook entries after backing up touched files."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_migration
+        selected = _selected_registered_roots(project_roots, paths or memory_project.RUNTIME_PATHS)
+        results = [{"root": str(root), **windows_migration.execute(windows_migration.prepare(root))} for root in selected]
+        return {"status": "applied", "projects": results}
     runtime_paths = paths or memory_project.RUNTIME_PATHS
     try:
         selected = _selected_registered_roots(project_roots, runtime_paths)
@@ -1081,6 +1095,9 @@ def _archive_project_legacy_hooks(
 
 def prepare_legacy_hook_cleanup(project_root: pathlib.Path) -> dict[str, Any]:
     """Validate ownership and capture the active legacy-hook state."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_migration
+        return windows_migration.prepare(project_root)
     root = pathlib.Path(project_root).expanduser().resolve()
     if not root.is_dir():
         raise ValueError(f"project root is not a directory: {root}")
@@ -1096,6 +1113,9 @@ def prepare_legacy_hook_cleanup(project_root: pathlib.Path) -> dict[str, Any]:
 
 def execute_legacy_hook_cleanup(plan: Mapping[str, Any]) -> dict[str, Any]:
     """Execute one prepared cleanup and restore the active state on failure."""
+    if runtime_platform.IS_WINDOWS:
+        import windows_migration
+        return windows_migration.execute(plan)
     root = pathlib.Path(plan["root"])
     snapshots = plan["snapshots"]
     layout = plan["layout"]
@@ -1925,6 +1945,9 @@ def _skill_registry(ui_design_home: pathlib.Path) -> tuple[dict[str, Any] | None
 
 
 def inspect_ui_skill_digests(ui_design_home: pathlib.Path) -> dict[str, Any]:
+    if os.name == "nt":
+        from windows_migration import inspect_ui_skill_digests as inspect_windows
+        return inspect_windows(ui_design_home)
     registry, errors = _skill_registry(ui_design_home)
     records: list[dict[str, Any]] = []
     if registry:

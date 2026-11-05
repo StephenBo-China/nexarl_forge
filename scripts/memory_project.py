@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import datetime as _dt
-import fcntl
+import runtime_platform
+if not runtime_platform.IS_WINDOWS:
+    import fcntl
 import json
 import os
 import pathlib
@@ -79,6 +81,14 @@ def _empty_registry() -> dict[str, Any]:
 
 @contextlib.contextmanager
 def _registry_lock(exclusive: bool):
+    if runtime_platform.IS_WINDOWS:
+        target = runtime_platform.validate_path(REGISTRY_PATH)
+        if not exclusive and not target.parent.exists():
+            yield None
+            return
+        with runtime_platform.file_lock(target.with_name(".projects.registry.lock")):
+            yield target.parent
+        return
     parent = REGISTRY_PATH.absolute().parent
     vibe_memory_install._validate_install_ancestor_chain(parent)
     canonical_parent = vibe_memory_install._canonical_install_path(parent)
@@ -103,6 +113,13 @@ def _registry_lock(exclusive: bool):
 
 
 def _read_registry_at(parent_fd: int) -> dict[str, Any]:
+    if isinstance(parent_fd, pathlib.Path):
+        target = runtime_platform.validate_path(parent_fd / REGISTRY_PATH.name)
+        try:
+            raw = runtime_platform.read_regular(target)
+        except FileNotFoundError:
+            return _empty_registry()
+        return _validate_registry_document(raw)
     name = REGISTRY_PATH.name
     try:
         before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
@@ -127,8 +144,12 @@ def _read_registry_at(parent_fd: int) -> dict[str, Any]:
             chunks.append(chunk)
     finally:
         os.close(descriptor)
+    return _validate_registry_document(b"".join(chunks))
+
+
+def _validate_registry_document(raw: bytes) -> dict[str, Any]:
     try:
-        data = json.loads(b"".join(chunks).decode("utf-8"))
+        data = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("project registry is malformed") from error
     if (
@@ -144,6 +165,9 @@ def _read_registry_at(parent_fd: int) -> dict[str, Any]:
 
 def _write_registry_at(parent_fd: int, value: dict[str, Any]) -> None:
     content = (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    if isinstance(parent_fd, pathlib.Path):
+        runtime_platform.atomic_write(parent_fd / REGISTRY_PATH.name, content)
+        return
     temporary_name = f".{REGISTRY_PATH.name}.tmp-{uuid.uuid4().hex}"
     descriptor = os.open(
         temporary_name,
@@ -521,7 +545,7 @@ def agent_candidate_protocol(root: pathlib.Path) -> str:
     except TypeError:
         launcher = pathlib.Path("")
     cli_parts: list[str]
-    if launcher.is_file() and os.access(launcher, os.X_OK):
+    if not runtime_platform.IS_WINDOWS and launcher.is_file() and os.access(launcher, os.X_OK):
         cli_parts = [str(launcher)]
     else:
         config = pathlib.Path(RUNTIME_PATHS.install_root) / "config.json"
@@ -542,6 +566,14 @@ def agent_candidate_protocol(root: pathlib.Path) -> str:
         else:
             cli_parts = [sys.executable, str(APP_ROOT / "scripts/vibe_memory_cli.py")]
     cli_command = " ".join(shlex.quote(part) for part in cli_parts)
+    candidate_example = f"MEMORY_REVIEW_PROJECT_ROOT={project_environment} {cli_command} memory propose"
+    continuation = "\\"
+    code_language = "bash"
+    if runtime_platform.IS_WINDOWS:
+        cli_command = subprocess.list2cmdline([*cli_parts, "--project-root", str(root)])
+        candidate_example = f"{cli_command} memory propose"
+        continuation = "^"
+        code_language = "cmd"
     return f"""## Agent-Generated Memory Candidates
 
 The active conversation model performs candidate summarization itself. Hooks
@@ -571,9 +603,9 @@ pending and approved memory before writing.
 
 Write a distilled candidate with:
 
-```bash
-MEMORY_REVIEW_PROJECT_ROOT={project_environment} {cli_command} memory propose \\
-  --scope personal|project --target long|short --category CATEGORY \\
+```{code_language}
+{candidate_example} {continuation}
+  --scope personal|project --target long|short --category CATEGORY {continuation}
   --title "TITLE" --summary "SUMMARY" --source-event agent_summary
 ```
 
@@ -733,7 +765,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-APP_ROOT = pathlib.Path("{APP_ROOT}")
+APP_ROOT = pathlib.Path({str(APP_ROOT)!r})
 CODEX_DIR = ROOT / "codex"
 SHORT_MEMORY = CODEX_DIR / "codex_short_memory.md"
 PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"
@@ -828,8 +860,8 @@ def loop_context() -> str:
 - finish validation gate: {{gate}}; run configured validation before success claims.
 - Subagents and parallel agents require explicit user authorization and isolated
   Loop-safe worktrees.
-- Read `{CODEX_LOOP_DIR}` and
-  `{CLAUDE_LOOP_DIR}` before substantial Loop work.
+- Read `{CODEX_LOOP_DIR.as_posix()}` and
+  `{CLAUDE_LOOP_DIR.as_posix()}` before substantial Loop work.
 """
 
     return f"""
@@ -856,8 +888,8 @@ Repository: `{{ROOT}}`
 - `codex/codex_long_memory.md`
 - `codex/codex_short_memory.md` (read selectively)
 - `codex/memory_proposals.md`
-- `{RUNTIME_PATHS.personal_memory / "long.md"}`
-- `{RUNTIME_PATHS.personal_memory / "short.md"}`
+- `{(RUNTIME_PATHS.personal_memory / "long.md").as_posix()}`
+- `{(RUNTIME_PATHS.personal_memory / "short.md").as_posix()}`
 
 ## Pending Memory Review
 
@@ -1148,6 +1180,32 @@ def init_project(root: str | pathlib.Path) -> dict[str, Any]:
 def upgrade_memory_hooks(root: str | pathlib.Path) -> dict[str, Any]:
     """Upgrade managed hook code while preserving a timestamped audit backup."""
     project_root = normalize_project_root(root)
+    if os.name == "nt":
+        # Universal user hooks own memory and design routing on Windows.
+        # Remove legacy project entry points rather than creating duplicates.
+        import windows_migration
+        result = windows_migration.execute(windows_migration.prepare(project_root))
+        import runtime_platform
+        import vibe_memory_hooks
+        for agent, relative in (("codex", ".codex/hooks.json"), ("claude", ".claude/settings.json")):
+            document = project_root / relative
+            gate = project_root / f".{agent}/hooks/ui_design_gate_hook.py"
+            if not document.exists() or not gate.exists():
+                continue
+            if runtime_platform.read_regular(gate).decode("utf-8").replace("\r\n", "\n") != ui_design_gate_hook_text().replace("\r\n", "\n"):
+                continue
+            raw = runtime_platform.read_regular(document)
+            value = json.loads(raw.decode("utf-8"))
+            entries = value.get("hooks", {}).get("PreToolUse", [])
+            if not isinstance(entries, list):
+                raise ValueError("invalid project PreToolUse hooks")
+            updated = [entry for entry in entries if not _is_managed_gate_entry(entry)]
+            if updated != entries:
+                value["hooks"]["PreToolUse"] = updated
+                vibe_memory_hooks.write_with_backup(document, value, expected_source=raw)
+                result["changed_paths"].append(str(document))
+        return {"ok": True, "project": project_entry(project_root),
+            "changes": [{"path": path, "status": "removed_legacy"} for path in result["changed_paths"]]}
     changes: list[dict[str, str]] = []
     stamp = _dt.datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     for path, content in (
