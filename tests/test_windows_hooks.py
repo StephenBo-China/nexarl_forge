@@ -15,7 +15,7 @@ class WindowsHookTests(unittest.TestCase):
             root = pathlib.Path(directory)
             launcher = root / "bin/nexarl-forge.cmd"
             rendered = hooks.command(launcher, "codex", "SessionStart")
-            expected = subprocess.list2cmdline([sys.executable, str(root / "current/scripts/vibe_memory_cli.py"), "hook", "--agent", "codex", "--event", "SessionStart"])
+            expected = f'"{sys.executable}" "{root / "current/scripts/vibe_memory_cli.py"}" hook --agent codex --event SessionStart'
             self.assertEqual(rendered, expected)
 
     def test_repair_idempotent_uninstall_preserves_external_hook(self):
@@ -48,3 +48,16 @@ class WindowsHookTests(unittest.TestCase):
             with self.assertRaises(hooks.ConcurrentConfigChange):
                 hooks.uninstall(target, launcher, _expected_source=before)
             self.assertEqual(target.read_bytes(), changed)
+
+    def test_cmd_executes_hook_path_with_ampersand_without_second_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "native&path"
+            script = root / "current/scripts/vibe_memory_cli.py"
+            script.parent.mkdir(parents=True)
+            script.write_text("import json,sys; print(json.dumps(sys.argv[1:]))", encoding="utf-8")
+            command = hooks.command(root / "bin/nexarl-forge.cmd", "codex", "SessionStart")
+            result = subprocess.run(command, shell=True, capture_output=True, encoding="utf-8", timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), ["hook", "--agent", "codex", "--event", "SessionStart"])
+            with self.assertRaisesRegex(ValueError, "percent"):
+                hooks.command(pathlib.Path(directory) / "%TEMP%/bin/nexarl-forge.cmd", "codex", "SessionStart")

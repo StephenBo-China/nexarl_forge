@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import pathlib
 import uuid
+import hashlib
+import tempfile
 import runtime_platform as storage
 import vibe_memory_hooks as hooks
 
@@ -20,47 +22,79 @@ def _snapshot(root):
     return result
 
 
+def _identity(root):
+    metadata = storage.validate_path(root).stat(follow_symlinks=False)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _lock_path(root):
+    locks = storage.private_directory(pathlib.Path(tempfile.gettempdir()) / "NexarlForge/migration-locks")
+    return locks / (hashlib.sha256(str(root).casefold().encode("utf-8")).hexdigest() + ".lock")
+
+
 def prepare(root):
     root = storage.validate_path(pathlib.Path(root).absolute())
-    with storage.file_lock(root / ".nexarl-forge-migration.lock"):
-        return {"root": root, "snapshots": _snapshot(root)}
+    identity = _identity(root)
+    snapshots = _snapshot(root)
+    if _identity(root) != identity:
+        raise ValueError("project root changed during migration preflight")
+    return {"root": root, "snapshots": snapshots, "identity": identity}
 
 
-def preview(root):
+def preview(root, *, _plan=None):
     import vibe_memory_migration as migration
     import memory_project
-    plan = prepare(root)
-    root, snapshots = plan["root"], plan["snapshots"]
+    errors = []
     managed, custom, documents, targets, scripts = set(), set(), [], [], []
-    for relative, script_relative in migration._LEGACY_HOOK_DOCUMENTS:
-        raw = snapshots[str(relative)]
-        if raw is None:
-            documents.append({"path": str(root / relative), "status": "missing"})
-            continue
-        value = json.loads(raw.decode("utf-8"))
-        agent = "codex" if relative.parts[0] == ".codex" else "claude"
-        script = snapshots[str(script_relative)]
-        owned = script is not None and script.decode("utf-8").replace("\r\n", "\n") == memory_project.hook_script(root, agent)
-        found, other = migration._hook_entry_counts(value, owned_script=owned)
-        managed.update(found)
-        custom.update(other)
-        documents.append({"path": str(root / relative), "status": "ok", "managed_entries": len(found), "custom_entries": len(other)})
-        if found:
-            targets.append(str(root / relative))
-            scripts.append(str(root / script_relative))
-    return {"root": str(root), "status": "preview", "managed_entries": len(managed), "custom_entries": len(custom),
-        "targets": targets, "script_targets": scripts, "documents": documents, "errors": []}
+    root = pathlib.Path(root).absolute()
+    try:
+        plan = prepare(root) if _plan is None else _plan
+        root, snapshots = plan["root"], plan["snapshots"]
+        for relative, script_relative in migration._LEGACY_HOOK_DOCUMENTS:
+            raw = snapshots[str(relative)]
+            if raw is None:
+                documents.append({"path": str(root / relative), "status": "missing"})
+                continue
+            try:
+                value = json.loads(raw.decode("utf-8"))
+                if not isinstance(value, dict) or not isinstance(value.get("hooks", {}), dict):
+                    raise ValueError("hook document and hooks must be objects")
+                agent = "codex" if relative.parts[0] == ".codex" else "claude"
+                script = snapshots[str(script_relative)]
+                owned = script is not None and script.decode("utf-8").replace("\r\n", "\n") == memory_project.hook_script(root, agent)
+                has_reference = any(migration._is_legacy_memory_command(handler.get("command"))
+                    for groups in value.get("hooks", {}).values() if isinstance(groups, list)
+                    for group in groups if isinstance(group, dict) and isinstance(group.get("hooks"), list)
+                    for handler in group["hooks"] if isinstance(handler, dict) and handler.get("type") == "command")
+                if has_reference and not owned:
+                    errors.append(migration._issue(root / script_relative, ValueError("referenced script is missing or not manager-owned")))
+                found, other = migration._hook_entry_counts(value, owned_script=owned)
+                managed.update(found)
+                custom.update(other)
+                documents.append({"path": str(root / relative), "status": "ok", "managed_entries": len(found), "custom_entries": len(other)})
+                if found:
+                    targets.extend((str(root / relative), str(root / script_relative)))
+                    scripts.append(str(root / script_relative))
+            except (ValueError, UnicodeError) as error:
+                errors.append(migration._issue(root / relative, error))
+    except (OSError, ValueError) as error:
+        errors.append(migration._issue(root, error))
+    return {"root": str(root), "status": "error" if errors else "preview", "managed_entries": len(managed), "custom_entries": len(custom),
+        "targets": sorted(set(targets)), "script_targets": sorted(set(scripts)), "documents": documents, "errors": errors}
 
 
-def execute(plan):
+def execute(plan, *, audit=False):
     import vibe_memory_migration as migration
     import memory_project
     root = storage.validate_path(pathlib.Path(plan["root"]))
     backups, changed, committed, archived = [], [], {}, []
     removed = 0
-    with storage.file_lock(root / ".nexarl-forge-migration.lock"):
-        if _snapshot(root) != plan["snapshots"]:
-            raise ValueError("legacy hook files changed after preflight")
+    with storage.file_lock(_lock_path(root)):
+        if _identity(root) != plan["identity"] or _snapshot(root) != plan["snapshots"]:
+            raise ValueError("legacy project binding or files changed after preflight")
+        inspection = preview(root, _plan=plan)
+        if inspection["errors"]:
+            raise ValueError("legacy hook ownership conflict")
         try:
             for relative, script_relative in migration._LEGACY_HOOK_DOCUMENTS:
                 raw = plan["snapshots"][str(relative)]
@@ -73,9 +107,13 @@ def execute(plan):
                 updated, count = migration._remove_legacy_memory_entries(json.loads(raw.decode("utf-8")), owned_script=True)
                 if not count:
                     continue
+                if _identity(root) != plan["identity"]:
+                    raise ValueError("legacy project root changed during migration")
                 target = root / relative
-                result = hooks.write_with_backup(target, updated, expected_source=raw)
-                committed[target] = storage.read_regular(target)
+                with hooks.exclusive_lock(target.with_name(f".{target.name}.vibe-memory.lock")):
+                    result = hooks.write_with_backup(target, updated, expected_source=raw, _include_commit_snapshot=True)
+                    if result["changed"]:
+                        committed[target] = result["_commit_snapshot"][1]
                 backups.append(result["backup"])
                 changed.append(str(target))
                 script_path = storage.validate_path(root / script_relative)
@@ -87,8 +125,28 @@ def execute(plan):
                 backups.append(str(archive))
                 changed.append(str(script_path))
                 removed += count
-            return {"result": "ok", "changed_paths": changed, "backups": backups, "removed_handlers": removed}
+            result = {"result": "ok", "changed_paths": changed, "backups": backups, "removed_handlers": removed}
+            if audit:
+                import hashlib
+                def state_digest(snapshot):
+                    digest = hashlib.sha256()
+                    for name, content in sorted(snapshot.items()):
+                        raw = json.dumps([name, content.hex() if content is not None else None], ensure_ascii=False).encode("utf-8")
+                        digest.update(len(raw).to_bytes(8, "big"))
+                        digest.update(raw)
+                    return digest.hexdigest()
+                inspection = preview(root, _plan=plan)
+                status = "applied" if changed else "unchanged"
+                audit_path = storage.validate_path(root / "codex/migration_audits" / ("legacy-hooks-" + uuid.uuid4().hex + ".json"))
+                document = {"root": str(root), "before_digest": state_digest(plan["snapshots"]),
+                    "after_digest": state_digest(_snapshot(root)), "changed_paths": changed,
+                    "backups": backups, "result": status, "conflict_paths": []}
+                storage.atomic_write(audit_path, (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+                result.update(result=status, audit=str(audit_path), managed_entries=inspection["managed_entries"], custom_entries=inspection["custom_entries"])
+            return result
         except Exception as error:
+            if _identity(root) != plan["identity"]:
+                raise RuntimeError("migration root changed; recovery artifacts preserved") from error
             conflicts = []
             for path, archive in reversed(archived):
                 if path.exists():
@@ -96,10 +154,11 @@ def execute(plan):
                 else:
                     archive.rename(path)
             for target, content in committed.items():
-                if storage.read_regular(target) != content:
-                    conflicts.append(str(target))
-                else:
-                    storage.atomic_write(target, plan["snapshots"][str(target.relative_to(root))])
+                with hooks.exclusive_lock(target.with_name(f".{target.name}.vibe-memory.lock")):
+                    if storage.read_regular(target) != content:
+                        conflicts.append(str(target))
+                    else:
+                        storage.atomic_write(target, plan["snapshots"][str(target.relative_to(root))])
             if conflicts:
                 raise RuntimeError("migration rollback conflict: " + ", ".join(conflicts)) from error
             raise
@@ -130,7 +189,7 @@ def safe_tree_digest(root, *, max_files=4096, max_total_bytes=64 * 1024 * 1024, 
                     raise ValueError("package contains a special file")
     walk(root)
     digest = hashlib.sha256()
-    for relative, path, size in sorted(files):
+    for relative, path, size in sorted(files, key=lambda item: pathlib.PurePosixPath(item[0]).parts):
         raw = storage.read_regular(path, max_file_bytes)
         if len(raw) != size:
             raise ValueError("package changed during inspection")
@@ -175,3 +234,24 @@ def inspect_ui_skill_digests(home):
                 except (OSError, ValueError) as error:
                     errors.append(migration._issue(packages, error))
     return migration._area({"errors": errors}, records, registry is not None and not errors)
+
+
+def apply(project_roots, paths):
+    import vibe_memory_migration as migration
+    try:
+        roots = migration._selected_registered_roots(project_roots, paths)
+    except (OSError, ValueError):
+        return {"status": "failed", "projects": [{"root": str(root), "result": "failed", "error": "invalid_root", "audit": ""} for root in project_roots]}
+    results = []
+    for root in roots:
+        try:
+            plan = prepare(root)
+            if preview(root, _plan=plan)["errors"]:
+                raise ValueError("legacy hook ownership conflict")
+            result = execute(plan, audit=True)
+            results.append({"root": str(root), **result})
+        except (OSError, ValueError, RuntimeError) as error:
+            results.append({"root": str(root), "result": "failed", "error": str(error), "audit": ""})
+    failures = sum(item["result"] == "failed" for item in results)
+    status = "failed" if failures and failures == len(results) else "partial" if failures else "applied"
+    return {"status": status, "projects": results}

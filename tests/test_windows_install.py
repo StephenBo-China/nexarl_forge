@@ -28,11 +28,19 @@ class WindowsInstallTests(unittest.TestCase):
                 result = windows_runtime.install(paths, pathlib.Path(__file__).resolve().parents[1], port=port)
                 self.assertTrue(result["ok"])
                 self.assertTrue((paths.install_root / "current/scripts/vibe_memory_cli.py").is_file())
+                self.assertFalse((paths.install_root / "current/docs/superpowers/plans").exists())
                 self.assertTrue(paths.launcher.is_file())
                 self.assertTrue(windows_service.status(paths)["ok"])
                 report = windows_runtime.doctor(paths)
                 self.assertTrue(all(area["ok"] for area in report.values()), report)
-                self.assertEqual(set(report), {"runtime", "codex_hooks", "claude_hooks", "service", "data"})
+                self.assertEqual(set(report), {"runtime", "codex_hooks", "claude_hooks", "service", "data", "control_plane"})
+                paths.ui_design_home.mkdir(parents=True, exist_ok=True)
+                broken_registry = paths.ui_design_home / "registry.json"
+                broken_registry.write_text('{"schema_version": 999}', encoding="utf-8")
+                broken_report = windows_runtime.doctor(paths)
+                self.assertFalse(broken_report["control_plane"]["ok"])
+                self.assertIn("ui_skills", broken_report["control_plane"]["non_ok_areas"])
+                broken_registry.unlink()
                 self.assertIn("python", (home / ".codex/hooks.json").read_text(encoding="utf-8"))
                 request = urllib.request.Request(f"http://127.0.0.1:{port}/api/settings/first-run",
                     data=json.dumps({"start_at_login": True}).encode(), headers={"Content-Type": "application/json"})
@@ -109,6 +117,17 @@ class WindowsInstallTests(unittest.TestCase):
                 memory.write_text("keep", encoding="utf-8")
                 windows_runtime.install(paths, source, port=port)
                 self.assertFalse(sentinel.exists())
+                original_switch = windows_runtime._rename_directory
+                previous_before = (paths.install_root / "previous/original.txt").read_bytes()
+                def fail_current_switch(path, target):
+                    if pathlib.Path(path).name == "current" and pathlib.Path(target).name == "previous":
+                        raise OSError("injected current switch failure")
+                    return original_switch(path, target)
+                with mock.patch.object(windows_runtime, "_rename_directory", side_effect=fail_current_switch):
+                    with self.assertRaisesRegex(OSError, "injected current switch failure"):
+                        windows_runtime.install(paths, source, port=port)
+                self.assertEqual((paths.install_root / "previous/original.txt").read_bytes(), previous_before)
+                self.assertTrue(windows_service.status(paths)["ok"])
                 original_rename = pathlib.Path.rename
                 def fail_archive(path, target):
                     if path.name.startswith(".rollback-") and not path.name.startswith(".rollback-failed-") and pathlib.Path(target).name == "previous":
@@ -151,7 +170,7 @@ class WindowsInstallTests(unittest.TestCase):
             bash = pathlib.Path(shutil.which("git")).parents[1] / "bin/bash.exe"
             try:
                 for command in (["cmd.exe", "/d", "/c", str(source / "install.cmd"), "--port", str(port)],
-                                [str(bash), str(source / "install.sh").replace("\\", "/"), "--port", str(port)]):
+                                [str(bash), str(source / "install.sh").replace("\\", "/")]):
                     result = subprocess.run(command, env=env, capture_output=True, encoding="utf-8", timeout=45)
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 source.rename(base / "source-moved")

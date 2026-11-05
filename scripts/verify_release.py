@@ -230,7 +230,7 @@ def _uninstall_check(root: pathlib.Path) -> str:
     return "ok"
 
 
-_INSTALLED_E2E_SERVICE = f"gui/{os.getuid()}/com.noema.vibe-memory"
+_INSTALLED_E2E_SERVICE = f"gui/{os.getuid() if hasattr(os, 'getuid') else 0}/com.noema.vibe-memory"
 
 
 def _installed_e2e_process(
@@ -686,6 +686,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--tree", default=".")
     args = parser.parse_args(argv)
+    if sys.platform == "win32":
+        import verify_windows
+        return verify_windows.main(["--tree", args.tree])
     result = evaluate_checks(args.tree)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if all(value == "ok" for value in result.values()) else 1

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import pathlib
+import re
 from typing import Any
 
 
@@ -86,4 +87,15 @@ def read_release_manifest(path: pathlib.Path | str) -> dict[str, Any]:
     missing = required.difference(value)
     if missing:
         raise ValueError(f"release manifest missing required fields: {', '.join(sorted(missing))}")
+    for name in ("app_version", "platform"):
+        if not isinstance(value[name], str) or not value[name].strip():
+            raise ValueError(f"release manifest {name} must be a nonempty string")
+    for name in ("data_schema_version", "hook_protocol_version"):
+        if type(value[name]) is not int or value[name] < 1:
+            raise ValueError(f"release manifest {name} must be a positive integer")
+    if not isinstance(value["minimum_python"], str) or not re.fullmatch(r"[0-9]+\.[0-9]+", value["minimum_python"]):
+        raise ValueError("release manifest minimum_python must be major.minor")
+    platforms = value.get("supported_platforms", [value["platform"]])
+    if not isinstance(platforms, list) or not platforms or any(not isinstance(item, str) or not item for item in platforms):
+        raise ValueError("release manifest supported_platforms must be a nonempty string array")
     return value

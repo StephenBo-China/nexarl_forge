@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import runtime_platform
 import datetime as dt
 import json
 import os
@@ -89,6 +90,11 @@ def package_digest(root: pathlib.Path) -> str:
 
 def _copy_package(source: pathlib.Path, destination: pathlib.Path) -> None:
     source = pathlib.Path(source)
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(source)
+        runtime_platform.validate_path(destination)
+        for path in source.rglob("*"):
+            runtime_platform.validate_path(path)
     if not source.is_dir():
         raise RegistryError(f"skill package is not a directory: {source}")
     symlink = next((path for path in source.rglob("*") if path.is_symlink()), None)

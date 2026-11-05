@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import runtime_platform
+
 import datetime as dt
 import hashlib
 import json
@@ -61,11 +63,18 @@ def resolve_targets(
 
 
 def _canonical_root(value: pathlib.Path | str) -> pathlib.Path:
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(pathlib.Path(value).expanduser())
     return pathlib.Path(value).expanduser().resolve()
 
 
 def _reject_symlink_ancestors(path: pathlib.Path, stop_at: pathlib.Path) -> None:
     stop_at = pathlib.Path(stop_at)
+    if runtime_platform.IS_WINDOWS:
+        try:
+            runtime_platform.validate_path(path)
+        except ValueError as error:
+            raise ScopeConflict(str(error)) from error
     for candidate in (path, *path.parents):
         if candidate.is_symlink():
             raise ScopeConflict(f"publication path contains a symlink ancestor: {candidate}")

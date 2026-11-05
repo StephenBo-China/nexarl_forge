@@ -20,7 +20,7 @@ class RuntimePathsTest(unittest.TestCase):
     def test_paths_are_derived_from_supplied_home(self) -> None:
         home = pathlib.Path("/portable/home")
 
-        paths = vibe_memory_paths.for_home(home)
+        paths = vibe_memory_paths.for_home(home, platform="darwin")
 
         self.assertEqual(paths.personal_memory, home / ".codex/personal_memory")
         self.assertEqual(paths.project_registry, home / ".codex/memory_review/projects.json")
@@ -38,13 +38,13 @@ class RuntimePathsTest(unittest.TestCase):
 
     def test_discover_python_rejects_39_and_selects_first_310_candidate(self) -> None:
         probes = {
-            "/usr/bin/python3": (3, 9),
-            "/opt/homebrew/bin/python3": (3, 11),
+            os.path.abspath("/usr/bin/python3"): (3, 9),
+            os.path.abspath("/opt/homebrew/bin/python3"): (3, 11),
         }
 
         self.assertEqual(
             vibe_memory_install.discover_python(lambda path: probes.get(path)),
-            "/opt/homebrew/bin/python3",
+            os.path.abspath("/opt/homebrew/bin/python3"),
         )
 
     def test_discover_python_fails_safely_when_no_310_candidate_exists(self) -> None:
@@ -59,6 +59,7 @@ class RuntimePathsTest(unittest.TestCase):
         self.assertEqual(manifest["hook_protocol_version"], 1)
         self.assertEqual(manifest["minimum_python"], "3.10")
         self.assertEqual(manifest["platform"], "macOS")
+        self.assertIn("Windows", manifest["supported_platforms"])
 
     def test_release_manifest_rejects_non_object_root(self) -> None:
         with tempfile.TemporaryDirectory() as value:
@@ -86,6 +87,7 @@ class WorktreeRootOverrideIntegrationTest(unittest.TestCase):
             env.update(
                 {
                     "HOME": str(temp / "home"),
+                    "USERPROFILE": str(temp / "home"),
                     "CODEX_WORKTREE_ROOT": str(override),
                 }
             )

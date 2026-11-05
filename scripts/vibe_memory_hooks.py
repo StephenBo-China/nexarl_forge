@@ -109,10 +109,14 @@ def command(runtime: str | pathlib.Path, agent: str, event: str) -> str:
             interpreter = value["python_executable"]
             if not isinstance(interpreter, str) or not pathlib.Path(interpreter).is_absolute():
                 raise ValueError("invalid Windows hook interpreter")
-        return subprocess.list2cmdline([
-            interpreter, str(install_root / "current/scripts/vibe_memory_cli.py"),
-            "hook", "--agent", agent, "--event", event,
-        ])
+        script = str(install_root / "current/scripts/vibe_memory_cli.py")
+        # list2cmdline only implements CRT quoting; cmd treats unquoted & as a
+        # command separator even without spaces. Always quote executable paths.
+        for value in (interpreter, script):
+            if any(character in value for character in ('"', "%", "\r", "\n")):
+                raise ValueError("Windows hook paths must not contain quotes, percent or line breaks")
+        return f'"{interpreter}" "{script}" hook --agent {agent} --event {event}'
+
     escaped = (
         str(launcher)
         .replace("\\", "\\\\")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import runtime_platform
 import contextlib
 import hashlib
 import json
@@ -19,6 +20,8 @@ from typing import Any
 def ui_design_home() -> pathlib.Path:
     configured = os.environ.get("UI_DESIGN_HOME")
     value = pathlib.Path(configured) if configured else pathlib.Path.home() / ".codex" / "ui_design"
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(value.expanduser())
     return value.expanduser().resolve()
 
 
@@ -124,8 +127,11 @@ def exclusive_lock(
 
 def tree_digest(root: pathlib.Path) -> str:
     root = pathlib.Path(root)
+    if runtime_platform.IS_WINDOWS:
+        from windows_migration import safe_tree_digest
+        return safe_tree_digest(root, max_files=20000, max_total_bytes=256 * 1024 * 1024, max_file_bytes=128 * 1024 * 1024)
     digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+    for path in sorted((item for item in root.rglob("*") if item.is_file()), key=lambda item: pathlib.PurePosixPath(item.relative_to(root).as_posix()).parts):
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)

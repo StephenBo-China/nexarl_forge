@@ -135,6 +135,7 @@ def atomic_write_text(target: pathlib.Path, content: str, mode: int = 0o644) -> 
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
+            newline="",
             dir=target.parent,
             prefix=f".{target.name}.",
             delete=False,

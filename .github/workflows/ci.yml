@@ -18,3 +18,16 @@ jobs:
         run: python -m unittest discover -s tests -q
       - name: Verify release
         run: python scripts/verify_release.py
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify native Windows and shared workflows
+        run: python scripts/verify_release.py

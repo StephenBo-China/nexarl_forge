@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import runtime_platform
+
 import copy
 import datetime as dt
 import fnmatch
@@ -91,6 +93,11 @@ def _safe_relative(value: str, *, label: str) -> pathlib.PurePosixPath:
         or not path.parts
     ):
         raise GateValidationError(f"unsafe {label}: {value}")
+    if runtime_platform.IS_WINDOWS:
+        try:
+            runtime_platform.validate_relative_components(path.parts, allow_glob=label != "design file")
+        except ValueError as error:
+            raise GateValidationError(str(error)) from error
     return path
 
 
@@ -173,7 +180,11 @@ def _declared_files(package_root: pathlib.Path, manifest: dict[str, Any]) -> lis
         package_root.joinpath(*_safe_relative(name, label="design file").parts)
         for name in manifest["design_files"]
     }
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(package_root)
     for path in package_root.rglob("*"):
+        if runtime_platform.IS_WINDOWS:
+            runtime_platform.validate_path(path)
         if path.is_symlink():
             raise GateValidationError(f"design package symlinks are not allowed: {path}")
         if path.is_dir():

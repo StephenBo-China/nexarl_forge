@@ -24,7 +24,7 @@ def _read(paths):
         value = json.loads(storage.read_regular(_record(paths)).decode("utf-8"))
     except FileNotFoundError:
         return None
-    if not isinstance(value, dict) or not isinstance(value.get("port"), int) or not 1 <= value["port"] <= 65535:
+    if not isinstance(value, dict) or type(value.get("port")) is not int or not 1 <= value["port"] <= 65535:
         raise ValueError("invalid service state")
     for name in ("instance", "secret"):
         if not isinstance(value.get(name), str) or len(value[name]) != 64:

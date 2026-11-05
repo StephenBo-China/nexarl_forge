@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import runtime_platform
 import pathlib
 import re
 from typing import Any
@@ -95,11 +96,24 @@ def validate_package(
     metadata: dict[str, str] = {}
     total_bytes = 0
 
-    if not root.is_dir():
+    unsafe_root = False
+    if runtime_platform.IS_WINDOWS:
+        try:
+            runtime_platform.validate_path(root)
+        except ValueError as error:
+            errors.append(_issue("symlink", str(error)))
+            unsafe_root = True
+    if not root.is_dir() or unsafe_root:
         errors.append(_issue("missing_package", f"package directory does not exist: {root}"))
     else:
         for path in sorted(root.rglob("*")):
             relative = path.relative_to(root).as_posix()
+            if runtime_platform.IS_WINDOWS:
+                try:
+                    runtime_platform.validate_path(path)
+                except ValueError as error:
+                    errors.append(_issue("symlink", str(error), relative))
+                    continue
             if path.is_symlink():
                 errors.append(_issue("symlink", "symlinks are not allowed", relative))
                 continue
@@ -144,7 +158,13 @@ def validate_package(
 
     skill_path = root / "SKILL.md"
     skill_text = ""
-    if not skill_path.is_file() or skill_path.is_symlink():
+    unsafe_skill = unsafe_root
+    if runtime_platform.IS_WINDOWS and not unsafe_skill:
+        try:
+            runtime_platform.validate_path(skill_path)
+        except ValueError:
+            unsafe_skill = True
+    if unsafe_skill or not skill_path.is_file() or skill_path.is_symlink():
         errors.append(_issue("missing_skill_md", "package root must contain SKILL.md"))
     else:
         try:

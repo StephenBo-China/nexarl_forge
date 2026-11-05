@@ -244,6 +244,7 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(rejected_status, 400)
         self.assertIn("formal_memory_requires_approval", rejected["error"])
 
+    @unittest.skipIf(os.name == "nt", "macOS LaunchAgent transaction fixture; native equivalent in test_windows_install/settings")
     def test_first_run_saves_choices_reconciles_and_registers_only_explicit_workspace(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "settings-home")
         workspace = self.temp / "chosen-workspace"
@@ -279,6 +280,7 @@ class UIDesignServerTest(unittest.TestCase):
         persisted = vibe_memory_settings.load_settings(paths)
         self.assertEqual(persisted, payload["settings"])
 
+    @unittest.skipIf(os.name == "nt", "macOS LaunchAgent transaction fixture; native equivalent in test_windows_install/settings")
     def test_first_run_without_workspace_never_registers_application_clone(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "settings-home")
         with mock.patch.object(
@@ -347,6 +349,7 @@ class UIDesignServerTest(unittest.TestCase):
                 self.assertEqual(handler.send_json.call_args.kwargs["status"], 400)
                 save.assert_not_called()
 
+    @unittest.skipIf(os.name == "nt", "macOS LaunchAgent transaction fixture; native equivalent in test_windows_install/settings")
     def test_bootout_worker_persists_failure_and_is_non_daemon(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "worker-home")
         settings = vibe_memory_settings.default_settings()
@@ -373,6 +376,7 @@ class UIDesignServerTest(unittest.TestCase):
         self.assertEqual(server.read_service_action(paths)["generation"], current["generation"])
         self.assertTrue(server.read_service_action(paths)["desired_start_at_login"])
 
+    @unittest.skipIf(os.name == "nt", "macOS LaunchAgent transaction fixture; native equivalent in test_windows_install/settings")
     def test_only_latest_false_generation_boots_out(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "two-worker-home")
         stale = server.write_service_action(paths, desired=False)
@@ -384,6 +388,7 @@ class UIDesignServerTest(unittest.TestCase):
             server.scheduled_bootout_worker(paths, current["generation"])
         bootout.assert_called_once_with(vibe_memory_paths.for_home())
 
+    @unittest.skipIf(os.name == "nt", "macOS LaunchAgent transaction fixture; native equivalent in test_windows_install/settings")
     def test_bootout_and_true_transaction_serialize_on_shared_lifecycle_lock(self) -> None:
         paths = vibe_memory_paths.for_home(self.temp / "serialized-home")
         action = server.write_service_action(paths, desired=False)

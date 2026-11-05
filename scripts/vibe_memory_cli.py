@@ -1084,7 +1084,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     install = subcommands.add_parser("install", help="Install or repair the local runtime")
     install.add_argument("--source-root", required=True)
-    install.add_argument("--port", type=int, default=8897)
+    install.add_argument("--port", type=int, default=None if sys.platform == "win32" else 8897)
     install.add_argument("--with-claude-hooks", action="store_true")
     install.set_defaults(command_handler=install_command)
 

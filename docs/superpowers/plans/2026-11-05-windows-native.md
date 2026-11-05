@@ -147,3 +147,19 @@
 - 独立复核确认原先两条P1复现已消除；进一步将回滚check+restore放入与hook/settings相同的exclusive_lock，Windows专项再次26项全绿。
 - 中文主要文档严格UTF-8读取，无replacement字符或连续问号；git diff --check通过。
 - 本次仅保存开发分支阶段检查点，不代表完整发布验收；完整旧suite平台分类、特殊路径与发布元数据仍需继续。
+
+
+### 收尾验收（2026-11-05）
+
+- 当前实现的 Windows 发布入口 `python scripts/verify_release.py` 已通过：201项，184通过、17明确跳过，耗时120秒。原生测试、共享UI设计/技能管理、worktree、Loop、事件、路径和发布扫描全部纳入；没有将任意失败自动转换为skip。
+- 17项skip由5个macOS LaunchAgent专属fixture、1个macOS目录fd安装快照比较、11个本账户缺少symlink权限的用例组成；真实junction、ACL、进程锁及原生等价生命周期测试仍执行。
+- 完整旧discovery审计为606项，80 failures/292 errors，已用于识别真实缺陷并修复，不宣称旧全集在Windows全绿。主要POSIX目录fd/flock/launchctl/syscall注入类保留在原macOS CI；Windows使用显式平台测试集，新加Python3.10/3.13 CI。
+- 已补齐：发布平台与协议验证、Windows完整doctor控制面、安装完成后doctor检查、重装保留已有端口、目录交换早期失败恢复previous和原后台、首次设置新端口跳转/停机提示。
+- 短记忆写入禁用隐式换行转换，备份以O_BINARY写入，真实审批封装摘要及备份字节回归通过。
+- 迁移保持只读预览、校验根身份/已知脚本所有权、保留自定义hook、生成前后摘要审计；审计失败恢复、并发源冲突及重绑定拒绝均有Windows实际测试。
+- 设计路径已覆盖Windows设备名、ADS、盘符、尾点与junction，合法范围通配符保留；包摘要排序跨平台一致。发布扫描亦拒绝junction，不遍历外部目录。
+- Codex及Claude Code真实hook子进程上下文注入通过，未注册目录不写项目数据、正式记忆不自动变更。
+- 独立只读审查的P1并发问题已修复且复核确认；未发现其他明确P1/P2。剩余验证限制为本机未执行macOS安装器及Python3.10解释器实际运行，CI矩阵已配置，不能声称其远程结果已通过。
+- 提交为本地开发分支，不包含推送、合并或发布。没有修改正式个人记忆或创建个人记忆候选。
+
+- 最后页面核验：发现并修复首次设置事件监听器缺少闭合括号；实际渲染JS使用Node语法检查通过，模拟DOM执行的保存/新端口跳转/停机提示3分支通过。产品运行不依赖Node。修复后页面契约与真实HTTP端口重启/自停2项回归通过。

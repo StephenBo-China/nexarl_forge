@@ -4,20 +4,20 @@
 
 安装 Windows Python 3.10 或更高版本（勾选 Add Python to PATH），以及 Git for Windows。运行时不依赖 WSL、PowerShell、Windows 任务计划程序或 Windows 服务，也无需第三方 Python 包。
 
-当前为原生适配开发分支；专项验证已覆盖安装、后台、hook 和记忆审批，完整跨平台回归仍在进行。
+安装目录和 Python 路径支持中文、空格及 `&`。包含 `%` 的解释器或安装路径会被拒绝，避免 hook 被 CMD 环境变量展开；请为这类账户选择不含 `%` 的 Python 和 LOCALAPPDATA 安装路径。
+
+当前实现位于 `feat/windows-native` 分支。Windows 发布检查覆盖原生安装、后台、hook、记忆审批和共享设计/worktree 工作流；macOS 安装器仍由 macOS CI 验证。
 
 ## 安装
 
-在 CMD 中执行：
+在包含 Windows 原生改动的源码目录中，使用 CMD 执行：
 
 ```bat
-git clone https://gitee.com/StephenBo_China/nexarl_forge.git
-cd nexarl_forge
 git switch feat/windows-native
 install.cmd
 ```
 
-已有本地分支时，直接在仓库目录执行 `install.cmd`。Git Bash 可以执行 `bash install.sh`。两种入口均调用 Windows Python，不启动 WSL。需要 Claude Code hook 时追加 `--with-claude-hooks`。
+该分支尚未推送时，请使用本地 checkout；远程仓库只有在分支推送或合并后才能取得这套改动。Git Bash 可以执行 `bash install.sh`。两种入口均调用 Windows Python，不启动 WSL。需要 Claude Code hook 时追加 `--with-claude-hooks`。
 
 安装副本放在 `%LOCALAPPDATA%\NexarlForge`，管理页面默认是 http://127.0.0.1:8897/ 。安装后可在首次设置中选择 hook、保留时间、端口及登录自启。
 
@@ -66,3 +66,16 @@ Git Bash 可调用安装目录 `bin/nexarl-forge`，例如：
 ```
 
 卸载停止后台、移除运行副本、托管入口及自启项，保留个人和项目记忆、配置及日志。不会删除自定义 hook。`doctor` 中某项失败时查看对应错误；服务日志位于 `%LOCALAPPDATA%\NexarlForge\logs\service.log`。
+
+
+## 开发验证
+
+Windows 下在源码目录运行：
+
+```bat
+python scripts/verify_release.py
+```
+
+该入口调用 `verify_windows.py`：先解析全部 Python 源码、校验发布元数据并扫描发布文件，再在临时 HOME、USERPROFILE、AppData 中运行 Windows 专项和共享业务测试。不会安装到真实用户目录。测试范围包括设计管理与技能发布、worktree、Loop、事件、路径及发布扫描；macOS 安装器的目录文件描述符、flock、LaunchAgent 测试由原 macOS CI 保留运行，Windows 使用对应原生用例。
+
+没有创建符号链接权限的账户会明确跳过对应 symlink 测试；真实 Windows junction、ACL、进程锁和路径越界测试仍执行。CI 增加 Windows Python 3.10/3.13 两组验证；本机实际运行版本和结果以测试日志为准。

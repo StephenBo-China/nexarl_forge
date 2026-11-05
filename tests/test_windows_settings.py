@@ -51,3 +51,30 @@ class WindowsSettingsTests(unittest.TestCase):
             removed = settings.prune_personal_short(target, retention_days=30, today=datetime.date(2026, 11, 5))
             self.assertEqual(removed, ["expired"])
             self.assertNotIn("body", target.read_text(encoding="utf-8"))
+
+    def test_approved_short_envelope_preserves_byte_digest_and_backup(self):
+        import datetime
+        import memory_review_queue
+        import vibe_memory_settings as settings
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "short.md"
+            memory_review_queue.append_official_memory(path, {"id": "test-approved"}, "line one\nline two\n## user heading", managed_short=True)
+            original = path.read_bytes()
+            self.assertNotIn(b"\r\n", original)
+            self.assertEqual(settings.prune_personal_short(path, today=datetime.date(2026, 11, 5), retention_days=30), [])
+            before_prune = path.read_bytes()
+            self.assertTrue(settings.prune_personal_short(path, retention_days=0))
+            backups = list(path.parent.glob("short.md.bak.*"))
+            self.assertIn(before_prune, [backup.read_bytes() for backup in backups])
+            self.assertNotIn(b"line one", path.read_bytes())
+
+    def test_runtime_config_rejects_invalid_ports_python_and_safety_flags(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self.prepare(pathlib.Path(directory))
+            target = paths.install_root / "config.json"
+            valid = json.loads(target.read_text(encoding="utf-8"))
+            for changes in ({"port": True}, {"port": "8897"}, {"service_port": 8898}, {"python_executable": "python"}, {"python_version": "3.9"}, {"formal_memory_requires_approval": False}):
+                with self.subTest(changes=changes):
+                    target.write_text(json.dumps({**valid, **changes}), encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        windows_runtime.config(paths)

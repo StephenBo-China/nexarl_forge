@@ -152,7 +152,12 @@ description: Broken duplicate skill.
         (package / "SKILL.md").write_text(
             "---\nname: Bad Name\ndescription:\n---\n", encoding="utf-8"
         )
-        (package / "escape").symlink_to(self.fixture / "SKILL.md")
+        try:
+            (package / "escape").symlink_to(self.fixture / "SKILL.md")
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege unavailable; native junction coverage in test_windows_migration")
+            raise
 
         report = validator.validate_package(package, installed_names=set())
 

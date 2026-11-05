@@ -20,6 +20,17 @@ else:
     import fcntl
 
 
+def validate_relative_components(parts, *, allow_glob=False):
+    for part in parts:
+        stem = part.split(".", 1)[0].upper()
+        if (not part or part in {".", ".."} or part.rstrip(" .") != part
+                or any(character in part for character in ('<>:"|' if allow_glob else '<>:"|?*'))
+                or any(ord(character) < 32 for character in part)
+                or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                or stem in {f"{prefix}{number}" for prefix in ("COM", "LPT") for number in range(1, 10)}):
+            raise ValueError("unsafe Windows path component")
+
+
 def validate_path(path: pathlib.Path) -> pathlib.Path:
     path = pathlib.Path(os.path.abspath(path))
     for entry in (*reversed(path.parents), path):

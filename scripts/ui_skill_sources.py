@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import runtime_platform
 import os
 import pathlib
 import shutil
@@ -38,11 +39,18 @@ def _safe_relative(value: str) -> pathlib.PurePosixPath:
     path = pathlib.PurePosixPath(value.replace("\\", "/"))
     if path.is_absolute() or not path.parts or ".." in path.parts:
         raise SourceError(f"unsafe package path: {value}")
+    if runtime_platform.IS_WINDOWS:
+        try:
+            runtime_platform.validate_relative_components(path.parts)
+        except ValueError as error:
+            raise SourceError(str(error)) from error
     return path
 
 
 def _check_destination(destination: pathlib.Path) -> pathlib.Path:
     destination = pathlib.Path(destination)
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(destination)
     if destination.exists():
         raise SourceError(f"import destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -56,11 +64,15 @@ def _validate_source_tree(
     max_bytes: int,
 ) -> None:
     root = pathlib.Path(root)
+    if runtime_platform.IS_WINDOWS:
+        runtime_platform.validate_path(root)
     if not root.is_dir() or not (root / "SKILL.md").is_file():
         raise SourceError(f"skill root must contain SKILL.md: {root}")
     count = 0
     total = 0
     for path in root.rglob("*"):
+        if runtime_platform.IS_WINDOWS:
+            runtime_platform.validate_path(path)
         if path.is_symlink():
             raise SourceError(f"symlinks are not allowed: {path}")
         if path.is_dir():

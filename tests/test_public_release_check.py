@@ -4,6 +4,7 @@ import contextlib
 import errno
 import io
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -21,6 +22,14 @@ import vibe_memory_install
 
 
 class PublicReleaseCheckTest(unittest.TestCase):
+    def make_symlink(self, path, target, **options):
+        try:
+            path.symlink_to(target, **options)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege unavailable; junction covered in native migration tests")
+            raise
+
     def test_scan_tree_accepts_valid_png_release_asset(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -59,6 +68,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             ],
         )
 
+    @unittest.skipIf(os.name == "nt", "macOS descriptor-based installer snapshot; native asset exclusion covered in test_windows_install")
     def test_scanner_release_candidates_match_installer_file_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
@@ -126,8 +136,8 @@ class PublicReleaseCheckTest(unittest.TestCase):
             (external / "guide.md").write_text(
                 "Path: /Users/example\n", encoding="utf-8"
             )
-            (docs / "note.txt").symlink_to(external / "note.txt")
-            (docs / "guide.md").symlink_to(external / "guide.md")
+            self.make_symlink(docs / "note.txt", external / "note.txt")
+            self.make_symlink(docs / "guide.md", external / "guide.md")
             nested = docs / "superpowers" / "plans"
             nested.mkdir(parents=True)
             (nested / "secret.md").write_text(
@@ -151,7 +161,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             root.mkdir()
             external = base / "external-readme.md"
             external.write_text("Path: /Users/example\n", encoding="utf-8")
-            (root / "README.md").symlink_to(external)
+            self.make_symlink(root / "README.md", external)
 
             violations = public_release_check.scan_tree(root)
 
@@ -174,7 +184,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
                 (external / "leaked.py").write_text(
                     "token = 'unique-external-secret'\n", encoding="utf-8"
                 )
-                (directory / "external").symlink_to(external, target_is_directory=True)
+                self.make_symlink(directory / "external", external, target_is_directory=True)
                 expected.append((f"{directory_name}/external", "release_asset_symlink"))
 
             violations = public_release_check.scan_tree(root)
@@ -188,7 +198,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
             link = root / "README.md"
-            link.symlink_to(root / "missing-readme.md")
+            self.make_symlink(link, root / "missing-readme.md")
 
             violations = public_release_check.scan_tree(root)
 
@@ -435,7 +445,8 @@ class PublicReleaseCheckTest(unittest.TestCase):
     def test_scan_tree_checks_tracked_client_asset_with_special_filename(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            rule = root / ".claude" / "rules" / "记忆\nrule.md"
+            filename = "记忆 rule.md" if os.name == "nt" else "记忆\nrule.md"
+            rule = root / ".claude" / "rules" / filename
             rule.parent.mkdir(parents=True)
             rule.write_text("Path: /Users/example\n", encoding="utf-8")
             subprocess.run(["git", "init", "--quiet", str(root)], check=True)
@@ -448,7 +459,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
 
         self.assertIn(
             {
-                "path": ".claude/rules/记忆\nrule.md",
+                "path": ".claude/rules/" + filename,
                 "pattern": "personal_path",
                 "match": "/Users/",
             },
@@ -474,7 +485,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             external.write_text("Path: /Users/example\n", encoding="utf-8")
             link = root / ".claude" / "rules" / "external.md"
             link.parent.mkdir(parents=True)
-            link.symlink_to(external)
+            self.make_symlink(link, external)
 
             violations = public_release_check.scan_tree(root)
 
@@ -494,7 +505,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             root = pathlib.Path(temporary)
             link = root / ".codex" / "hooks" / "broken.py"
             link.parent.mkdir(parents=True)
-            link.symlink_to(root / "missing-target")
+            self.make_symlink(link, root / "missing-target")
 
             violations = public_release_check.scan_tree(root)
 
@@ -518,7 +529,7 @@ class PublicReleaseCheckTest(unittest.TestCase):
             (external / "legacy.md").write_text("Path: /Users/example\n", encoding="utf-8")
             root.mkdir()
             client_root = root / ".claude"
-            client_root.symlink_to(external, target_is_directory=True)
+            self.make_symlink(client_root, external, target_is_directory=True)
 
             violations = public_release_check.scan_tree(root)
 

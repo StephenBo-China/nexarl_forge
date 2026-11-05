@@ -904,9 +904,7 @@ def apply_legacy_hooks(
     """Remove old per-project memory hook entries after backing up touched files."""
     if runtime_platform.IS_WINDOWS:
         import windows_migration
-        selected = _selected_registered_roots(project_roots, paths or memory_project.RUNTIME_PATHS)
-        results = [{"root": str(root), **windows_migration.execute(windows_migration.prepare(root))} for root in selected]
-        return {"status": "applied", "projects": results}
+        return windows_migration.apply(project_roots, paths or memory_project.RUNTIME_PATHS)
     runtime_paths = paths or memory_project.RUNTIME_PATHS
     try:
         selected = _selected_registered_roots(project_roots, runtime_paths)

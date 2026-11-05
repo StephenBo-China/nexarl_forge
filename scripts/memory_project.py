@@ -765,7 +765,7 @@ from typing import Any
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-APP_ROOT = pathlib.Path({str(APP_ROOT)!r})
+APP_ROOT = pathlib.Path({json.dumps(str(APP_ROOT), ensure_ascii=False)})
 CODEX_DIR = ROOT / "codex"
 SHORT_MEMORY = CODEX_DIR / "codex_short_memory.md"
 PROJECT_PROPOSALS = CODEX_DIR / "memory_proposals.md"

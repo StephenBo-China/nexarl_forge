@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -46,7 +47,23 @@ def config(paths):
     value = json.loads(storage.read_regular(pathlib.Path(paths.install_root) / "config.json").decode("utf-8"))
     if not isinstance(value, dict) or value.get("service") != "vibe-memory":
         raise ValueError("invalid Windows runtime config")
-    return value
+    import vibe_memory_settings as settings
+    unknown = set(value).difference(settings._SETTING_KEYS).difference(settings._RUNTIME_KEYS)
+    if unknown:
+        raise ValueError("unknown Windows runtime config fields: " + ", ".join(sorted(unknown)))
+    normalized = {**settings.default_settings(), **{key: value[key] for key in settings._SETTING_KEYS if key in value}}
+    normalized = settings.validate_settings(normalized)
+    if type(value.get("port")) is not int or value["port"] != normalized["service_port"]:
+        raise ValueError("runtime config ports do not match")
+    if not isinstance(value.get("app_version"), str) or not value["app_version"]:
+        raise ValueError("invalid runtime version")
+    interpreter = value.get("python_executable")
+    if not isinstance(interpreter, str) or not pathlib.Path(interpreter).is_absolute():
+        raise ValueError("invalid Windows Python interpreter")
+    version = value.get("python_version")
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+\.[0-9]+", version) or tuple(map(int, version.split("."))) < (3, 10):
+        raise ValueError("invalid Windows Python version")
+    return {**value, **normalized}
 
 
 def _write_json(path, value):
@@ -89,8 +106,17 @@ def install(paths, source, *, port=8897, with_claude_hooks=False):
         raise RuntimeError("Git is required")
     if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
         raise ValueError("invalid service port")
+    for command_path in (sys.executable, str(pathlib.Path(paths.install_root) / "current/scripts/vibe_memory_cli.py")):
+        if any(character in command_path for character in ('"', "%", "\r", "\n")):
+            raise ValueError("Windows hook paths must not contain quotes, percent or line breaks")
     source = storage.validate_path(pathlib.Path(source).absolute())
     manifest = vibe_memory_paths.read_release_manifest(source / "release.json")
+    if "Windows" not in manifest.get("supported_platforms", [manifest["platform"]]):
+        raise ValueError("release does not declare Windows support")
+    if tuple(map(int, manifest["minimum_python"].split("."))) > sys.version_info[:2]:
+        raise ValueError("release requires a newer Python interpreter")
+    if manifest["data_schema_version"] != 1 or manifest["hook_protocol_version"] != 1:
+        raise ValueError("unsupported release data schema or hook protocol")
     root = storage.private_directory(pathlib.Path(paths.install_root))
     marker = root / "windows-install.json"
     current = root / "current"
@@ -117,10 +143,15 @@ def install(paths, source, *, port=8897, with_claude_hooks=False):
         moved_old = False
         prior_previous = root / (".saved-previous-" + uuid.uuid4().hex)
         try:
+            import vibe_memory_install
+            def ignored_release_entries(directory, names):
+                relative = pathlib.Path(directory).relative_to(source)
+                return [name for name in names if name == "__pycache__" or name.endswith(".pyc")
+                    or vibe_memory_install._is_release_path_excluded(pathlib.PurePosixPath((relative / name).as_posix()))]
             for name in ("scripts", "templates", "docs"):
                 tree = source / name
                 _validate_tree(tree)
-                shutil.copytree(tree, staging / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+                shutil.copytree(tree, staging / name, ignore=ignored_release_entries)
             for name in ("README.md", "release.json", "LICENSE"):
                 if (source / name).exists():
                     storage.atomic_write(staging / name, storage.read_regular(source / name))
@@ -168,10 +199,13 @@ def install(paths, source, *, port=8897, with_claude_hooks=False):
                     raise RuntimeError(f"installation hook conflict: {target}")
             repaired = repair_hooks(paths, on_change=record_change, expected_sources=snapshots)
             service = windows_service.start(paths, port=port)
+            report = doctor(paths)
+            if not all(area["ok"] for area in report.values()):
+                raise RuntimeError("installed Windows runtime failed doctor: " + ", ".join(name for name, area in report.items() if not area["ok"]))
             if prior_previous.exists():
                 _validate_tree(prior_previous)
                 shutil.rmtree(prior_previous)
-            return {"ok": True, "runtime": str(current), "launcher": str(launcher), "hooks": repaired, "service": service}
+            return {"ok": True, "runtime": str(current), "launcher": str(launcher), "hooks": repaired, "service": service, "doctor": report}
         except Exception as original_error:
             if replaced:
                 windows_service.stop(paths)
@@ -195,10 +229,13 @@ def install(paths, source, *, port=8897, with_claude_hooks=False):
                         windows_service.start(paths, port=config(paths)["port"])
                     except Exception as restart_error:
                         raise RuntimeError(f"installation failed: {original_error}; restored service failed: {restart_error}") from original_error
-            elif moved_old:
-                _rename_directory((root / "previous"), current)
+            else:
+                if moved_old:
+                    _rename_directory((root / "previous"), current)
                 if prior_previous.exists():
                     _rename_directory(prior_previous, root / "previous")
+                if before_running and current.exists() and not windows_service.status(paths)["ok"]:
+                    windows_service.start(paths, port=config(paths)["port"])
             raise
         finally:
             if staging.exists():
@@ -229,14 +266,17 @@ def uninstall(paths):
 def dispatch(args, paths):
     name = args.command
     if name in {"install", "update"}:
-        return install(paths, pathlib.Path(args.source_root), port=getattr(args, "port", None) or config(paths)["port"],
+        selected_port = getattr(args, "port", None)
+        if selected_port is None:
+            selected_port = config(paths)["port"] if (pathlib.Path(paths.install_root) / "config.json").exists() else 8897
+        return install(paths, pathlib.Path(args.source_root), port=selected_port,
             with_claude_hooks=getattr(args, "with_claude_hooks", False))
     if name == "rollback":
         return rollback(paths)
     if name == "repair":
         return repair(paths)
     if name in {"status", "doctor"}:
-        return doctor(paths)
+        return doctor(paths, include_control_plane=name == "doctor")
     if name == "stop":
         return windows_service.stop(paths)
     if name in {"start", "restart"}:
@@ -392,7 +432,7 @@ def rollback(paths):
             if promoted:
                 failed = root / (".rollback-failed-" + uuid.uuid4().hex)
                 _rename_directory(current, failed)
-                (previous if archived else temporary).rename(current)
+                _rename_directory(previous if archived else temporary, current)
                 _rename_directory(failed, previous)
             elif temporary.exists():
                 _rename_directory(temporary, current)
@@ -426,7 +466,7 @@ def repair(paths):
         return {"ok": True, "hooks": repaired, "startup": startup}
 
 
-def doctor(paths):
+def doctor(paths, *, include_control_plane=True):
     """Diagnose independent areas without hiding malformed installation state."""
     result = {}
     settings = None
@@ -477,4 +517,15 @@ def doctor(paths):
         result["data"] = {"ok": True, "status": "available"}
     except Exception as error:
         result["data"] = {"ok": False, "status": "invalid", "error": str(error)}
+    if include_control_plane:
+        try:
+            import vibe_memory_migration
+            registry = json.loads(storage.read_regular(pathlib.Path(paths.project_registry)).decode("utf-8"))
+            if not isinstance(registry, dict) or not isinstance(registry.get("projects"), list):
+                raise ValueError("project registry is malformed")
+            areas = vibe_memory_migration.validate_control_plane(paths, registry)
+            non_ok = sorted(area for area, status in areas.items() if status != "ok")
+            result["control_plane"] = {"ok": not non_ok, "status": "error" if non_ok else "ok", "areas": areas, "non_ok_areas": non_ok}
+        except Exception as error:
+            result["control_plane"] = {"ok": False, "status": "error", "error": str(error), "non_ok_areas": ["projects"]}
     return result

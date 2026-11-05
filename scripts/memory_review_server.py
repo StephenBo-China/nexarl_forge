@@ -83,7 +83,7 @@ def save_first_run_settings(body: dict[str, object]) -> dict[str, object]:
 
 
 def first_run_page() -> str:
-    return """<!doctype html>
+    page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>设置 AI Coding 管理后台</title><style>
 :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:#171717;color:#ececec}body{margin:0;display:grid;min-height:100vh;place-items:center}.wizard{width:min(680px,calc(100vw - 32px));background:#202020;border:1px solid #333;border-radius:12px;padding:28px;box-shadow:0 18px 60px #0006}h1{font-size:24px;margin:0 0 8px}p{color:#aaa;line-height:1.6}.row{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-top:1px solid #303030}.stack{display:grid;gap:8px}.radios{display:flex;gap:14px;flex-wrap:wrap}input[type=text],input[type=number]{background:#2b2b2b;border:1px solid #444;border-radius:7px;color:#fff;padding:9px;width:min(380px,70vw)}button{margin-top:18px;background:#eee;border:0;border-radius:8px;color:#171717;font-weight:650;padding:11px 16px}.message{min-height:20px;color:#8ab4ff}</style></head>
@@ -96,7 +96,8 @@ def first_run_page() -> str:
 <label class="row"><span>本机端口</span><input name="service_port" type="number" min="1" max="65535" value="8897" required></label>
 <label class="row stack"><span>可选工作区路径</span><input name="workspace" type="text" placeholder="/path/to/workspace"></label>
 <div class="message" id="message"></div><button type="submit">保存并继续</button></form>
-<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');location.href='/'}catch(error){msg.textContent=error.message}}</script></body></html>"""
+<script>const form=document.getElementById('first-run'),msg=document.getElementById('message');form.addEventListener('submit',async e=>{e.preventDefault();msg.textContent='正在保存…';const f=new FormData(form),body={codex_hooks:f.has('codex_hooks'),claude_hooks:f.has('claude_hooks'),automatic_candidate_checks:f.has('automatic_candidate_checks'),personal_short_retention_days:Number(f.get('personal_short_retention_days')),start_at_login:f.has('start_at_login'),service_port:Number(f.get('service_port')),workspace:String(f.get('workspace')||'').trim()};try{const r=await fetch('/api/settings/first-run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),data=await r.json();if(!r.ok)throw new Error(data.error||'保存失败');if(data.bootout_after_response){msg.textContent='设置已保存，后台正在停止。需要使用时运行 start。'}else if(data.restart_after_response){msg.textContent='设置已保存，正在切换端口…';setTimeout(()=>{location.href='http://127.0.0.1:'+data.settings.service_port+'/'},1500)}else{location.href='/'}}catch(error){msg.textContent=error.message}});</script></body></html>"""
+    return page.replace('placeholder="/path/to/workspace"', 'placeholder="C:/Projects/my-project"') if os.name == "nt" else page
 
 
 def service_action_path(paths: vibe_memory_paths.RuntimePaths) -> pathlib.Path:

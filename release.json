@@ -3,5 +3,9 @@
   "data_schema_version": 1,
   "hook_protocol_version": 1,
   "minimum_python": "3.10",
-  "platform": "macOS"
+  "platform": "macOS",
+  "supported_platforms": [
+    "macOS",
+    "Windows"
+  ]
 }

@@ -199,7 +199,12 @@ class UISkillPublicationTest(unittest.TestCase):
     def test_scope_rechecks_inside_lock_and_rejects_symlink_ancestor(self) -> None:
         project = self.temp / "project"
         project.mkdir()
-        (project / ".agents").symlink_to(self.temp / "outside", target_is_directory=True)
+        try:
+            (project / ".agents").symlink_to(self.temp / "outside", target_is_directory=True)
+        except OSError as error:
+            if getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows symlink privilege unavailable; native junction coverage in test_windows_migration")
+            raise
         approved = {**self.approved, "scope": {"type": "project", "root": str(project)}}
 
         with self.assertRaises(publisher.ScopeConflict):

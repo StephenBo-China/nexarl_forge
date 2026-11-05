@@ -24,6 +24,19 @@ class WindowsMigrationTests(unittest.TestCase):
             with mock.patch.object(memory_project, "REGISTRY_PATH", registry):
                 memory_project.register_project(root)
                 plan = migration.prepare_legacy_hook_cleanup(root)
+                import windows_migration
+                import runtime_platform
+                original_write = runtime_platform.atomic_write
+                before = document.read_bytes()
+                def fail_audit(path, content, *args, **kwargs):
+                    if pathlib.Path(path).parent.name == "migration_audits":
+                        raise OSError("injected audit failure")
+                    return original_write(path, content, *args, **kwargs)
+                with mock.patch.object(runtime_platform, "atomic_write", side_effect=fail_audit):
+                    with self.assertRaisesRegex(OSError, "injected audit failure"):
+                        windows_migration.execute(plan, audit=True)
+                self.assertEqual(document.read_bytes(), before)
+                self.assertTrue(script.exists())
                 result = migration.execute_legacy_hook_cleanup(plan)
                 self.assertGreater(result["removed_handlers"], 0)
                 self.assertIn("echo custom", document.read_text(encoding="utf-8"))
@@ -39,6 +52,8 @@ class WindowsMigrationTests(unittest.TestCase):
             root = pathlib.Path(directory)
             (root / "nested").mkdir()
             (root / "nested/SKILL.md").write_bytes(b"# A skill\n")
+            (root / "SKILL.md").write_bytes(b"# Root\n")
+            (root / "nested.txt").write_bytes(b"sibling file")
             self.assertEqual(migration.safe_tree_digest(root), ui_design_store.tree_digest(root))
             with self.assertRaises(ValueError):
                 migration.safe_tree_digest(root, max_file_bytes=2)
@@ -71,3 +86,61 @@ class WindowsMigrationTests(unittest.TestCase):
                 self.assertTrue(memory_project.upgrade_memory_hooks(project)["ok"])
                 self.assertFalse((project / ".codex/hooks.json").exists())
                 compile(memory_project.hook_script(project, "codex"), "generated_hook", "exec")
+
+    def test_preflight_is_readonly_and_root_rebind_is_rejected(self):
+        import windows_migration
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory) / "project"
+            root.mkdir()
+            plan = windows_migration.prepare(root)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertFalse(windows_migration.preview(root)["errors"])
+            self.assertEqual(list(root.iterdir()), [])
+            root.rename(root.with_name("original"))
+            root.mkdir()
+            with self.assertRaisesRegex(ValueError, "binding"):
+                windows_migration.execute(plan)
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_skill_import_rejects_windows_alias_and_junction_paths(self):
+        import subprocess
+        import ui_skill_sources
+        import ui_skill_publisher
+        import ui_skill_validator
+        import zipfile
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            for member in ("C:/outside/SKILL.md", "asset.txt:stream", "NUL.txt", "folder./SKILL.md"):
+                archive = root / "unsafe.zip"
+                with zipfile.ZipFile(archive, "w") as handle:
+                    handle.writestr(member, "unsafe")
+                with self.subTest(member=member), self.assertRaises(ui_skill_sources.SourceError):
+                    ui_skill_sources.import_zip(archive, root / "destination")
+                self.assertFalse((root / "destination").exists())
+            actual = root / "actual"
+            actual.mkdir()
+            (actual / "SKILL.md").write_text("---\nname: example\ndescription: example\n---\n", encoding="utf-8")
+            alias = root / "junction"
+            result = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(alias), str(actual)], capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            try:
+                with self.assertRaises(ValueError):
+                    ui_skill_sources.import_local(alias, root / "destination")
+                with self.assertRaises(ui_skill_publisher.ScopeConflict):
+                    ui_skill_publisher._reject_symlink_ancestors(alias / "child", root)
+                report = ui_skill_validator.validate_package(alias, installed_names=set())
+                self.assertFalse(report["valid"])
+                self.assertEqual(report["digest"], "")
+                import public_release_check
+                scanroot = root / "release"
+                scanroot.mkdir()
+                scan_alias = scanroot / "scripts"
+                made = subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(scan_alias), str(actual)], capture_output=True)
+                self.assertEqual(made.returncode, 0, made.stderr)
+                try:
+                    violations = public_release_check.scan_tree(scanroot)
+                    self.assertTrue(any(item["path"] == "scripts" and item["pattern"] == "release_asset_symlink" for item in violations), violations)
+                finally:
+                    scan_alias.rmdir()
+            finally:
+                alias.rmdir()

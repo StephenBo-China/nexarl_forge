@@ -41,15 +41,23 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def _is_link(path):
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return False
+    return path.is_symlink() or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
+
+
 def _file_candidates(root: pathlib.Path) -> Iterable[pathlib.Path]:
     for name in _ROOT_FILES:
         candidate = root / name
-        if candidate.is_symlink() or candidate.is_file():
+        if _is_link(candidate) or candidate.is_file():
             yield candidate
 
     for name in _RELEASE_DIRECTORIES:
         directory = root / name
-        if directory.is_symlink():
+        if _is_link(directory):
             yield directory
         elif directory.is_dir():
             yield from _iter_release_tree(
@@ -67,7 +75,7 @@ def _iter_release_tree(
         relative = root_relative / path.name
         if vibe_memory_install._is_release_path_excluded(relative):
             continue
-        if path.is_symlink():
+        if _is_link(path):
             yield path
         elif path.is_dir():
             yield from _iter_release_tree(path, root_relative=relative)
@@ -108,7 +116,7 @@ def _tracked_client_assets(root: pathlib.Path) -> list[pathlib.Path] | None:
         if path
         and (
             (root / os.fsdecode(path)).is_file()
-            or (root / os.fsdecode(path)).is_symlink()
+            or _is_link(root / os.fsdecode(path))
         )
     ]
 
@@ -116,14 +124,14 @@ def _tracked_client_assets(root: pathlib.Path) -> list[pathlib.Path] | None:
 def _client_assets_without_git(root: pathlib.Path) -> list[pathlib.Path]:
     candidates: list[pathlib.Path] = []
     for directory in (root / ".claude", root / ".codex"):
-        if directory.is_symlink():
+        if _is_link(directory):
             candidates.append(directory)
             continue
         if directory.is_dir():
             candidates.extend(
                 path
                 for path in sorted(directory.rglob("*"))
-                if path.is_file() or path.is_symlink()
+                if path.is_file() or _is_link(path)
             )
     return candidates
 
@@ -163,7 +171,7 @@ def _release_asset_safety_violation(
     try:
         for component in relative.parts:
             current /= component
-            if current.is_symlink():
+            if _is_link(current):
                 return {
                     "path": _display_path(path, root),
                     "pattern": "release_asset_symlink",
@@ -244,7 +252,7 @@ def _scan_png(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
 
 
 def _scan_client_asset(path: pathlib.Path, root: pathlib.Path) -> list[dict[str, str]]:
-    if path.is_symlink():
+    if _is_link(path):
         return [
             {
                 "path": _display_path(path, root),
